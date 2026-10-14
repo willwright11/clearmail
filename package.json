@@ -1,0 +1,33 @@
+{
+  "name": "clearmail",
+  "productName": "ClearMail",
+  "version": "0.1.0",
+  "description": "Reads your email like a chat app: strips the waffle, highlights what matters.",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "demo": "electron . --demo",
+    "test": "node --test test/*.test.js",
+    "dist": "electron-builder --mac"
+  },
+  "build": {
+    "appId": "com.clearmail.app",
+    "productName": "ClearMail",
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": ["dmg"]
+    },
+    "files": ["main.js", "preload.js", "src/**", "renderer/**", "package.json"]
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0",
+    "imapflow": "^1.0.190",
+    "mailparser": "^3.7.4",
+    "nodemailer": "^7.0.6"
+  },
+  "devDependencies": {
+    "electron": "^38.2.0",
+    "electron-builder": "^26.0.12"
+  }
+}

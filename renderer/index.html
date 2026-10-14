@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:;" />
+  <title>ClearMail</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <header class="sidebar-head">
+        <h1>ClearMail</h1>
+        <div class="head-actions">
+          <button id="refresh" class="icon-btn" title="Refresh (⌘R)">⟳</button>
+          <button id="open-settings" class="icon-btn" title="Settings (⌘,)">⚙︎</button>
+        </div>
+      </header>
+      <div class="needs-you" id="needs-you" hidden></div>
+      <input id="search" class="search" type="search" placeholder="Search people or topics" />
+      <nav class="filters" id="filters">
+        <button data-filter="all" class="chip active">All</button>
+        <button data-filter="action" class="chip">Needs me</button>
+        <button data-filter="person" class="chip">People</button>
+        <button data-filter="updates" class="chip">Updates</button>
+      </nav>
+      <ul class="chat-list" id="chat-list"></ul>
+      <footer class="sidebar-foot" id="mode-banner"></footer>
+    </aside>
+
+    <main class="conversation" id="conversation">
+      <div class="empty" id="empty">
+        <div class="empty-icon">✉︎</div>
+        <p>Pick a conversation.<br />Emails show up as short messages. The important bits are highlighted.</p>
+      </div>
+      <header class="convo-head" id="convo-head" hidden>
+        <div class="avatar" id="convo-avatar"></div>
+        <div>
+          <div class="convo-name" id="convo-name"></div>
+          <div class="convo-sub" id="convo-sub"></div>
+        </div>
+      </header>
+      <section class="messages" id="messages" hidden></section>
+      <footer class="composer" id="composer" hidden>
+        <div class="suggestions" id="suggestions"></div>
+        <form id="reply-form" class="reply-row">
+          <textarea id="reply-input" rows="1" placeholder="Type a reply"></textarea>
+          <button type="submit" class="send" title="Send (↩)">➤</button>
+        </form>
+      </footer>
+    </main>
+  </div>
+
+  <dialog id="settings">
+    <form method="dialog" id="settings-form">
+      <h2>Settings</h2>
+      <fieldset>
+        <legend>Email account</legend>
+        <label>Provider
+          <select name="provider" id="provider"></select>
+        </label>
+        <div id="custom-server" hidden>
+          <label>IMAP host <input name="imapHost" placeholder="imap.example.com" /></label>
+          <label>IMAP port <input name="imapPort" type="number" placeholder="993" /></label>
+          <label>SMTP host <input name="smtpHost" placeholder="smtp.example.com" /></label>
+          <label>SMTP port <input name="smtpPort" type="number" placeholder="465" /></label>
+        </div>
+        <label>Email address <input name="user" type="email" autocomplete="username" /></label>
+        <label>App password <input name="pass" type="password" autocomplete="current-password" placeholder="leave blank to keep current" /></label>
+        <p class="hint">Use an <b>app password</b>, not your normal password. Gmail: myaccount.google.com/apppasswords · iCloud: account.apple.com → Sign-In and Security → App-Specific Passwords.</p>
+      </fieldset>
+      <fieldset>
+        <legend>AI summaries (optional)</legend>
+        <label>Claude API key <input name="apiKey" type="password" placeholder="sk-ant-… (leave blank to keep current)" /></label>
+        <p class="hint">Without a key, ClearMail still removes waffle offline. With a key, every email gets a plain-English one-liner, a to-do list and suggested replies.</p>
+      </fieldset>
+      <label class="check"><input type="checkbox" name="demo" /> Demo mode (sample emails)</label>
+      <div class="dialog-actions">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button value="save" class="primary">Save &amp; reload</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
