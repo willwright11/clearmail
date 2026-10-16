@@ -1,7 +1,7 @@
 {
   "name": "clearmail",
   "productName": "ClearMail",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Reads your email like a chat app: strips the waffle, highlights what matters.",
   "main": "main.js",
   "private": true,
@@ -9,24 +9,47 @@
     "start": "electron .",
     "demo": "electron . --demo",
     "test": "node --test test/*.test.js",
-    "dist": "electron-builder --mac"
+    "dist": "electron-builder --mac --universal --publish never"
   },
   "build": {
     "appId": "com.clearmail.app",
     "productName": "ClearMail",
-    "mac": {
-      "category": "public.app-category.productivity",
-      "target": [
-        "dmg"
-      ]
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
     },
     "files": [
       "main.js",
       "preload.js",
       "src/**",
       "renderer/**",
-      "package.json"
-    ]
+      "package.json",
+      "build-config.json"
+    ],
+    "publish": null,
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "build/icon.icns",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
+      "identity": "-",
+      "notarize": false
+    },
+    "dmg": {
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "writeUpdateInfo": false
+    },
+    "electronFuses": {
+      "runAsNode": false,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false
+    }
   },
   "dependencies": {
     "@anthropic-ai/sdk": "0.131.0",

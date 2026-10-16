@@ -2,3 +2,5 @@ node_modules/
 dist/
 .DS_Store
 *.log
+# Written by GitHub Actions from the MS_CLIENT_ID repository variable (see README).
+/build-config.json

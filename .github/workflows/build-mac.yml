@@ -1,0 +1,138 @@
+# Builds the ClearMail Mac app (.dmg, Intel + Apple Silicon) on a GitHub-hosted Mac.
+# - Run it by hand: Actions tab -> "Build Mac app" -> "Run workflow". The .dmg is attached
+#   to the run as an artifact.
+# - Push a tag like v0.2.0 (matching "version" in package.json) to also publish a GitHub
+#   Release with the .dmg, which is the easy download link for everyone else.
+# Optional: a repository variable MS_CLIENT_ID builds your Microsoft app ID into the app,
+# so Outlook users don't have to paste one (see "For the repo owner" in README.md).
+name: Build Mac app
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+# Read-only by default: the build runs third-party package code, so only the small
+# release job below (which runs none) gets permission to publish.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ClearMail.dmg
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run the tests
+        run: npm test
+
+      - name: Check the tag matches package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          expected="v$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$expected" ]; then
+            echo "::error::The tag is $TAG but package.json says $expected. Set \"version\" in package.json to match the tag (without the v), then tag again."
+            exit 1
+          fi
+
+      - name: Build in the Microsoft app ID (if the MS_CLIENT_ID variable is set)
+        env:
+          MS_CLIENT_ID: ${{ vars.MS_CLIENT_ID }}
+        run: |
+          node - <<'EOF'
+          const fs = require('fs');
+          const id = (process.env.MS_CLIENT_ID || '').trim();
+          if (!id) {
+            fs.rmSync('build-config.json', { force: true });
+            console.log('::notice::No MS_CLIENT_ID variable, so Outlook users will paste their own Microsoft app ID in Settings.');
+            process.exit(0);
+          }
+          if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+            console.log('::error::The MS_CLIENT_ID variable is not an Application (client) ID. It should look like 1a2b3c4d-1234-5678-9abc-1234567890ab.');
+            process.exit(1);
+          }
+          fs.writeFileSync('build-config.json', JSON.stringify({ msClientId: id.toLowerCase() }, null, 2) + '\n');
+          console.log('Built-in Microsoft app ID: ' + id.toLowerCase());
+          EOF
+
+      - name: Build the universal .dmg (Intel + Apple Silicon)
+        run: npm run dist
+
+      - name: Check the app is signed, hardened and universal
+        run: |
+          app="dist/mac-universal/ClearMail.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          sig="$(codesign --display --verbose=2 "$app" 2>&1)"
+          case "$sig" in *Signature=adhoc*) echo "Ad-hoc signed." ;; *) echo "::error::The app is not ad-hoc signed."; exit 1 ;; esac
+          case "$sig" in *runtime*) echo "Hardened runtime on." ;; *) echo "::error::The hardened runtime is off."; exit 1 ;; esac
+          archs="$(lipo -archs "$app/Contents/MacOS/ClearMail")"
+          echo "Architectures: $archs"
+          case "$archs" in *x86_64*arm64*|*arm64*x86_64*) ;; *) echo "::error::The app is not universal."; exit 1 ;; esac
+          # No colours, so the text can be checked; a universal app lists each architecture.
+          fuses="$(FORCE_COLOR=0 NO_COLOR=1 npx --no-install electron-fuses read --app "$app" | sed 's/\x1b\[[0-9;]*m//g')"
+          echo "$fuses"
+          for fuse in RunAsNode EnableNodeOptionsEnvironmentVariable EnableNodeCliInspectArguments; do
+            if echo "$fuses" | grep -E "$fuse is Enabled" > /dev/null || ! echo "$fuses" | grep -E "$fuse is (Disabled|Removed)" > /dev/null; then
+              echo "::error::The $fuse fuse is still on."; exit 1
+            fi
+          done
+          ls -l dist/*.dmg
+          shasum -a 256 dist/*.dmg | tee dist/SHA256.txt
+
+      - name: Upload the .dmg to this run
+        uses: actions/upload-artifact@v7
+        with:
+          name: ClearMail-mac
+          path: |
+            dist/*.dmg
+            dist/SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish the GitHub Release (tags only)
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the .dmg from the build
+        uses: actions/download-artifact@v8
+        with:
+          name: ClearMail-mac
+          path: dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes="Download the .dmg below, open it and drag ClearMail into Applications.
+          The first time you open it, macOS blocks it because it hasn't been checked by Apple. The two-minute fix is in the README: $GITHUB_SERVER_URL/$GH_REPO#download-and-install
+
+          SHA-256 of the download (to check it hasn't been swapped):
+          $(cat dist/SHA256.txt)"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.dmg --clobber
+          else
+            gh release create "$TAG" dist/*.dmg --verify-tag --title "ClearMail $TAG" --notes "$notes"
+          fi

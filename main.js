@@ -3,19 +3,38 @@ const { app, BrowserWindow, Menu, ipcMain, shell, dialog } = require('electron')
 const { clean } = require('./src/cleaner');
 const { summarize, heuristicSummary, normalizeSummary, originalText } = require('./src/summarize');
 const mail = require('./src/mail');
+const microsoft = require('./src/microsoft');
 const store = require('./src/store');
+const config = require('./src/config');
 const demoEmails = require('./src/demo');
 
 const FORCE_DEMO = process.argv.includes('--demo');
 const WORKERS = 4;
-const PASS_LOCKED = "ClearMail couldn't unlock your saved app password from the macOS Keychain. Quit and reopen ClearMail and choose Always Allow when asked, or enter the password again in Settings.";
+const DEMO_ACCOUNT = 'demo'; // the accountId of the sample emails
 const KEY_LOCKED = "ClearMail couldn't unlock your saved Claude API key from the macOS Keychain. Quit and reopen ClearMail and choose Always Allow when asked, or paste the key again in Settings.";
+const NO_CLIENT_ID = 'ClearMail needs a Microsoft app ID (the "Application (client) ID") before it can use Outlook. Add it in Settings. See "Using Outlook" in the README for the 5-minute setup.';
+const ACCOUNT_GONE = 'That account has been removed from ClearMail. Refresh to update your chats.';
+const passLocked = (user) => `ClearMail couldn't unlock the saved app password for ${user} from the macOS Keychain. Quit and reopen ClearMail and choose Always Allow when asked, or enter the password again in Settings.`;
+const signInLocked = (email) => `ClearMail couldn't unlock your saved Microsoft sign-in for ${email} from the macOS Keychain. Quit and reopen ClearMail and choose Always Allow when asked, or click "Sign in again".`;
+const signInAgain = (email) => `Microsoft needs you to sign in to ${email} again. Use "Sign in again" to reconnect it.`;
+
+// The error codes src/microsoft.js uses, with wording for when its error has no message.
+const MS_ERRORS = {
+  'needs-sign-in': 'Microsoft needs you to sign in to this account again. Use "Sign in again" to reconnect it.',
+  'admin-approval': "Your organisation (for example your university's IT team) has to approve ClearMail before it can open this mailbox. You can ask them to approve it for your account, or keep reading this mailbox in Outlook as usual.",
+  'no-client-id': NO_CLIENT_ID,
+  cancelled: 'Signing in was cancelled.',
+  timeout: 'Signing in took too long, so ClearMail stopped waiting. Please try again.',
+  network: "Couldn't reach Microsoft. Check your internet connection and try again.",
+  throttled: 'Microsoft is busy right now. Wait a minute and try again.',
+  server: 'Microsoft had a problem. Please try again in a few minutes.',
+};
 
 let win = null;
-let settings = {};
-// The inbox the UI is showing, with the account it came from, so mark-as-read and
-// replies always go to that account even if settings change meanwhile.
-let inbox = { account: null, demo: true, emails: new Map() };
+let settings = { accounts: [], apiKey: '', limit: 60, demo: false, msClientId: '', locked: {} }; // until the app is ready
+// The inbox the UI is showing. Each email remembers the account it came from (as it was
+// when loaded), so mark-as-read and replies always go to that account.
+let inbox = { demo: true, emails: new Map() };
 let loadGen = 0; // bumped by every inbox load; older loads give way to newer ones
 let latestLoad = null;
 let summaryRun = 0; // bumped by every summary run; older runs stop taking new work
@@ -24,13 +43,16 @@ let aiProblem = null; // { key, message, sticky }: why AI is off for this key
 let summaryCache = {};
 let prepared = new Map(); // email id -> cleaned text etc. from the last load
 let saveTimer = null;
-let seenChain = Promise.resolve();
+const seenChains = new Map(); // account id -> its mark-as-read queue
 const demoSeen = new Set(); // demo emails opened this session, so a refresh keeps them read
+const needsSignIn = new Set(); // Microsoft account ids whose last call said to sign in again
+let signInRun = null; // AbortController of the Microsoft sign-in waiting in the browser
 
 // Electron sends err.toString() to the renderer; an empty name leaves just the message.
-function ipcError(message, cause) {
+function ipcError(message, cause, code) {
   const err = new Error(message || 'Something went wrong. Please try again.', cause ? { cause } : undefined);
   err.name = '';
+  if (code) err.code = code;
   return err;
 }
 
@@ -84,8 +106,8 @@ function setMenu() {
 function demoState() {
   if (FORCE_DEMO) return { active: true, reason: 'flag' };
   if (settings.demo) return { active: true, reason: 'chosen' };
-  // An address without a password is not demo: loading then says what is missing.
-  if (!settings.user) return { active: true, reason: 'no-account' };
+  // An account without a password is not demo: loading then says what is missing.
+  if (!settings.accounts.length) return { active: true, reason: 'no-account' };
   return { active: false, reason: null };
 }
 
@@ -99,24 +121,79 @@ function aiState() {
 function publicView() {
   const demo = demoState();
   return {
-    ...store.publicSettings(settings),
+    ...store.publicSettings(settings, { needsSignIn }),
     demoActive: demo.active,
     demoReason: demo.reason,
     providers: Object.fromEntries(Object.entries(mail.PROVIDERS).map(([k, v]) => [k, v.label])),
+    msClientIdBuiltIn: Boolean(config.msClientId),
   };
 }
 
-const accountOf = (s) => ({
-  provider: s.provider,
-  user: s.user,
-  pass: s.pass,
-  imapHost: s.imapHost,
-  imapPort: s.imapPort,
-  imapSecurity: s.imapSecurity,
-  smtpHost: s.smtpHost,
-  smtpPort: s.smtpPort,
-  smtpSecurity: s.smtpSecurity,
-});
+const addressOf = (account) => (account.kind === 'microsoft' ? account.email : account.user) || '';
+
+// ---------- Microsoft accounts ----------
+
+// The app ID typed in Settings wins over the one built into the app.
+const clientId = () => settings.msClientId || config.msClientId || '';
+
+// Microsoft hands out a new refresh token now and then. The old one keeps working, so
+// failing to save the new one only shortens how long the sign-in lasts.
+function keepRefreshToken(accountId, token) {
+  try {
+    const next = store.setRefreshToken(accountId, token);
+    if (next) settings = next;
+  } catch (err) {
+    console.error('Could not save a renewed Microsoft sign-in:', err.message);
+  }
+}
+
+// Options for every src/microsoft.js call made for this account.
+function msOptions(account) {
+  if (!account.refreshToken) {
+    const text = account.locked ? signInLocked(account.email) : signInAgain(account.email);
+    throw ipcError(text, null, 'needs-sign-in');
+  }
+  const id = clientId();
+  if (!id) throw ipcError(NO_CLIENT_ID, null, 'no-client-id');
+  return { clientId: id, onRefreshToken: (token) => keepRefreshToken(account.id, token) };
+}
+
+// src/microsoft.js writes its errors for the user when they carry one of its codes;
+// anything else is a bug, so the user gets the fallback and the details go to the log.
+function msError(err, fallback) {
+  const code = err?.code;
+  if (!code || !Object.hasOwn(MS_ERRORS, code)) return ipcError(fallback, err);
+  const text = typeof err.message === 'string' && err.message.trim() ? err.message.trim() : MS_ERRORS[code];
+  return ipcError(text, err, code);
+}
+
+// A failed call for an account, as an error for the user. Notes Microsoft accounts that
+// need signing in again, so Settings and the chat list can offer the button.
+function accountError(account, err, fallback) {
+  const microsoftAccount = account.kind === 'microsoft';
+  if (microsoftAccount && err?.code === 'needs-sign-in') needsSignIn.add(account.id);
+  if (err?.name === '') return err; // already written for the user
+  if (!microsoftAccount) return ipcError(err?.message || fallback, err); // mail.js errors are written for the user
+  // The plain "sign in again" names the account. A more specific reason (such as the
+  // organisation blocking ClearMail) is kept as it is.
+  if (err?.code === 'needs-sign-in' && (!err.message || /^Microsoft needs you to sign in to this account again\b/.test(err.message))) {
+    return ipcError(signInAgain(account.email), err, err.code);
+  }
+  return msError(err, fallback);
+}
+
+function signedIn(account) {
+  if (account.kind === 'microsoft') needsSignIn.delete(account.id);
+}
+
+// The account to act for: the one the email came from. Its saved details are used (a
+// Microsoft sign-in may have been renewed meanwhile), unless an IMAP account was edited
+// to point at another mailbox since the load: then the details it was loaded with are.
+function accountFor(entry) {
+  const current = settings.accounts.find((a) => a.id === entry.accountId);
+  if (!current) throw ipcError(ACCOUNT_GONE);
+  return store.accountIdentity(current) === store.accountIdentity(entry.account) ? current : entry.account;
+}
 
 // ---------- summary cache ----------
 
@@ -147,6 +224,36 @@ function cachedSummary(id, offline) {
   return offline;
 }
 
+// Summaries saved before ClearMail had several accounts are filed under the bare email
+// id. Move them under the new id instead of paying for them again.
+function adoptOldSummary(id, rawId) {
+  const old = summaryCache[rawId];
+  if (!old || summaryCache[id] || rawId.includes(':')) return;
+  summaryCache[id] = old;
+  delete summaryCache[rawId];
+  saveCacheSoon();
+}
+
+// A removed account's summaries and cleaned text are dropped with it.
+function forgetAccount(accountId) {
+  const prefix = `${accountId}:`;
+  let changed = false;
+  for (const id of Object.keys(summaryCache)) {
+    if (id.startsWith(prefix)) {
+      delete summaryCache[id];
+      changed = true;
+    }
+  }
+  if (changed) saveCacheSoon();
+  for (const id of [...prepared.keys()]) if (id.startsWith(prefix)) prepared.delete(id);
+  for (const id of [...inbox.emails.keys()]) if (id.startsWith(prefix)) inbox.emails.delete(id);
+  needsSignIn.delete(accountId);
+  seenChains.delete(accountId);
+  if (typeof microsoft.forgetAccount === 'function') microsoft.forgetAccount(accountId); // its access token
+}
+
+const accountExists = (accountId) => accountId === DEMO_ACCOUNT || settings.accounts.some((a) => a.id === accountId);
+
 // ---------- inbox ----------
 
 function emptyCleaned(original) {
@@ -159,7 +266,8 @@ function emptyCleaned(original) {
 
 // Cleaning is the slow part of a load. An email never changes for its id, so refreshes
 // reuse the work (the lengths catch an email that couldn't be read last time).
-function prepare(email, previous, next) {
+function prepare(entry, previous, next) {
+  const email = { ...entry.raw, id: entry.id, seen: entry.seen };
   const key = `${String(email.text || '').length}:${String(email.html || '').length}`;
   let done = previous.get(email.id);
   if (!done || done.key !== key) {
@@ -176,13 +284,16 @@ function prepare(email, previous, next) {
     done = { key, cleaned, original, offline: heuristicSummary(cleaned, email.subject, original) };
   }
   next.set(email.id, done);
-  return { email, cleaned: done.cleaned, original: done.original, summary: cachedSummary(email.id, done.offline) };
+  adoptOldSummary(email.id, String(entry.raw.id));
+  return { entry, email, cleaned: done.cleaned, original: done.original, summary: cachedSummary(email.id, done.offline) };
 }
 
-function toView({ email, cleaned, original, summary }) {
+function toView({ entry, email, cleaned, original, summary }) {
   const date = new Date(email.date);
   return {
-    id: String(email.id),
+    id: entry.id,
+    accountId: entry.accountId,
+    accountEmail: entry.accountEmail,
     messageId: email.messageId || null,
     from: { name: String(email.from?.name || email.from?.address || 'Unknown sender'), address: String(email.from?.address || '') },
     replyTo: email.replyTo?.address ? { name: String(email.replyTo.name || email.replyTo.address), address: String(email.replyTo.address) } : null,
@@ -196,29 +307,100 @@ function toView({ email, cleaned, original, summary }) {
   };
 }
 
+// An IMAP account whose password the Keychain won't unlock says so, instead of "add a password".
+function imapReady(account) {
+  // An Outlook account saved by the first ClearMail version, which offered Outlook over IMAP.
+  if (store.MICROSOFT_MAIL_RE.test(account.user || '')) {
+    throw ipcError('Outlook no longer works with app passwords. In Settings, remove this account and use "Add Outlook or Microsoft 365" instead.');
+  }
+  if (account.locked && !account.pass) throw ipcError(passLocked(account.user));
+  return account;
+}
+
+function fetchAccount(account, limit) {
+  if (account.kind === 'imap') return mail.fetchInbox(imapReady(account), { limit });
+  return microsoft.fetchInbox(account, { ...msOptions(account), limit });
+}
+
+// Never rejects: one account failing must not hide the others.
+async function loadAccount(account, limit) {
+  try {
+    const raw = await fetchAccount(account, limit);
+    signedIn(account);
+    return { account, raw: Array.isArray(raw) ? raw : [], error: null };
+  } catch (err) {
+    const error = accountError(account, err, "Couldn't load this account. Please try again.");
+    console.warn(`Couldn't load a ${account.kind} account:`, error.message);
+    return { account, raw: [], error: error.message };
+  }
+}
+
 async function loadInbox(gen) {
   if (aiProblem && !aiProblem.sticky) aiProblem = null; // retry account-level failures on refresh
   const demo = demoState();
-  const account = accountOf(settings);
-  let raw;
-  try {
-    if (demo.active) raw = demoEmails.map((e) => ({ ...e, seen: e.seen || demoSeen.has(e.id) }));
-    else if (settings.locked?.pass && !settings.pass) throw ipcError(PASS_LOCKED);
-    else raw = await mail.fetchInbox(account, { limit: settings.limit });
-  } catch (err) {
-    if (gen !== loadGen) return latestLoad;
-    throw err.name === '' ? err : ipcError(err.message, err); // mail.js errors are written for the user
+  let results;
+  if (demo.active) {
+    const raw = demoEmails.map((e) => ({ ...e, seen: e.seen || demoSeen.has(e.id) }));
+    results = [{ account: { id: DEMO_ACCOUNT, kind: 'demo' }, raw, error: null }];
+  } else {
+    const limit = settings.limit;
+    results = await Promise.all(settings.accounts.map((account) => loadAccount(account, limit)));
   }
   // A newer load started while this one was downloading: answer with that one instead.
   if (gen !== loadGen) return latestLoad;
+  // An account removed while it was loading is left out.
+  results = results.filter((r) => accountExists(r.account.id));
+  if (!demo.active && results.length && results.every((r) => r.error)) {
+    if (results.length === 1) throw ipcError(results[0].error);
+    throw ipcError(`ClearMail couldn't load any of your accounts. ${results.map((r) => `${addressOf(r.account)}: ${r.error}`).join(' ')}`);
+  }
+
+  const entries = new Map();
+  for (const { account, raw, error } of results) {
+    if (error) {
+      // Like a failed refresh with one account, an account that couldn't load this time
+      // keeps the emails it showed last time, so a network blip doesn't empty its chats.
+      for (const entry of inbox.emails.values()) {
+        const same = entry.accountId === account.id && store.accountIdentity(entry.account) === store.accountIdentity(account);
+        if (same && !entries.has(entry.id)) entries.set(entry.id, entry);
+      }
+      continue;
+    }
+    for (const email of raw) {
+      if (!email || email.id == null) continue;
+      // Prefixed with the account, so ids are unique across accounts and stable across refreshes.
+      const id = `${account.id}:${email.id}`;
+      if (entries.has(id)) continue;
+      const accountEmail = account.kind === 'demo' ? '' : addressOf(account);
+      entries.set(id, { id, accountId: account.id, accountEmail, account, raw: email, seen: Boolean(email.seen) });
+    }
+  }
+  // Oldest first across all accounts (the sort is stable, so ties keep each account's order).
+  const time = (entry) => {
+    const t = new Date(entry.raw.date).getTime();
+    return Number.isNaN(t) ? Date.now() : t;
+  };
+  const list = [...entries.values()].sort((a, b) => time(a) - time(b));
 
   const next = new Map();
-  const items = raw.map((email) => prepare(email, prepared, next));
+  const items = list.map((entry) => prepare(entry, prepared, next));
   prepared = next;
-  inbox = { account, demo: demo.active, emails: new Map(raw.map((e) => [String(e.id), e])) };
+  inbox = { demo: demo.active, emails: new Map(list.map((entry) => [entry.id, entry])) };
   if (store.cache.prune(summaryCache, new Set(inbox.emails.keys()))) saveCacheSoon();
   startSummaries(items);
-  return { demo: demo.active, demoReason: demo.reason, ...aiState(), emails: items.map(toView) };
+  return {
+    demo: demo.active,
+    demoReason: demo.reason,
+    ...aiState(),
+    accounts: demo.active ? [] : results.map(({ account, error }) => ({
+      id: account.id,
+      email: addressOf(account),
+      kind: account.kind,
+      error,
+      needsSignIn: account.kind === 'microsoft' && needsSignIn.has(account.id),
+    })),
+    emails: items.map(toView),
+  };
 }
 
 // ---------- AI summaries ----------
@@ -236,12 +418,13 @@ function startSummaries(items) {
     while (queue.length && current()) {
       const item = queue.shift();
       const id = item.email.id;
-      if (summaryCache[id] || inFlight.has(id)) continue;
+      if (summaryCache[id] || inFlight.has(id) || !accountExists(item.entry.accountId)) continue;
       inFlight.add(id);
       try {
         const { errorKind, ...summary } = await summarize({ apiKey, email: item.email, cleaned: item.cleaned, original: item.original });
-        if (summary.source === 'ai') remember(id, { summary });
-        else if (errorKind === 'permanent') remember(id, { failed: summary.error });
+        const keep = accountExists(item.entry.accountId); // not if its account was removed meanwhile
+        if (keep && summary.source === 'ai') remember(id, { summary });
+        else if (keep && errorKind === 'permanent') remember(id, { failed: summary.error });
         send('summary:update', { id, summary });
         if (errorKind === 'auth' || errorKind === 'account') {
           queue.length = 0;
@@ -278,17 +461,73 @@ function handle(channel, fallback, fn) {
   });
 }
 
+// Runs a store.js change; its errors are written for the user.
+function saveWith(fn) {
+  try {
+    settings = fn();
+  } catch (err) {
+    throw ipcError(err.message, err);
+  }
+  return publicView();
+}
+
 handle('settings:get', "Couldn't read your settings.", () => publicView());
 
 handle('settings:save', "Couldn't save your settings. Please try again.", (_e, input) => {
   const before = settings;
-  try {
-    settings = store.saveSettings(input);
-  } catch (err) {
-    throw ipcError(err.message, err); // store.js errors are written for the user
-  }
+  const view = saveWith(() => store.saveSettings(input));
   if (settings.apiKey !== before.apiKey) aiProblem = null;
+  return view;
+});
+
+handle('account:save', "Couldn't save the account. Please try again.", (_e, input) => saveWith(() => store.saveAccount(input)));
+
+handle('account:remove', "Couldn't remove the account. Please try again.", (_e, id) => {
+  if (typeof id !== 'string' || !id) throw ipcError("Couldn't remove the account. Please try again.");
+  const view = saveWith(() => store.removeAccount(id));
+  forgetAccount(id);
+  return view;
+});
+
+// Opens the Microsoft sign-in page in the browser and waits for it. With accountId, that
+// account is signed in again; otherwise a new account is added (or an existing one with
+// the same address is updated).
+handle('microsoft:signIn', "Couldn't sign in to Microsoft. Please try again.", async (_e, options) => {
+  if (signInRun) throw ipcError('ClearMail is already waiting for you to sign in. Finish signing in in your browser, or click Cancel.');
+  const accountId = typeof options?.accountId === 'string' && options.accountId ? options.accountId : null;
+  const target = accountId ? settings.accounts.find((a) => a.id === accountId && a.kind === 'microsoft') : null;
+  if (accountId && !target) throw ipcError('That account is no longer in ClearMail. Close Settings and try again.');
+  const id = clientId();
+  if (!id) throw ipcError(NO_CLIENT_ID, null, 'no-client-id');
+
+  const run = new AbortController();
+  signInRun = run;
+  let result;
+  try {
+    result = await microsoft.signIn({
+      clientId: id,
+      // Only ever opens a secure web page, in the user's own browser.
+      openUrl: (url) => {
+        if (!/^https:\/\//i.test(String(url))) throw new Error('Refusing to open a sign-in page that is not https.');
+        return shell.openExternal(String(url));
+      },
+      loginHint: target?.email || undefined,
+      signal: run.signal,
+    });
+  } catch (err) {
+    throw msError(err, "Couldn't sign in to Microsoft. Please try again.");
+  } finally {
+    if (signInRun === run) signInRun = null;
+  }
+  const { email, name, refreshToken } = result || {};
+  saveWith(() => store.saveMicrosoftAccount({ id: target?.id, email, name, refreshToken }));
+  const address = String(email).trim().toLowerCase();
+  for (const a of settings.accounts) if (a.kind === 'microsoft' && a.email.toLowerCase() === address) needsSignIn.delete(a.id);
   return publicView();
+});
+
+handle('microsoft:cancelSignIn', "Couldn't cancel signing in.", () => {
+  if (signInRun) signInRun.abort();
 });
 
 handle('inbox:load', "Couldn't load your inbox. Please try again.", () => {
@@ -297,42 +536,79 @@ handle('inbox:load', "Couldn't load your inbox. Please try again.", () => {
   return latestLoad;
 });
 
-// Mark-as-read runs one batch at a time, so fast browsing never opens a pile of IMAP logins.
-function queueMarkSeen(account, uids) {
-  const run = seenChain.then(() => mail.markSeen(account, uids));
-  seenChain = run.catch(() => {});
+// Mark-as-read runs one batch at a time per account, so fast browsing never opens a pile
+// of IMAP logins or Microsoft requests.
+function queueFor(accountId, fn) {
+  const run = (seenChains.get(accountId) || Promise.resolve()).then(fn);
+  const tail = run.catch(() => {});
+  seenChains.set(accountId, tail);
+  tail.then(() => {
+    if (seenChains.get(accountId) === tail) seenChains.delete(accountId);
+  });
   return run;
 }
 
+async function markAccountSeen(list) {
+  const account = accountFor(list[0]);
+  try {
+    if (account.kind === 'imap') {
+      await queueFor(account.id, () => mail.markSeen(imapReady(account), list.map((m) => m.raw.uid)));
+    } else {
+      await queueFor(account.id, () => microsoft.markSeen(account, list.map((m) => m.raw.id), msOptions(account)));
+      signedIn(account);
+    }
+  } catch (err) {
+    throw accountError(account, err, "Couldn't mark the email as read.");
+  }
+  for (const m of list) m.seen = true; // only once the server has confirmed it
+}
+
 handle('email:markSeen', "Couldn't mark the email as read.", async (_e, ids) => {
-  const { account, demo, emails } = inbox;
+  const { demo, emails } = inbox;
   const wanted = [...new Set([].concat(ids || []).filter((id) => typeof id === 'string'))];
   const targets = wanted.map((id) => emails.get(id)).filter((m) => m && !m.seen);
   if (!targets.length) return;
-  if (!demo) {
-    try {
-      await queueMarkSeen(account, targets.map((m) => m.uid));
-    } catch (err) {
-      throw ipcError(err.message, err);
+  if (demo) {
+    for (const m of targets) {
+      m.seen = true;
+      demoSeen.add(m.raw.id);
     }
+    return;
   }
-  for (const m of targets) {
-    m.seen = true; // only once the server has confirmed it
-    if (demo) demoSeen.add(m.id);
-  }
+  // Each account's emails go to that account's server, all at once.
+  const byAccount = new Map();
+  const idOf = new Map(wanted.map((id) => [emails.get(id), id]));
+  for (const m of targets) byAccount.set(m.accountId, [...(byAccount.get(m.accountId) || []), m]);
+  const groups = [...byAccount.values()];
+  const results = await Promise.allSettled(groups.map(markAccountSeen));
+  const failedAt = results.map((r, i) => (r.status === 'rejected' ? i : -1)).filter((i) => i >= 0);
+  if (!failedAt.length) return;
+  if (failedAt.length === groups.length) throw results[failedAt[0]].reason;
+  // Some accounts worked: say which emails are still unread so only those are shown unread.
+  return {
+    failed: failedAt.flatMap((i) => groups[i].map((m) => idOf.get(m))),
+    error: results[failedAt[0]].reason.message,
+  };
 });
 
 handle('email:reply', "Couldn't send your reply. Please try again.", async (_e, payload) => {
   const { id, body } = payload || {};
   if (typeof body !== 'string' || !body.trim()) throw ipcError('Type a reply first.');
-  const { account, demo, emails } = inbox;
-  const email = typeof id === 'string' ? emails.get(id) : null;
-  if (!email) throw ipcError('This email is no longer in your inbox. Refresh and try again.');
+  const { demo, emails } = inbox;
+  const entry = typeof id === 'string' ? emails.get(id) : null;
+  if (!entry) throw ipcError('This email is no longer in your inbox. Refresh and try again.');
   if (demo) return { demo: true };
+  // Sent from the account that received the email.
+  const account = accountFor(entry);
   try {
-    await mail.sendReply(account, email, body);
+    if (account.kind === 'imap') {
+      await mail.sendReply(imapReady(account), entry.raw, body);
+    } else {
+      await microsoft.sendReply(account, entry.raw, body, msOptions(account));
+      signedIn(account);
+    }
   } catch (err) {
-    throw ipcError(err.message, err);
+    throw accountError(account, err, "Couldn't send your reply. Please try again.");
   }
   return { sent: true };
 });
@@ -382,6 +658,7 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.on('will-quit', () => {
+    if (signInRun) signInRun.abort(); // closes the sign-in's local web server
     if (saveTimer) saveCacheNow();
   });
 
