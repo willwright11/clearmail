@@ -12,72 +12,96 @@
       <header class="sidebar-head">
         <h1>ClearMail</h1>
         <div class="head-actions">
-          <button id="refresh" class="icon-btn" title="Refresh (⌘R)">⟳</button>
-          <button id="open-settings" class="icon-btn" title="Settings (⌘,)">⚙︎</button>
+          <button id="refresh" class="icon-btn" type="button" title="Refresh (⌘R)" aria-label="Refresh inbox">⟳</button>
+          <button id="open-settings" class="icon-btn" type="button" title="Settings (⌘,)" aria-label="Settings">⚙︎</button>
         </div>
       </header>
-      <div class="needs-you" id="needs-you" hidden></div>
-      <input id="search" class="search" type="search" placeholder="Search people or topics" />
-      <nav class="filters" id="filters">
-        <button data-filter="all" class="chip active">All</button>
-        <button data-filter="action" class="chip">Needs me</button>
-        <button data-filter="person" class="chip">People</button>
-        <button data-filter="updates" class="chip">Updates</button>
+      <div class="load-error" id="load-error" role="alert" hidden></div>
+      <div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
+      <button class="needs-you" id="needs-you" type="button" hidden></button>
+      <input id="search" class="search" type="search" placeholder="Search people or topics" aria-label="Search conversations" />
+      <nav class="filters" id="filters" aria-label="Show">
+        <button data-filter="all" class="chip active" type="button" aria-pressed="true">All</button>
+        <button data-filter="action" class="chip" type="button" aria-pressed="false">Needs me</button>
+        <button data-filter="person" class="chip" type="button" aria-pressed="false">People</button>
+        <button data-filter="updates" class="chip" type="button" aria-pressed="false">Updates</button>
       </nav>
-      <ul class="chat-list" id="chat-list"></ul>
-      <footer class="sidebar-foot" id="mode-banner"></footer>
+      <ul class="chat-list" id="chat-list" role="listbox" aria-label="Conversations"></ul>
+      <footer class="sidebar-foot" id="mode-banner" role="status"></footer>
     </aside>
 
     <main class="conversation" id="conversation">
       <div class="empty" id="empty">
-        <div class="empty-icon">✉︎</div>
+        <div class="empty-icon" aria-hidden="true">✉︎</div>
         <p>Pick a conversation.<br />Emails show up as short messages. The important bits are highlighted.</p>
       </div>
       <header class="convo-head" id="convo-head" hidden>
-        <div class="avatar" id="convo-avatar"></div>
-        <div>
-          <div class="convo-name" id="convo-name"></div>
+        <div class="avatar" id="convo-avatar" aria-hidden="true"></div>
+        <div class="convo-title">
+          <h2 class="convo-name" id="convo-name"></h2>
           <div class="convo-sub" id="convo-sub"></div>
         </div>
+        <button id="convo-done" class="head-btn" type="button" hidden>✓ Mark all done</button>
       </header>
-      <section class="messages" id="messages" hidden></section>
+      <section class="messages" id="messages" aria-labelledby="convo-name" tabindex="-1" hidden></section>
       <footer class="composer" id="composer" hidden>
-        <div class="suggestions" id="suggestions"></div>
+        <div class="suggestions" id="suggestions" aria-label="Suggested replies"></div>
         <form id="reply-form" class="reply-row">
-          <textarea id="reply-input" rows="1" placeholder="Type a reply"></textarea>
-          <button type="submit" class="send" title="Send (↩)">➤</button>
+          <textarea id="reply-input" rows="1" placeholder="Type a reply" aria-label="Reply"></textarea>
+          <button type="submit" class="send" title="Send (↩)" aria-label="Send reply">➤</button>
         </form>
       </footer>
     </main>
   </div>
 
-  <dialog id="settings">
-    <form method="dialog" id="settings-form">
-      <h2>Settings</h2>
+  <dialog id="settings" aria-labelledby="settings-title">
+    <form method="dialog" id="settings-form" novalidate>
+      <h2 id="settings-title">Settings</h2>
+      <p class="warn" id="secrets-locked" hidden>ClearMail couldn't unlock your saved app password or Claude key from the macOS Keychain. Quit and reopen ClearMail and choose <b>Always Allow</b> when asked, or type them again below. Leaving the fields blank keeps the saved ones.</p>
       <fieldset>
         <legend>Email account</legend>
         <label>Provider
           <select name="provider" id="provider"></select>
         </label>
         <div id="custom-server" hidden>
-          <label>IMAP host <input name="imapHost" placeholder="imap.example.com" /></label>
-          <label>IMAP port <input name="imapPort" type="number" placeholder="993" /></label>
-          <label>SMTP host <input name="smtpHost" placeholder="smtp.example.com" /></label>
-          <label>SMTP port <input name="smtpPort" type="number" placeholder="465" /></label>
+          <div class="row">
+            <label class="grow">IMAP server (incoming) <input name="imapHost" placeholder="imap.example.com" spellcheck="false" autocapitalize="off" /></label>
+            <label>Port <input name="imapPort" type="number" min="1" max="65535" placeholder="993" /></label>
+            <label>Security
+              <select name="imapSecurity">
+                <option value="tls">SSL/TLS</option>
+                <option value="starttls">STARTTLS</option>
+              </select>
+            </label>
+          </div>
+          <div class="row">
+            <label class="grow">SMTP server (outgoing) <input name="smtpHost" placeholder="smtp.example.com" spellcheck="false" autocapitalize="off" /></label>
+            <label>Port <input name="smtpPort" type="number" min="1" max="65535" placeholder="465" /></label>
+            <label>Security
+              <select name="smtpSecurity">
+                <option value="tls">SSL/TLS</option>
+                <option value="starttls">STARTTLS</option>
+              </select>
+            </label>
+          </div>
+          <p class="hint">SSL/TLS usually uses ports 993 and 465. STARTTLS usually uses 143 and 587.</p>
         </div>
-        <label>Email address <input name="user" type="email" autocomplete="username" /></label>
-        <label>App password <input name="pass" type="password" autocomplete="current-password" placeholder="leave blank to keep current" /></label>
-        <p class="hint">Use an <b>app password</b>, not your normal password. Gmail: myaccount.google.com/apppasswords · iCloud: account.apple.com → Sign-In and Security → App-Specific Passwords.</p>
+        <label>Email address <input name="user" type="text" inputmode="email" autocomplete="username" spellcheck="false" autocapitalize="off" /></label>
+        <label>App password <input name="pass" type="password" autocomplete="current-password" /></label>
+        <p class="hint">Use an <b>app password</b>, not your normal password. Gmail: myaccount.google.com/apppasswords · iCloud: account.apple.com → Sign-In and Security → App-Specific Passwords. Changing the provider, address or server clears the saved password, so type it again.</p>
       </fieldset>
       <fieldset>
         <legend>AI summaries (optional)</legend>
-        <label>Claude API key <input name="apiKey" type="password" placeholder="sk-ant-… (leave blank to keep current)" /></label>
+        <label>Claude API key <input name="apiKey" type="password" autocomplete="off" spellcheck="false" /></label>
         <p class="hint">Without a key, ClearMail still removes waffle offline. With a key, every email gets a plain-English one-liner, a to-do list and suggested replies.</p>
       </fieldset>
+      <label>Emails to load <input name="limit" type="number" min="1" max="500" placeholder="60" class="short" /></label>
       <label class="check"><input type="checkbox" name="demo" /> Demo mode (sample emails)</label>
+      <p class="hint" id="demo-flag" hidden>ClearMail was started with <code>--demo</code>, so it shows sample emails until you restart it normally.</p>
+      <p class="form-error" id="settings-error" role="alert" hidden></p>
       <div class="dialog-actions">
-        <button value="cancel" formnovalidate>Cancel</button>
-        <button value="save" class="primary">Save &amp; reload</button>
+        <button type="button" id="settings-cancel">Cancel</button>
+        <button type="submit" id="settings-save" class="primary">Save &amp; reload</button>
       </div>
     </form>
   </dialog>

@@ -6,7 +6,9 @@ const ago = (h) => new Date(now - h * 3600_000).toISOString();
 module.exports = [
   {
     id: 'demo-1',
+    messageId: null,
     from: { name: 'Sarah Collins', address: 'sarah.collins@brightbuild.co.uk' },
+    replyTo: null,
     subject: 'RE: Site visit + quote for the Harrow extension',
     date: ago(30),
     seen: true,
@@ -28,7 +30,9 @@ Registered in England No. 0123456. This email and any attachments are confidenti
   },
   {
     id: 'demo-2',
+    messageId: null,
     from: { name: 'Sarah Collins', address: 'sarah.collins@brightbuild.co.uk' },
+    replyTo: null,
     subject: 'RE: Site visit + quote for the Harrow extension',
     date: ago(3),
     seen: false,
@@ -56,7 +60,9 @@ On Mon, 6 Oct 2026 at 09:12, Will Wright <will@example.com> wrote:
   },
   {
     id: 'demo-3',
+    messageId: null,
     from: { name: 'Dad', address: 'dad@example.com' },
+    replyTo: null,
     subject: 'Sunday',
     date: ago(20),
     seen: false,
@@ -71,7 +77,9 @@ Sent from my iPhone`,
   },
   {
     id: 'demo-4',
+    messageId: null,
     from: { name: 'HMRC', address: 'noreply@notifications.service.gov.uk' },
+    replyTo: null,
     subject: 'Action required: your Self Assessment tax return',
     date: ago(48),
     seen: false,
@@ -90,7 +98,9 @@ HM Revenue and Customs`,
   },
   {
     id: 'demo-5',
+    messageId: null,
     from: { name: 'Screwfix', address: 'orders@screwfix.com' },
+    replyTo: null,
     subject: 'Your order confirmation #SF-4471920',
     date: ago(6),
     seen: true,
@@ -109,7 +119,9 @@ You are receiving this email because you placed an order with Screwfix. Privacy 
   },
   {
     id: 'demo-6',
+    messageId: null,
     from: { name: 'The Weekly Builder', address: 'newsletter@weeklybuilder.com' },
+    replyTo: null,
     subject: '🏗️ This week in construction: 12 trends you can\'t ignore',
     date: ago(12),
     seen: false,
@@ -133,7 +145,9 @@ You are receiving this because you signed up at weeklybuilder.com. Unsubscribe h
   },
   {
     id: 'demo-7',
+    messageId: null,
     from: { name: 'Priya Shah', address: 'priya@shahaccounting.co.uk' },
+    replyTo: null,
     subject: 'Quick one — VAT receipts',
     date: ago(1),
     seen: false,
@@ -152,5 +166,41 @@ Priya
 --
 Priya Shah ACCA
 Shah Accounting | 020 7946 0000`,
+  },
+  {
+    id: 'demo-8',
+    messageId: null,
+    from: { name: 'Jo Patel', address: 'jo.patel@example.com' },
+    replyTo: null,
+    subject: 'Fwd: Planning decision - 12 Elm Road',
+    date: ago(2),
+    seen: false,
+    attachments: [{ filename: 'Decision-notice-26-1234.pdf', size: 96000 }],
+    text: `Hi Will,
+
+FYI - see below. Can you get the appeal in? I'm away until Monday.
+
+Thanks,
+Jo
+
+---------- Forwarded message ---------
+From: Northfield Borough Council Planning <planning@northfield-council.example>
+Date: Wed, 14 Oct 2026 at 16:05
+Subject: Planning decision - 12 Elm Road
+To: Jo Patel <jo.patel@example.com>
+
+Dear Ms Patel,
+
+Application 26/1234: single-storey rear extension at 12 Elm Road.
+
+We have refused this application because the extension is too close to the boundary with number 14.
+
+You can appeal within 28 days of this notice, so by 11 November 2026. The appeal fee of £462 is non-refundable.
+
+Yours sincerely,
+Planning Services
+Northfield Borough Council
+
+This email and any attachments are confidential and intended solely for the intended recipient.`,
   },
 ];
