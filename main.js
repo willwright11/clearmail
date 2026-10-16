@@ -352,7 +352,16 @@ async function loadInbox(gen) {
   }
 
   const entries = new Map();
-  for (const { account, raw } of results) {
+  for (const { account, raw, error } of results) {
+    if (error) {
+      // Like a failed refresh with one account, an account that couldn't load this time
+      // keeps the emails it showed last time, so a network blip doesn't empty its chats.
+      for (const entry of inbox.emails.values()) {
+        const same = entry.accountId === account.id && store.accountIdentity(entry.account) === store.accountIdentity(account);
+        if (same && !entries.has(entry.id)) entries.set(entry.id, entry);
+      }
+      continue;
+    }
     for (const email of raw) {
       if (!email || email.id == null) continue;
       // Prefixed with the account, so ids are unique across accounts and stable across refreshes.

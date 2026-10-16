@@ -374,10 +374,11 @@ function renderSidebarSoon() {
   });
 }
 
-// One account's load error, naming the account unless the message already does.
+// One account's load error, naming the account unless the message already does. An
+// account that failed keeps the emails it had, so say they may be out of date.
 function accountProblem(a) {
-  if (!a.email || a.error.toLowerCase().includes(a.email.toLowerCase())) return a.error;
-  return `Couldn't load ${a.email}. ${a.error}`;
+  const text = !a.email || a.error.toLowerCase().includes(a.email.toLowerCase()) ? a.error : `Couldn't load ${a.email}. ${a.error}`;
+  return state.emails.some((m) => m.accountId === a.id) ? `${text} Its emails below are from the last time it loaded.` : text;
 }
 
 function renderLoadError() {

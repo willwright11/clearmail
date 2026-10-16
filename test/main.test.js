@@ -332,10 +332,19 @@ test('two accounts: one failing never hides the other', async () => {
   imap.fetchInbox = async () => { throw new Error('Your email provider rejected the login. Check your email address and app password in Settings.'); };
   ms.fetchInbox = async () => [rawEmail('AAMkAD=', { date: hoursAgo(2) })];
   res = await api().loadInbox();
-  assert.deepStrictEqual(res.emails.map((m) => [m.id, m.accountId, m.accountEmail]), [[`${outlookId}:AAMkAD=`, outlookId, OUTLOOK]]);
+  // The Gmail account keeps the email it showed last time, as a failed refresh of one account does.
+  assert.deepStrictEqual(res.emails.map((m) => [m.id, m.accountId, m.accountEmail]), [
+    [`${gmailId}:fp-1-7`, gmailId, 'me@gmail.com'],
+    [`${outlookId}:AAMkAD=`, outlookId, OUTLOOK],
+  ]);
   assert.match(res.accounts[0].error, /rejected the login/);
   assert.deepStrictEqual([res.accounts[1].error, res.accounts[1].needsSignIn], [null, false]);
   assert.strictEqual((await api().getSettings()).accounts[1].needsSignIn, false);
+  // Not once the account points at another mailbox: those emails aren't its emails.
+  await api().saveAccount({ id: gmailId, user: 'other@gmail.com' });
+  res = await api().loadInbox();
+  assert.deepStrictEqual(res.emails.map((m) => m.id), [`${outlookId}:AAMkAD=`]);
+  await api().saveAccount({ id: gmailId, user: 'me@gmail.com', pass: 'app-pw' });
 
   ms.fetchInbox = async () => { throw msErr('network', "Couldn't reach Microsoft. Check your internet connection and try again."); };
   await assert.rejects(api().loadInbox(), (err) => message(err) === "ClearMail couldn't load any of your accounts. "

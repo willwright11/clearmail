@@ -85,7 +85,7 @@ Under **Accounts**:
      - **Yahoo:** Account Security → Generate app password
      - **Other:** use your full email address as the user name, as it is also the From address of your replies.
 
-You can add as many accounts as you like. Each one is listed with its status. If an account has a problem, the reason is shown next to it, and Outlook accounts get a **Sign in again** button when Microsoft needs you to sign in again. Use **Edit** or **Remove** to change or remove an account.
+You can add as many accounts as you like. Each one is listed with its status. If an account has a problem, the reason is shown next to it (and above your chats, which keep that account's emails from the last time it loaded), and Outlook accounts get a **Sign in again** button when Microsoft needs you to sign in again. One account having a problem never stops the others loading. Use **Edit** or **Remove** to change or remove an account.
 
 Under **General**:
 

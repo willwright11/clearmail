@@ -307,8 +307,14 @@ test('a revoked sign-in only affects that account, and "Sign in again" fixes it'
     error: `Microsoft needs you to sign in to ${UNI} again. Use "Sign in again" to reconnect it.`,
   });
   assert.ok(res.accounts.filter((a) => a.email !== UNI).every((a) => !a.error));
-  assert.ok(res.emails.some((m) => m.accountId === ids[OUTLOOK]) && !res.emails.some((m) => m.accountId === ids[UNI]));
+  assert.ok(res.emails.some((m) => m.accountId === ids[OUTLOOK]));
   assert.strictEqual(byEmail(await api.getSettings(), UNI).needsSignIn, true);
+  // Its chats stay as they were last loaded; replying asks to sign in again and sends nothing.
+  const kept = res.emails.filter((m) => m.accountId === ids[UNI]);
+  assert.deepStrictEqual(kept.map((m) => m.subject).sort(), ['Library loan overdue', 'Project meeting']);
+  const replies = microsoft.replies.length;
+  await assert.rejects(api.reply(kept[0].id, 'Hello?'), (err) => message(err) === uni.error);
+  assert.strictEqual(microsoft.replies.length, replies);
 
   microsoft.choose = () => ({ email: UNI });
   const s = await api.signInMicrosoft({ accountId: ids[UNI] });
@@ -322,11 +328,15 @@ test('a revoked sign-in only affects that account, and "Sign in again" fixes it'
 
 test('a mailbox Microsoft refuses says why, and recovers by itself', async () => {
   microsoft.mailbox(OUTLOOK).forbidden = true;
-  let res = await api.loadInbox();
+  let res;
+  try {
+    res = await api.loadInbox();
+  } finally {
+    microsoft.mailbox(OUTLOOK).forbidden = false;
+  }
   const outlook = res.accounts.find((a) => a.email === OUTLOOK);
   assert.match(outlook.error, /didn't let ClearMail into this mailbox.*organisation may be blocking ClearMail/);
   assert.strictEqual(outlook.needsSignIn, true);
-  microsoft.mailbox(OUTLOOK).forbidden = false;
   res = await api.loadInbox();
   assert.ok(res.accounts.every((a) => !a.error && !a.needsSignIn));
 });
