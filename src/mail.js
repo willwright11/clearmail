@@ -42,8 +42,10 @@ const TRUNCATED = 'This email is very long, so ClearMail only downloaded the sta
 const LOGIN_REJECTED = 'Your email provider rejected the login. Check your email address and app password in Settings.';
 const EMAIL_RE = /^[^\s@]+@[^\s@]+$/;
 
-// Parsed emails from the last load, so a refresh only downloads new messages.
-let inboxCache = { key: null, emails: new Map() };
+// Parsed emails from each account's last load, so a refresh only downloads new messages.
+// account fingerprint -> { key, emails }; only the most recently loaded accounts are kept.
+const inboxCache = new Map();
+const CACHED_ACCOUNTS = 20;
 const uidValidityByAccount = new Map();
 
 function userError(message) {
@@ -297,7 +299,8 @@ async function fetchInbox(account, { limit = 60 } = {}) {
       const total = client.mailbox.exists;
       if (!total) return [];
       const key = `${fp}-${uidValidity}`;
-      const cached = inboxCache.key === key ? inboxCache.emails : new Map();
+      const last = inboxCache.get(fp);
+      const cached = last && last.key === key ? last.emails : new Map();
 
       // 1. Cheap metadata for the newest messages.
       const metas = new Map();
@@ -349,7 +352,9 @@ async function fetchInbox(account, { limit = 60 } = {}) {
       }
 
       const list = [...emails.values()];
-      inboxCache = { key, emails: new Map(list.filter((e) => !unreadable.has(e.uid)).map((e) => [e.uid, e])) };
+      inboxCache.delete(fp); // re-added last, so the least recently loaded account goes first
+      inboxCache.set(fp, { key, emails: new Map(list.filter((e) => !unreadable.has(e.uid)).map((e) => [e.uid, e])) });
+      while (inboxCache.size > CACHED_ACCOUNTS) inboxCache.delete(inboxCache.keys().next().value);
       return list.map((e) => ({ ...e })).sort((a, b) => new Date(a.date) - new Date(b.date));
     });
   } catch (err) {

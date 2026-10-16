@@ -731,6 +731,12 @@ test('errors: client ID, network, timeout and Graph refusals', async () => {
   graph.handler = () => ({ status: 400, json: { error: null } });
   await rejectsWith(ms.fetchInbox(account(), opts()), 'server', /^Couldn't load your Outlook inbox\. Please try again\.$/);
 
+  // A redirect is not followed with the token.
+  fresh();
+  graph.handler = () => ({ status: 302, headers: { Location: `${login.base}/elsewhere` } });
+  await rejectsWith(ms.fetchInbox(account(), opts()), 'server', /Couldn't load your Outlook inbox/);
+  assert.ok(!login.requests.some((r) => r.path === '/elsewhere'));
+
   fresh();
   graph.handler = () => ({ status: 502 });
   await rejectsWith(ms.fetchInbox(account(), opts()), 'server', /having problems/);

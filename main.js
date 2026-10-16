@@ -174,7 +174,11 @@ function accountError(account, err, fallback) {
   if (microsoftAccount && err?.code === 'needs-sign-in') needsSignIn.add(account.id);
   if (err?.name === '') return err; // already written for the user
   if (!microsoftAccount) return ipcError(err?.message || fallback, err); // mail.js errors are written for the user
-  if (err?.code === 'needs-sign-in') return ipcError(signInAgain(account.email), err, err.code);
+  // The plain "sign in again" names the account. A more specific reason (such as the
+  // organisation blocking ClearMail) is kept as it is.
+  if (err?.code === 'needs-sign-in' && (!err.message || /^Microsoft needs you to sign in to this account again\b/.test(err.message))) {
+    return ipcError(signInAgain(account.email), err, err.code);
+  }
   return msError(err, fallback);
 }
 

@@ -46,8 +46,9 @@
       <section class="messages" id="messages" aria-labelledby="convo-name" tabindex="-1" hidden></section>
       <footer class="composer" id="composer" hidden>
         <div class="suggestions" id="suggestions" aria-label="Suggested replies"></div>
+        <div class="reply-from" id="reply-from" hidden></div>
         <form id="reply-form" class="reply-row">
-          <textarea id="reply-input" rows="1" placeholder="Type a reply" aria-label="Reply"></textarea>
+          <textarea id="reply-input" rows="1" placeholder="Type a reply" aria-label="Reply" aria-describedby="reply-from"></textarea>
           <button type="submit" class="send" title="Send (↩)" aria-label="Send reply">➤</button>
         </form>
       </footer>
@@ -55,53 +56,103 @@
   </div>
 
   <dialog id="settings" aria-labelledby="settings-title">
-    <form method="dialog" id="settings-form" novalidate>
+    <div class="dialog-body" id="settings-main">
       <h2 id="settings-title">Settings</h2>
-      <p class="warn" id="secrets-locked" hidden>ClearMail couldn't unlock your saved app password or Claude key from the macOS Keychain. Quit and reopen ClearMail and choose <b>Always Allow</b> when asked, or type them again below. Leaving the fields blank keeps the saved ones.</p>
-      <fieldset>
-        <legend>Email account</legend>
-        <label>Provider
-          <select name="provider" id="provider"></select>
-        </label>
-        <div id="custom-server" hidden>
-          <div class="row">
-            <label class="grow">IMAP server (incoming) <input name="imapHost" placeholder="imap.example.com" spellcheck="false" autocapitalize="off" /></label>
-            <label>Port <input name="imapPort" type="number" min="1" max="65535" placeholder="993" /></label>
-            <label>Security
-              <select name="imapSecurity">
-                <option value="tls">SSL/TLS</option>
-                <option value="starttls">STARTTLS</option>
-              </select>
-            </label>
+      <p class="warn" id="secrets-locked" hidden>ClearMail couldn't unlock some of your saved passwords, sign-ins or your Claude key from the macOS Keychain. Quit and reopen ClearMail and choose <b>Always Allow</b> when asked. Or enter them again: the accounts that need it are marked below.</p>
+
+      <section class="settings-section" aria-labelledby="accounts-title">
+        <h3 id="accounts-title">Accounts</h3>
+        <ul class="account-list" id="account-list" aria-labelledby="accounts-title"></ul>
+        <p class="ok-line" id="accounts-status" role="status" aria-live="polite" hidden></p>
+        <p class="form-error" id="accounts-error" role="alert" hidden></p>
+
+        <div class="ms-wait" id="ms-wait" role="status" hidden>
+          <div class="ms-wait-row">
+            <span class="spinner" aria-hidden="true"></span>
+            <span class="ms-wait-text">Finish signing in in your browser…</span>
+            <button type="button" id="ms-cancel">Cancel</button>
           </div>
-          <div class="row">
-            <label class="grow">SMTP server (outgoing) <input name="smtpHost" placeholder="smtp.example.com" spellcheck="false" autocapitalize="off" /></label>
-            <label>Port <input name="smtpPort" type="number" min="1" max="65535" placeholder="465" /></label>
-            <label>Security
-              <select name="smtpSecurity">
-                <option value="tls">SSL/TLS</option>
-                <option value="starttls">STARTTLS</option>
-              </select>
-            </label>
-          </div>
-          <p class="hint">SSL/TLS usually uses ports 993 and 465. STARTTLS usually uses 143 and 587.</p>
+          <p class="hint">A Microsoft sign-in page has opened in your web browser. Choose your account and accept. When the page says you're signed in, come back here.</p>
         </div>
-        <label>Email address <input name="user" type="text" inputmode="email" autocomplete="username" spellcheck="false" autocapitalize="off" /></label>
-        <label>App password <input name="pass" type="password" autocomplete="current-password" /></label>
-        <p class="hint">Use an <b>app password</b>, not your normal password. Gmail: myaccount.google.com/apppasswords · iCloud: account.apple.com → Sign-In and Security → App-Specific Passwords. Changing the provider, address or server clears the saved password, so type it again.</p>
-      </fieldset>
-      <fieldset>
-        <legend>AI summaries (optional)</legend>
-        <label>Claude API key <input name="apiKey" type="password" autocomplete="off" spellcheck="false" /></label>
-        <p class="hint">Without a key, ClearMail still removes waffle offline. With a key, every email gets a plain-English one-liner, a to-do list and suggested replies.</p>
-      </fieldset>
-      <label>Emails to load <input name="limit" type="number" min="1" max="500" placeholder="60" class="short" /></label>
-      <label class="check"><input type="checkbox" name="demo" /> Demo mode (sample emails)</label>
-      <p class="hint" id="demo-flag" hidden>ClearMail was started with <code>--demo</code>, so it shows sample emails until you restart it normally.</p>
-      <p class="form-error" id="settings-error" role="alert" hidden></p>
+
+        <form class="ms-setup" id="ms-setup" novalidate hidden aria-labelledby="ms-setup-title">
+          <h4 id="ms-setup-title">One-time setup for Outlook</h4>
+          <p>To open Outlook and Microsoft 365 mailboxes, ClearMail needs a free app ID from Microsoft. This copy of ClearMail doesn't have one built in, so it has to be added once.</p>
+          <label>Application (client) ID
+            <input name="msClientId" id="ms-client-id" placeholder="1a2b3c4d-1234-5678-9abc-1234567890ab" spellcheck="false" autocapitalize="off" autocomplete="off" />
+          </label>
+          <p class="hint">See "Using Outlook" in the README for the 5-minute setup.</p>
+          <p class="form-error" id="ms-setup-error" role="alert" hidden></p>
+          <div class="dialog-actions">
+            <button type="button" id="ms-setup-cancel">Cancel</button>
+            <button type="submit" id="ms-setup-save" class="primary">Save and sign in</button>
+          </div>
+        </form>
+
+        <div class="add-buttons" id="add-buttons">
+          <button type="button" id="add-microsoft" class="add-btn">＋ Add Outlook or Microsoft 365</button>
+          <button type="button" id="add-imap" class="add-btn">＋ Add Gmail, iCloud, Yahoo or other</button>
+        </div>
+      </section>
+
+      <form id="settings-form" novalidate>
+        <section class="settings-section" aria-labelledby="general-title">
+          <h3 id="general-title">General</h3>
+          <label>Claude API key (optional) <input name="apiKey" type="password" autocomplete="off" spellcheck="false" /></label>
+          <p class="hint">Without a key, ClearMail still removes waffle offline. With a key, every email gets a plain-English one-liner, a to-do list and suggested replies.</p>
+          <label>Emails to load from each account <input name="limit" type="number" min="1" max="500" placeholder="60" class="short" /></label>
+          <label class="check"><input type="checkbox" name="demo" /> Demo mode (sample emails)</label>
+          <p class="hint" id="demo-flag" hidden>ClearMail was started with <code>--demo</code>, so it shows sample emails until you restart it normally.</p>
+          <details class="advanced" id="advanced">
+            <summary>Advanced</summary>
+            <label>Microsoft app ID for Outlook <input name="msClientId" placeholder="1a2b3c4d-1234-5678-9abc-1234567890ab" spellcheck="false" autocapitalize="off" autocomplete="off" /></label>
+            <p class="hint" id="ms-id-hint"></p>
+          </details>
+        </section>
+        <p class="form-error" id="settings-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" id="settings-cancel">Close</button>
+          <button type="submit" id="settings-save" class="primary">Save &amp; reload</button>
+        </div>
+      </form>
+    </div>
+
+    <form class="dialog-body" id="account-form" novalidate hidden aria-labelledby="account-title">
+      <h2 id="account-title">Add an email account</h2>
+      <label>Provider
+        <select name="provider" id="provider"></select>
+      </label>
+      <div id="custom-server" hidden>
+        <div class="row">
+          <label class="grow">IMAP server (incoming) <input name="imapHost" placeholder="imap.example.com" spellcheck="false" autocapitalize="off" /></label>
+          <label>Port <input name="imapPort" type="number" min="1" max="65535" placeholder="993" /></label>
+          <label>Security
+            <select name="imapSecurity">
+              <option value="tls">SSL/TLS</option>
+              <option value="starttls">STARTTLS</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <label class="grow">SMTP server (outgoing) <input name="smtpHost" placeholder="smtp.example.com" spellcheck="false" autocapitalize="off" /></label>
+          <label>Port <input name="smtpPort" type="number" min="1" max="65535" placeholder="465" /></label>
+          <label>Security
+            <select name="smtpSecurity">
+              <option value="tls">SSL/TLS</option>
+              <option value="starttls">STARTTLS</option>
+            </select>
+          </label>
+        </div>
+        <p class="hint">SSL/TLS usually uses ports 993 and 465. STARTTLS usually uses 143 and 587.</p>
+      </div>
+      <label>Email address <input name="user" type="text" inputmode="email" autocomplete="username" spellcheck="false" autocapitalize="off" /></label>
+      <label>App password <input name="pass" type="password" autocomplete="current-password" /></label>
+      <p class="hint">Use an <b>app password</b>, not your normal password. Gmail: myaccount.google.com/apppasswords · iCloud: account.apple.com → Sign-In and Security → App-Specific Passwords · Yahoo: Account Security → Generate app password. Changing the provider, address or server clears the saved password, so type it again.</p>
+      <p class="hint">Outlook, Hotmail and Microsoft 365 (work or university) addresses can't use an app password. Go back and choose <b>Add Outlook or Microsoft 365</b> instead.</p>
+      <p class="form-error" id="account-error" role="alert" hidden></p>
       <div class="dialog-actions">
-        <button type="button" id="settings-cancel">Cancel</button>
-        <button type="submit" id="settings-save" class="primary">Save &amp; reload</button>
+        <button type="button" id="account-cancel">Back</button>
+        <button type="submit" id="account-save" class="primary">Save account</button>
       </div>
     </form>
   </dialog>

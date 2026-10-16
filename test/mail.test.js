@@ -343,6 +343,26 @@ test('fetchInbox parses mail, downloads only text of big messages, and closes th
   }
 });
 
+test('each account keeps its own cache: loading one account does not make the other download everything again', { timeout: 15000 }, async () => {
+  const first = await imapServer({ messages: sampleInbox().slice(0, 2) });
+  const second = await imapServer({ messages: sampleInbox().slice(0, 2) });
+  try {
+    const a = account(first.port, { user: 'a@example.com' });
+    const b = account(second.port, { user: 'b@example.com' });
+    await Promise.all([mail.fetchInbox(a), mail.fetchInbox(b)]);
+    first.state.fetches.length = 0;
+    second.state.fetches.length = 0;
+    await mail.fetchInbox(a);
+    await mail.fetchInbox(b);
+    for (const { state } of [first, second]) {
+      assert.strictEqual(state.fetches.length, 1, 'only the metadata is fetched again');
+      assert.doesNotMatch(state.fetches[0].items, /BODY/);
+    }
+  } finally {
+    await Promise.all([first.close(), second.close()]);
+  }
+});
+
 test('a huge single-part email is capped and says so instead of silently losing the end', { timeout: 15000 }, async () => {
   const html = `<p>Urgent: the site is closed on Monday.</p>${'<p>filler text</p>'.repeat(200000)}`;
   const imap = await imapServer({

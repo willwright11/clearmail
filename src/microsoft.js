@@ -109,7 +109,8 @@ const sleep = (ms, signal) => new Promise((resolve, reject) => {
 async function send(url, init, signal) {
   const timeout = AbortSignal.timeout(timing.requestTimeoutMs);
   try {
-    const res = await fetch(url, { ...init, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+    // Graph and the token endpoint never redirect; following one could carry the token away.
+    const res = await fetch(url, { ...init, redirect: 'manual', signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
     const text = await res.text();
     let data = null;
     try {
