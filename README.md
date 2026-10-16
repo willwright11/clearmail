@@ -190,12 +190,13 @@ The Mac app is built by GitHub Actions ([`.github/workflows/build-mac.yml`](.git
 
 ### Publish a new version
 
-1. On GitHub, edit `package.json` and change `"version"` (for example to `"0.2.0"`). Commit the change.
-2. Go to **Releases** → **Draft a new release** → **Choose a tag**, type `v0.2.0` (a `v` plus the same version) and click **Create new tag**. Give it a title and click **Publish release**.
-   (Or from a terminal: `git tag v0.2.0 && git push origin v0.2.0`.)
-3. The **Build Mac app** workflow starts by itself (see the **Actions** tab). After about 10 minutes, **ClearMail-0.2.0-universal.dmg** is attached to the release. If the tag doesn't match `package.json`, the build stops and says so. If no build starts, go to **Actions** → **Build Mac app** → **Run workflow**, pick the tag (for example `v0.2.0`) under **Use workflow from**, and click **Run workflow**.
+1. On GitHub, edit `package.json` and change `"version"` (for example to `"0.3.0"`). Commit the change to `main`.
+2. Go to **Actions** → **Build Mac app** → **Run workflow**, leave **Also publish a GitHub Release** ticked, and click **Run workflow**.
+3. After about 10 minutes the release **ClearMail v0.3.0** appears under **Releases**, with **ClearMail-0.3.0-universal.dmg** attached and its SHA-256 in the notes. GitHub creates the `v0.3.0` tag itself. Running it again for the same version replaces the .dmg.
 
-To build without publishing: **Actions** → **Build Mac app** → **Run workflow**. When it finishes, the .dmg is under **Artifacts** at the bottom of the run's page (as a zip; you must be signed in to GitHub to download it).
+Pushing a tag yourself (`git tag v0.3.0 && git push origin v0.3.0`) does the same; the build stops if the tag doesn't match `package.json`.
+
+To build without publishing, untick **Also publish a GitHub Release** in step 2. When it finishes, the .dmg is under **Artifacts** at the bottom of the run's page (as a zip; you must be signed in to GitHub to download it).
 
 ### Build your Microsoft app ID into the download (optional)
 
