@@ -25,22 +25,32 @@ console.warn = () => {};
 const CRLF = '\r\n';
 const q = (s) => (s == null ? 'NIL' : `"${String(s).replace(/["\\]/g, '')}"`);
 
+// Every command any mock IMAP server in this file received, to check at the end that
+// ClearMail never changed a mailbox.
+const allCommands = [];
+
+// "Name <a@b>, c@d" as an IMAP envelope address list.
 function addressList(value) {
   if (!value) return 'NIL';
-  const m = /^(?:(.*?)\s*<)?([^<>@\s]+)@([^<>\s]+?)>?$/.exec(value);
-  return `((${q(m[1] || null)} NIL ${q(m[2])} ${q(m[3])}))`;
+  const one = (part) => {
+    const m = /^(?:(.*?)\s*<)?([^<>@\s]+)@([^<>\s]+?)>?$/.exec(part.trim());
+    return `(${q(m[1] || null)} NIL ${q(m[2])} ${q(m[3])})`;
+  };
+  return `(${value.split(/,\s*/).map(one).join('')})`;
 }
 
 function envelope(h) {
   const from = addressList(h.From);
-  return `(${q(h.Date)} ${q(h.Subject)} ${from} ${from} ${h['Reply-To'] ? addressList(h['Reply-To']) : from} NIL NIL NIL NIL ${q(h['Message-ID'])})`;
+  const replyTo = h['Reply-To'] ? addressList(h['Reply-To']) : from;
+  return `(${q(h.Date)} ${q(h.Subject)} ${from} ${from} ${replyTo} ${addressList(h.To)} ${addressList(h.Cc)} ${addressList(h.Bcc)} ${q(h['In-Reply-To'])} ${q(h['Message-ID'])})`;
 }
 
-function message({ uid, flags = [], headers, body, structure, parts }) {
+function message({ uid, flags = [], headers, body, structure, parts, internalDate }) {
   const header = Object.entries(headers).map(([k, v]) => `${k}: ${v}`).join(CRLF) + CRLF + CRLF;
   return {
     uid,
     flags,
+    internalDate,
     headers,
     header,
     source: header + body,
@@ -68,11 +78,22 @@ async function start(server) {
   };
 }
 
-async function imapServer({ messages = [], password = 'secret', caps = 'IMAP4rev1 UIDPLUS SPECIAL-USE', onFetch, storeFails = false } = {}) {
-  const state = { commands: [], fetches: [], stores: [], appended: [], open: 0, connections: 0, uidValidity: nextUidValidity++ };
+// A tiny IMAP server with an INBOX and (unless sentFolder is false) a Sent folder marked
+// \Sent. EXAMINE answers read-only, as real servers do (no permanent flags). Nothing that
+// changes a mailbox is carried out: STORE, COPY, MOVE and EXPUNGE are refused and recorded.
+async function imapServer({
+  messages = [], sent = [], sentFolder = true, password = 'secret', caps = 'IMAP4rev1 UIDPLUS SPECIAL-USE', onFetch, sentHasCopy = false, uidNext: sendUidNext = true,
+} = {}) {
+  const state = {
+    commands: [], fetches: [], stores: [], appended: [], opened: [], open: 0, connections: 0,
+    boxes: { INBOX: { messages, uidValidity: nextUidValidity++ }, Sent: { messages: sent, uidValidity: nextUidValidity++ } },
+  };
+  // Kept for the tests written before there was a Sent folder.
+  Object.defineProperty(state, 'uidValidity', { get: () => state.boxes.INBOX.uidValidity, set: (v) => { state.boxes.INBOX.uidValidity = v; } });
   const server = net.createServer((socket) => {
     state.connections++;
     state.open++;
+    let selected = null;
     socket.on('close', () => state.open--);
     socket.on('error', () => {});
     const send = (s) => !socket.destroyed && socket.write(s);
@@ -113,9 +134,9 @@ async function imapServer({ messages = [], password = 'secret', caps = 'IMAP4rev
     function fetch(tag, uidMode, args) {
       const [set, ...rest] = args.split(' ');
       const items = rest.join(' ');
-      state.fetches.push({ uidMode, set, items });
-      const list = messages.map((msg, i) => ({ msg, seq: i + 1 }));
-      const max = uidMode ? Math.max(...messages.map((m) => m.uid)) : messages.length;
+      state.fetches.push({ uidMode, set, items, box: selected });
+      const list = state.boxes[selected].messages.map((msg, i) => ({ msg, seq: i + 1 }));
+      const max = uidMode ? Math.max(...list.map(({ msg }) => msg.uid)) : list.length;
       const ranges = set.split(',').map((part) => {
         const [a, b] = part.split(':');
         const lo = a === '*' ? max : Number(a);
@@ -129,7 +150,7 @@ async function imapServer({ messages = [], password = 'secret', caps = 'IMAP4rev
         const fields = [`UID ${msg.uid}`];
         if (/\bFLAGS\b/.test(items)) fields.push(`FLAGS (${msg.flags.join(' ')})`);
         if (/RFC822\.SIZE/.test(items)) fields.push(`RFC822.SIZE ${Buffer.byteLength(msg.source)}`);
-        if (/INTERNALDATE/.test(items)) fields.push('INTERNALDATE "01-Oct-2026 09:00:00 +0000"');
+        if (/INTERNALDATE/.test(items)) fields.push(`INTERNALDATE "${msg.internalDate || '01-Oct-2026 09:00:00 +0000'}"`);
         if (/ENVELOPE/.test(items)) fields.push(`ENVELOPE ${envelope(msg.headers)}`);
         if (/BODYSTRUCTURE/.test(items)) fields.push(`BODYSTRUCTURE ${msg.structure}`);
         for (const [, section, start, length] of items.matchAll(/BODY\.PEEK\[([^\]]*)\](?:<(\d+)\.(\d+)>)?/g)) {
@@ -148,6 +169,7 @@ async function imapServer({ messages = [], password = 'secret', caps = 'IMAP4rev
       const [, tag, uidMode, name, args] = m;
       const command = name.toUpperCase();
       state.commands.push(`${uidMode ? 'UID ' : ''}${command} ${args}`);
+      allCommands.push(`${uidMode ? 'UID ' : ''}${command} ${args}`);
       const ok = (msg = 'done') => send(`${tag} OK ${msg}${CRLF}`);
       switch (command) {
         case 'CAPABILITY':
@@ -160,31 +182,41 @@ async function imapServer({ messages = [], password = 'secret', caps = 'IMAP4rev
         }
         case 'SELECT':
         case 'EXAMINE': {
-          const uidNext = Math.max(0, ...messages.map((x) => x.uid)) + 1;
-          send(`* FLAGS (\\Seen \\Flagged)${CRLF}* OK [PERMANENTFLAGS (\\Seen \\Flagged \\*)] ok${CRLF}`);
-          send(`* ${messages.length} EXISTS${CRLF}* OK [UIDVALIDITY ${state.uidValidity}] ok${CRLF}* OK [UIDNEXT ${uidNext}] ok${CRLF}`);
-          return ok('[READ-WRITE] selected');
+          const boxName = args.replace(/"/g, '').split(' ')[0];
+          state.opened.push(`${command} ${boxName}`);
+          const box = state.boxes[boxName];
+          if (!box || (boxName === 'Sent' && !sentFolder)) return send(`${tag} NO [NONEXISTENT] no such mailbox${CRLF}`);
+          selected = boxName;
+          const uidNext = Math.max(0, ...box.messages.map((x) => x.uid)) + 1;
+          const readOnly = command === 'EXAMINE';
+          send(`* FLAGS (\\Seen \\Flagged)${CRLF}* OK [PERMANENTFLAGS (${readOnly ? '' : '\\Seen \\Flagged \\*'})] ok${CRLF}`);
+          send(`* ${box.messages.length} EXISTS${CRLF}* OK [UIDVALIDITY ${box.uidValidity}] ok${CRLF}${sendUidNext ? `* OK [UIDNEXT ${uidNext}] ok${CRLF}` : ''}`);
+          return ok(readOnly ? '[READ-ONLY] examined' : '[READ-WRITE] selected');
         }
         case 'FETCH':
           return fetch(tag, Boolean(uidMode), args);
-        case 'STORE': {
-          state.stores.push(args);
-          if (storeFails) return send(`${tag} NO [CANNOT] not allowed${CRLF}`);
-          const uids = args.split(' ')[0].split(',').map(Number);
-          messages.forEach((msg, i) => {
-            if (!uids.includes(msg.uid)) return;
-            if (!msg.flags.includes('\\Seen')) msg.flags.push('\\Seen');
-            send(`* ${i + 1} FETCH (UID ${msg.uid} FLAGS (${msg.flags.join(' ')}))${CRLF}`);
-          });
+        case 'SEARCH':
+          send(`* SEARCH${sentHasCopy ? ' 1' : ''}${CRLF}`);
           return ok();
-        }
+        case 'STORE':
+        case 'COPY':
+        case 'MOVE':
+        case 'EXPUNGE':
+          state.stores.push(`${command} ${args}`);
+          return send(`${tag} NO [CANNOT] the mock refuses to change a mailbox${CRLF}`);
         case 'LIST':
         case 'LSUB':
-          send(`* ${command} (\\HasNoChildren) "/" "INBOX"${CRLF}* ${command} (\\HasNoChildren \\Sent) "/" "Sent"${CRLF}`);
+          // `LIST "" ""` asks for the hierarchy delimiter, as real servers answer it.
+          if (args.trim() === '"" ""') {
+            send(`* ${command} (\\Noselect) "/" ""${CRLF}`);
+            return ok();
+          }
+          send(`* ${command} (\\HasNoChildren) "/" "INBOX"${CRLF}`);
+          if (sentFolder) send(`* ${command} (\\HasNoChildren \\Sent) "/" "Sent"${CRLF}`);
           return ok();
         case 'APPEND':
-          state.appended.push({ args, content: lits[0] });
-          return ok(`[APPENDUID ${state.uidValidity} 1] appended`);
+          state.appended.push({ args, box: args.replace(/"/g, '').split(' ')[0], content: lits[0] });
+          return ok(`[APPENDUID ${state.boxes.Sent.uidValidity} 1] appended`);
         case 'LOGOUT':
           send(`* BYE bye${CRLF}`);
           ok();
@@ -275,14 +307,21 @@ function sampleInbox() {
   return [
     message({
       uid: 11,
-      flags: ['\\Seen'],
-      headers: { From: 'Alice <alice@example.com>', Subject: 'Booking', Date: 'Thu, 01 Oct 2026 10:00:00 +0000', 'Message-ID': '<same@example.com>', 'Reply-To': 'Bookings <bookings@example.com>' },
+      flags: ['\\Seen', '\\Flagged'],
+      headers: {
+        From: 'Alice <alice@example.com>', To: 'Me <Me@Example.com>, Tom <tom@example.com>, me@example.com', Cc: 'Ann <ann@example.com>',
+        Subject: 'Booking', Date: 'Thu, 01 Oct 2026 10:00:00 +0000', 'Message-ID': '<same@example.com>', 'Reply-To': 'Bookings <bookings@example.com>',
+        'In-Reply-To': '<prev@example.com>', 'X-Priority': '1 (Highest)',
+      },
       body: 'Can you confirm the booking?\r\n',
+      internalDate: '01-Oct-2026 10:00:07 +0000',
     }),
     message({
       uid: 12,
       headers: {
-        From: 'Bob <bob@example.com>', Subject: 'Contract', Date: 'Fri, 02 Oct 2026 10:00:00 +0000', 'Message-ID': '<same@example.com>',
+        From: 'Bob <bob@example.com>', To: 'me@example.com', Subject: 'Contract', Date: 'Fri, 02 Oct 2026 10:00:00 +0000', 'Message-ID': '<same@example.com>',
+        'List-Unsubscribe': '<https://bob.example/unsub?u=1>,\r\n <mailto:unsub@bob.example>', 'List-Id': 'Bob News <news.bob.example>',
+        Precedence: 'Bulk', 'Auto-Submitted': 'Auto-Generated',
         'MIME-Version': '1.0', 'Content-Type': 'multipart/mixed; boundary="m1"',
       },
       // Apple Mail style: the PDF is marked inline but is a real attachment.
@@ -291,8 +330,12 @@ function sampleInbox() {
     }),
     message({
       uid: 14,
+      flags: ['\\Flagged'],
+      internalDate: '30-Sep-2026 10:05:00 +0000',
       headers: {
-        From: 'Big Sender <big@example.com>', Subject: 'Big one', Date: 'Wed, 30 Sep 2026 10:00:00 +0000', 'Message-ID': '<big@example.com>',
+        From: 'Big Sender <big@example.com>', To: 'Me <me@example.com>', Cc: 'Boss <Boss@Example.com>, Ann <ann@example.com>',
+        Subject: 'Big one', Date: 'Wed, 30 Sep 2026 10:00:00 +0000', 'Message-ID': '<big@example.com>',
+        'List-Unsubscribe': '<mailto:leave@big.example>', Importance: 'low',
         'MIME-Version': '1.0', 'Content-Type': 'multipart/mixed; boundary="b1"',
       },
       body: bigBody,
@@ -304,12 +347,55 @@ function sampleInbox() {
   ];
 }
 
+const RAW_EMAIL_KEYS = [
+  'attachments', 'cc', 'conversationId', 'date', 'flagged', 'focused', 'from', 'headers', 'html', 'id', 'importance', 'inReplyTo',
+  'messageId', 'receivedAt', 'references', 'replyTo', 'seen', 'subject', 'text', 'to', 'uid', 'webLink',
+];
+const NO_HEADERS = { listUnsubscribe: null, listId: null, precedence: null, autoSubmitted: null };
+
+// Every body ClearMail downloads is a PEEK, so the server never marks it as read.
+function onlyPeeks(fetches) {
+  for (const { items } of fetches) {
+    const rest = items.replace(/\b(?:BODY|BINARY)\.PEEK\[[^\]]*\](?:<\d+\.\d+>)?/g, '').replace(/RFC822\.SIZE/g, '');
+    assert.doesNotMatch(rest, /\bBODY\[|\bBINARY\[|\bRFC822\b/, `a fetch that would mark as read: ${items}`);
+  }
+}
+
 test('fetchInbox parses mail, downloads only text of big messages, and closes the connection', { timeout: 15000 }, async () => {
   const imap = await imapServer({ messages: sampleInbox() });
   try {
     const emails = await mail.fetchInbox(account(imap.port));
     assert.deepStrictEqual(emails.map((e) => e.uid), [14, 11, 12], 'sorted oldest first');
+    for (const e of emails) assert.deepStrictEqual(Object.keys(e).sort(), RAW_EMAIL_KEYS);
     const [big, booking, contract] = emails;
+
+    // RawEmail v3: recipients, flags, list headers, importance, threading.
+    assert.deepStrictEqual(booking.to, [{ name: 'Me', address: 'me@example.com' }, { name: 'Tom', address: 'tom@example.com' }]);
+    assert.deepStrictEqual(booking.cc, [{ name: 'Ann', address: 'ann@example.com' }]);
+    assert.deepStrictEqual([booking.flagged, booking.importance, booking.inReplyTo], [true, 'high', '<prev@example.com>']);
+    assert.deepStrictEqual(booking.headers, NO_HEADERS);
+    assert.strictEqual(booking.date, '2026-10-01T10:00:00.000Z');
+    assert.strictEqual(booking.receivedAt, '2026-10-01T10:00:07.000Z');
+    assert.deepStrictEqual(contract.headers, {
+      listUnsubscribe: '<https://bob.example/unsub?u=1>, <mailto:unsub@bob.example>',
+      listId: 'Bob News <news.bob.example>',
+      precedence: 'bulk',
+      autoSubmitted: 'auto-generated',
+    });
+    assert.deepStrictEqual([contract.flagged, contract.importance, contract.inReplyTo], [false, 'normal', null]);
+    assert.deepStrictEqual(contract.to, [{ name: 'me@example.com', address: 'me@example.com' }]);
+    assert.deepStrictEqual(contract.cc, []);
+    // The big message's fields come from its downloaded headers alone.
+    assert.deepStrictEqual(big.to, [{ name: 'Me', address: 'me@example.com' }]);
+    assert.deepStrictEqual(big.cc, [{ name: 'Boss', address: 'boss@example.com' }, { name: 'Ann', address: 'ann@example.com' }]);
+    assert.deepStrictEqual(big.headers, { ...NO_HEADERS, listUnsubscribe: '<mailto:leave@big.example>' });
+    assert.deepStrictEqual([big.flagged, big.importance, big.receivedAt], [true, 'low', '2026-09-30T10:05:00.000Z']);
+    for (const e of emails) assert.deepStrictEqual([e.focused, e.conversationId, e.webLink], [null, null, null], 'Outlook only');
+
+    // Read-only: the inbox was EXAMINEd, every body was a PEEK, nothing was changed or added.
+    assert.deepStrictEqual(imap.state.opened, ['EXAMINE INBOX']);
+    onlyPeeks(imap.state.fetches);
+    assert.deepStrictEqual([imap.state.stores, imap.state.appended], [[], []]);
 
     assert.notStrictEqual(booking.id, contract.id, 'duplicate Message-IDs still get unique ids');
     assert.strictEqual(booking.messageId, '<same@example.com>');
@@ -332,12 +418,17 @@ test('fetchInbox parses mail, downloads only text of big messages, and closes th
     assert.strictEqual(await settled(imap.state), 0, 'no connection left open');
     assert.ok(imap.state.commands.some((c) => c.startsWith('LOGOUT')));
 
-    // A refresh only asks for the metadata again.
+    // A refresh only asks for the metadata again, and picks up what changed in the user's mail app.
     imap.state.fetches.length = 0;
+    const [m11, m12] = imap.state.boxes.INBOX.messages;
+    m11.flags = ['\\Flagged'];
+    m12.flags = ['\\Seen', '\\Flagged'];
     const again = await mail.fetchInbox(account(imap.port));
     assert.deepStrictEqual(again.map((e) => e.id), emails.map((e) => e.id), 'ids are stable');
     assert.strictEqual(imap.state.fetches.length, 1, 'cached messages are not downloaded again');
     assert.doesNotMatch(imap.state.fetches[0].items, /BODY/);
+    assert.deepStrictEqual(again.map((e) => [e.uid, e.seen, e.flagged]), [[14, false, true], [11, false, true], [12, true, true]]);
+    assert.deepStrictEqual(again[2].headers, contract.headers, 'the rest comes from the cache');
   } finally {
     await imap.close();
   }
@@ -434,33 +525,6 @@ test('a connection reset mid-fetch rejects cleanly instead of crashing', { timeo
   }
 });
 
-test('markSeen uses one connection and one STORE for all ids, and rejects when the server refuses', { timeout: 10000 }, async () => {
-  const imap = await imapServer({ messages: sampleInbox().slice(0, 2) });
-  try {
-    await mail.fetchInbox(account(imap.port));
-    imap.state.connections = 0;
-    await mail.markSeen(account(imap.port), [12, 11, 12]);
-    assert.strictEqual(imap.state.connections, 1);
-    assert.deepStrictEqual(imap.state.stores, ['12,11 +FLAGS (\\Seen)']);
-    assert.strictEqual(await settled(imap.state), 0);
-
-    // UIDs from before a UIDVALIDITY change would point at other messages.
-    imap.state.uidValidity += 1;
-    await assert.rejects(mail.markSeen(account(imap.port), [12]), /changed on the server/);
-    assert.strictEqual(imap.state.stores.length, 1);
-  } finally {
-    await imap.close();
-  }
-
-  const refusing = await imapServer({ messages: sampleInbox().slice(0, 2), storeFails: true });
-  try {
-    await mail.fetchInbox(account(refusing.port));
-    await assert.rejects(mail.markSeen(account(refusing.port), [12]), /mark the email as read/);
-  } finally {
-    await refusing.close();
-  }
-});
-
 test('IMAP STARTTLS is required: no password is sent to a server without it', { timeout: 10000 }, async () => {
   allowPlain = false;
   const imap = await imapServer({ messages: sampleInbox() });
@@ -508,12 +572,169 @@ test('sendReply answers the Reply-To address, threads the reply and files it in 
     assert.match(sent, /^Message-ID: <.+>/m);
     assert.match(sent, /^Date: /m);
     assert.strictEqual(imap.state.appended.length, 1);
+    assert.strictEqual(imap.state.appended[0].box, 'Sent');
     assert.match(imap.state.appended[0].args, /"?Sent"? \(\\Seen\)/);
     assert.strictEqual(imap.state.appended[0].content.toString().trimEnd(), sent.trimEnd(), 'Sent copy matches what was delivered');
+    // Sent was only looked at read-only, to check the server hadn't filed a copy itself.
+    assert.deepStrictEqual(imap.state.opened, ['EXAMINE Sent']);
+    assert.ok(imap.state.commands.some((c) => /^UID SEARCH HEADER Message-ID/i.test(c)));
+    assert.deepStrictEqual(imap.state.stores, []);
     assert.strictEqual(await settled(imap.state), 0);
   } finally {
     await imap.close();
     await smtp.close();
+  }
+});
+
+test('sendReply adds no second copy when the server filed one, and none when there is no Sent folder', { timeout: 10000 }, async () => {
+  const original = { from: { name: 'Alice', address: 'alice@example.com' }, replyTo: null, subject: 'Hi', messageId: '<a@example.com>', references: [] };
+  for (const [options, filed] of [[{ sentHasCopy: true }, true], [{ sentFolder: false }, false]]) {
+    const imap = await imapServer(options);
+    const smtp = await smtpServer();
+    try {
+      const result = await mail.sendReply(account(imap.port, { smtpPort: smtp.port }), original, 'Thanks');
+      assert.strictEqual(result.sent, true);
+      assert.strictEqual(await result.filedInSent, filed);
+      assert.deepStrictEqual(imap.state.appended, []);
+      assert.ok(!imap.state.opened.some((c) => c.startsWith('SELECT')));
+      assert.strictEqual(await settled(imap.state), 0);
+    } finally {
+      await imap.close();
+      await smtp.close();
+    }
+  }
+});
+
+// ---------- sent history ----------
+
+function sentMail(uid, { to = 'Sarah <Sarah@Example.com>', cc, bcc, inReplyTo, date } = {}) {
+  return message({
+    uid,
+    flags: ['\\Seen'],
+    headers: {
+      From: 'Me <Me@example.com>', To: to, ...(cc ? { Cc: cc } : {}), ...(bcc ? { Bcc: bcc } : {}),
+      Subject: `Sent ${uid}`, Date: date || new Date(Date.UTC(2026, 8, 1) + uid * 3600_000).toUTCString(), 'Message-ID': `<sent-${uid}@example.com>`,
+      ...(inReplyTo ? { 'In-Reply-To': inReplyTo } : {}),
+    },
+    body: `Private reply ${uid}\r\n`,
+  });
+}
+
+const sentFetches = (state) => state.fetches.filter((f) => f.box === 'Sent');
+
+test('fetchSentHistory reads Sent read-only by envelope, then only what is new', { timeout: 15000 }, async () => {
+  const imap = await imapServer({
+    messages: sampleInbox().slice(0, 1),
+    sent: [
+      sentMail(5, { cc: 'Tom <tom@example.com>, sarah@example.com', bcc: 'Dad <dad@example.com>', inReplyTo: '<same@example.com>' }),
+      sentMail(6, { date: 'not a date' }),
+      sentMail(9, { to: 'Priya <priya@example.com>' }),
+    ],
+  });
+  try {
+    const acct = account(imap.port);
+    const before = Date.now();
+    const first = await mail.fetchSentHistory(acct, null);
+    assert.strictEqual(first.full, true);
+    assert.deepStrictEqual(first.entries, [
+      { from: 'me@example.com', to: ['sarah@example.com', 'tom@example.com', 'dad@example.com'], date: '2026-09-01T05:00:00.000Z', conversationId: null, inReplyTo: '<same@example.com>' },
+      { from: 'me@example.com', to: ['priya@example.com'], date: '2026-09-01T09:00:00.000Z', conversationId: null, inReplyTo: null },
+    ], 'oldest first; one with no date is left out');
+    const box = imap.state.boxes.Sent;
+    assert.deepStrictEqual({ ...first.cursor, fullAt: 0 }, { kind: 'imap', path: 'Sent', uidValidity: String(box.uidValidity), lastUid: 9, fullAt: 0 });
+    assert.ok(first.cursor.fullAt >= before && first.cursor.fullAt <= Date.now());
+    // Envelopes only, from a folder opened read-only: no email content is downloaded.
+    assert.deepStrictEqual(imap.state.opened, ['EXAMINE Sent']);
+    assert.deepStrictEqual(sentFetches(imap.state).map((f) => [f.uidMode, f.set]), [[false, '1:*']]);
+    for (const f of sentFetches(imap.state)) {
+      assert.match(f.items, /ENVELOPE/);
+      assert.doesNotMatch(f.items, /BODY|RFC822|BINARY/);
+    }
+
+    // A new sent email: only it is fetched, by UID.
+    box.messages.push(sentMail(12, { to: 'Jo <jo@example.com>' }));
+    imap.state.fetches.length = 0;
+    const second = await mail.fetchSentHistory(acct, first.cursor);
+    assert.strictEqual(second.full, false);
+    assert.deepStrictEqual(second.entries.map((e) => e.to), [['jo@example.com']]);
+    assert.deepStrictEqual(sentFetches(imap.state).map((f) => [f.uidMode, f.set]), [[true, '10:*']]);
+    assert.deepStrictEqual(second.cursor, { ...first.cursor, lastUid: 12 });
+
+    // Nothing new (UIDNEXT says so): nothing is fetched at all.
+    imap.state.fetches.length = 0;
+    const third = await mail.fetchSentHistory(acct, second.cursor);
+    assert.deepStrictEqual([third.full, third.entries, third.cursor], [false, [], second.cursor]);
+    assert.deepStrictEqual(sentFetches(imap.state), []);
+
+    // The folder's UIDVALIDITY changed (rebuilt on the server): UIDs mean nothing now, start again.
+    box.uidValidity += 1000;
+    const reset = await mail.fetchSentHistory(acct, third.cursor);
+    assert.deepStrictEqual([reset.full, reset.entries.length, reset.cursor.uidValidity], [true, 3, String(box.uidValidity)]);
+
+    // And every 30 days, or with a cursor that doesn't fit this folder.
+    for (const cursor of [
+      { ...reset.cursor, fullAt: Date.now() - 31 * 24 * 3600_000 },
+      { ...reset.cursor, path: 'Old Sent' },
+      { ...reset.cursor, lastUid: -1 },
+      { kind: 'graph', since: '2026-10-01T00:00:00Z', fullAt: Date.now() },
+      'junk',
+    ]) {
+      const again = await mail.fetchSentHistory(acct, cursor);
+      assert.deepStrictEqual([again.full, again.entries.length], [true, 3], JSON.stringify(cursor));
+    }
+    assert.deepStrictEqual([imap.state.appended, imap.state.stores], [[], []]);
+    assert.ok(imap.state.opened.every((c) => c === 'EXAMINE Sent'));
+    assert.strictEqual(await settled(imap.state), 0);
+  } finally {
+    await imap.close();
+  }
+});
+
+test('fetchSentHistory: at most the newest 500, and a server that hides UIDNEXT still gets only new ones', { timeout: 20000 }, async () => {
+  const imap = await imapServer({ sent: Array.from({ length: 520 }, (_, i) => sentMail(i + 1, { to: `p${i}@example.com` })), uidNext: false });
+  try {
+    const acct = account(imap.port);
+    const first = await mail.fetchSentHistory(acct, null);
+    assert.strictEqual(first.entries.length, 500);
+    assert.deepStrictEqual([first.entries[0].to, first.entries.at(-1).to], [['p20@example.com'], ['p519@example.com']]);
+    assert.deepStrictEqual(sentFetches(imap.state).map((f) => f.set), ['21:*']);
+    assert.strictEqual(first.cursor.lastUid, 520);
+
+    // Without UIDNEXT it has to ask; "UID FETCH 521:*" then returns the newest message (520)
+    // anyway, which isn't new.
+    imap.state.fetches.length = 0;
+    const again = await mail.fetchSentHistory(acct, first.cursor);
+    assert.deepStrictEqual(sentFetches(imap.state).map((f) => [f.uidMode, f.set]), [[true, '521:*']]);
+    assert.deepStrictEqual([again.full, again.entries, again.cursor.lastUid], [false, [], 520]);
+
+    // More than 500 new since the last sync: the newest 500 of them.
+    imap.state.boxes.Sent.messages.push(...Array.from({ length: 503 }, (_, i) => sentMail(521 + i, { to: `n${i}@example.com` })));
+    const more = await mail.fetchSentHistory(acct, again.cursor);
+    assert.deepStrictEqual([more.full, more.entries.length, more.entries[0].to, more.cursor.lastUid], [false, 500, ['n3@example.com'], 1023]);
+  } finally {
+    await imap.close();
+  }
+});
+
+test('fetchSentHistory: no Sent folder is an empty history, not an error', { timeout: 10000 }, async () => {
+  const imap = await imapServer({ sentFolder: false });
+  try {
+    const batch = await mail.fetchSentHistory(account(imap.port), null);
+    assert.deepStrictEqual({ ...batch, cursor: { ...batch.cursor, fullAt: 0 } }, {
+      cursor: { kind: 'imap', path: null, uidValidity: null, lastUid: 0, fullAt: 0 }, full: true, entries: [],
+    });
+    assert.deepStrictEqual(imap.state.opened, []);
+    assert.strictEqual(await settled(imap.state), 0);
+  } finally {
+    await imap.close();
+  }
+
+  // A login the server rejects is a sentence, like everywhere else.
+  const refusing = await imapServer();
+  try {
+    await assert.rejects(mail.fetchSentHistory(account(refusing.port, { pass: 'wrong' }), null), /rejected the login/);
+  } finally {
+    await refusing.close();
   }
 });
 
@@ -556,4 +777,20 @@ test('an email whose HTML mailparser cannot convert is still read, not replaced 
 test('sendReply refuses to send without an email address to send from', async () => {
   const original = { from: { name: 'Bob', address: 'bob@example.com' }, replyTo: null, subject: 'x', messageId: null };
   await assert.rejects(mail.sendReply(account(1, { user: 'jsmith' }), original, 'hi'), /full email address/);
+});
+
+test('there is no way to mark as read, and nothing ClearMail did changed a mailbox', () => {
+  assert.strictEqual(mail.markSeen, undefined);
+  assert.ok(allCommands.length > 50, 'the tests above talked to the mock servers');
+  for (const command of allCommands) {
+    assert.doesNotMatch(command, /^(?:UID )?(?:STORE|COPY|MOVE|EXPUNGE|SELECT|CLOSE|DELETE|RENAME|CREATE)\b/i, command);
+    if (/^EXAMINE /i.test(command)) assert.match(command, /^EXAMINE "?(?:INBOX|Sent)"?$/, command);
+    if (/^APPEND /i.test(command)) assert.match(command, /^APPEND "?Sent"? \(\\Seen\)/, command);
+    if (/^(?:UID )?FETCH /i.test(command)) {
+      const items = command.replace(/\b(?:BODY|BINARY)\.PEEK\[[^\]]*\](?:<\d+\.\d+>)?/g, '').replace(/RFC822\.SIZE/g, '');
+      assert.doesNotMatch(items, /\bBODY\[|\bBINARY\[|\bRFC822\b/, command);
+    }
+  }
+  // The only APPENDs are the replies the sendReply tests sent.
+  assert.strictEqual(allCommands.filter((c) => /^APPEND /i.test(c)).length, 1);
 });

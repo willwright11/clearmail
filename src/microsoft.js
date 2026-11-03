@@ -1,13 +1,66 @@
 // Outlook.com and Microsoft 365 through Microsoft Graph. Microsoft has turned off
 // app-password IMAP and SMTP, so ClearMail signs in with OAuth 2.0 in the user's own
 // browser (authorization code + PKCE, as a public client with no secret) and then reads
-// and sends mail with Graph. Nothing in this file logs tokens, codes or email content.
+// mail and sends replies with Graph. Nothing in this file logs tokens, codes or email content.
+//
+// ClearMail reads and replies, and never changes the mailbox. It asks Microsoft for
+// Mail.Read and Mail.Send only: Mail.ReadWrite (which can mark as read, move or delete) is
+// never requested. graph() also refuses, before anything is sent, every request that isn't a
+// read (GET, or a $batch of GETs) or a reply the user wrote (POST /me/messages/{id}/reply).
 
 const crypto = require('crypto');
 const http = require('http');
 const { htmlToText } = require('./cleaner');
 
-const SCOPES = 'openid profile email offline_access https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send';
+/**
+ * An email as both backends return it (src/mail.js builds the same shape).
+ * @typedef {{ name: string, address: string }} Address  the address is lower-cased
+ * @typedef {{ listUnsubscribe: string|null, listId: string|null, precedence: string|null,
+ *   autoSubmitted: string|null }} MailHeaders  raw values (precedence and autoSubmitted lower-cased)
+ * @typedef {Object} RawEmail
+ * @property {string} id
+ * @property {string|null} messageId
+ * @property {number|null} uid  IMAP only
+ * @property {Address} from
+ * @property {Address|null} replyTo
+ * @property {Address[]} to
+ * @property {Address[]} cc
+ * @property {string} subject
+ * @property {string} date  ISO: when it was sent
+ * @property {string} receivedAt  ISO: when it arrived
+ * @property {string} text
+ * @property {string} html  kept as data, never rendered
+ * @property {boolean} seen  the mailbox's own read state (ClearMail never changes it)
+ * @property {boolean} flagged
+ * @property {string[]} references
+ * @property {{ filename: string, size: number }[]} attachments
+ * @property {MailHeaders|null} headers  null while unknown
+ * @property {'low'|'normal'|'high'} importance
+ * @property {boolean|null} focused  Outlook's Focused (true) or Other (false); null over IMAP
+ * @property {string|null} conversationId  Graph only
+ * @property {string|null} inReplyTo
+ * @property {string|null} webLink  Graph only: https on an Outlook web host, else null
+ *
+ * What fetchSentHistory returns. `full` means the entries are the whole history (start
+ * again from them); otherwise they are only what was sent since the cursor passed in.
+ * @typedef {{ from: string, to: string[], date: string, conversationId: string|null,
+ *   inReplyTo: string|null }} SentEntry  addresses lower-cased; to holds To, Cc and Bcc
+ * @typedef {{ cursor: { kind: 'graph', since: string|null, fullAt: number }, full: boolean,
+ *   entries: SentEntry[] }} SentBatch
+ *
+ * Options every mail call takes. onRefreshToken gets each new refresh token Microsoft hands
+ * out; onGrantedScopes gets the permissions a refreshed token carries, when they change.
+ * @typedef {{ clientId: string, onRefreshToken?: (token: string) => any,
+ *   onGrantedScopes?: (scopes: string[]) => any }} GraphOptions
+ */
+
+const SCOPES = 'openid profile email offline_access https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send';
+const GRAPH_SCOPE_PREFIX = 'https://graph.microsoft.com/';
+// A permission that could change the mailbox. Asked for by ClearMail 0.2, so an old consent
+// can still carry it; the account then shows how to take it back.
+const WRITE_SCOPE_RE = /^Mail\.ReadWrite(?:\.Shared)?$/i;
+// The `tid` of every personal Microsoft account (Outlook.com, Hotmail, Live).
+const PERSONAL_TENANT = '9188040d-6c67-4c5b-b112-36a304b66dad';
 
 const DEFAULT_ENDPOINTS = { login: 'https://login.microsoftonline.com', graph: 'https://graph.microsoft.com' };
 const DEFAULT_TIMING = {
@@ -15,18 +68,28 @@ const DEFAULT_TIMING = {
   attempts: 3, // tries for a request Microsoft throttles (429/503)
   maxRetryWaitMs: 20 * 1000, // a longer Retry-After gives up straight away instead
   backoffMs: 1000, // first wait when Microsoft gives no Retry-After; doubles each time
+  headerBudgetMs: 15 * 1000, // time a load may spend on mailing-list headers before showing the emails without them
 };
 let endpoints = { ...DEFAULT_ENDPOINTS };
 let timing = { ...DEFAULT_TIMING };
 
 const REFRESH_EARLY_MS = 5 * 60 * 1000; // refresh access tokens this long before they expire
-const PAGE_SIZE = 100; // messages per Graph page
+const PAGE_SIZE = 50; // messages per Graph page (big pages can time out at Microsoft's end)
 const BATCH_LIMIT = 20; // Graph's limit for one JSON batch
 const TEXT_LIMIT = 1024 * 1024; // characters of body text kept per email, as mail.js does
-const MESSAGE_FIELDS = 'id,internetMessageId,subject,from,sender,replyTo,sentDateTime,receivedDateTime,isRead,body';
+const MESSAGE_FIELDS = 'id,internetMessageId,subject,from,sender,replyTo,toRecipients,ccRecipients,sentDateTime,receivedDateTime,' +
+  'isRead,importance,inferenceClassification,flag,conversationId,webLink,body';
 const ATTACHMENT_FIELDS = 'name,size,isInline,contentType'; // never contentBytes: no attachment is downloaded
+const SENT_FIELDS = 'id,from,toRecipients,ccRecipients,bccRecipients,conversationId,sentDateTime';
+const SENT_LIMIT = 500; // sent emails read at most per sync
+const SENT_FULL_EVERY_MS = 30 * 24 * 3600 * 1000; // the sent history is rebuilt from scratch this often
+const HEADER_CACHE_LIMIT = 10000; // emails whose mailing-list headers are remembered (they never change)
+const ADDRESS_LIMIT = 500; // recipients kept per email
+// Where an email's "Open in Outlook on the web" link may point.
+const WEB_LINK_HOSTS = new Set(['outlook.live.com', 'outlook.office.com', 'outlook.office365.com', 'outlook.cloud.microsoft']);
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+$/;
+const PERSONAL_DOMAIN_RE = /@(?:outlook|hotmail|live|msn|passport)\.[a-z.]+$/i;
 
 const MSG = {
   noClientId: 'To add an Outlook account, ClearMail needs a Microsoft app ID (the "Application (client) ID"). Add it in Settings. See "Using Outlook" in the README for the 5-minute setup.',
@@ -56,12 +119,13 @@ const MSG = {
   noMailbox: "ClearMail can't reach the mailbox of this Microsoft account. The account may not have an Outlook mailbox, or your organisation may keep its email on its own servers.",
   gone: 'This email is no longer in your Outlook inbox (it may have been moved or deleted). Refresh and try again.',
   truncated: 'This email is very long, so ClearMail only shows the start of it. Open it in Outlook to read the rest.',
+  blocked: 'ClearMail stopped a request that would have changed your mailbox. ClearMail only reads your email and sends the replies you write, so nothing was changed.',
 };
 
 const ACTION = {
   signIn: "Couldn't sign in to Microsoft",
   load: "Couldn't load your Outlook inbox",
-  seen: "Couldn't mark the email as read",
+  history: "Couldn't read your sent emails",
   reply: "Couldn't send your reply",
 };
 
@@ -206,6 +270,46 @@ function checkClientId(value) {
   return id;
 }
 
+// ---------- permissions ----------
+
+/**
+ * The permissions in a token response's `scope`, as short names ("Mail.Read", not
+ * "https://graph.microsoft.com/Mail.Read"), sorted. null when Microsoft didn't list any.
+ * @param {unknown} value
+ * @returns {string[]|null}
+ */
+function scopeList(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const out = new Set();
+  for (const word of value.trim().split(/\s+/)) {
+    const name = word.toLowerCase().startsWith(GRAPH_SCOPE_PREFIX) ? word.slice(GRAPH_SCOPE_PREFIX.length) : word;
+    if (/^[\w.-]{1,100}$/.test(name)) out.add(name);
+  }
+  return [...out].sort();
+}
+
+/**
+ * Whether these granted permissions could change the mailbox (an old Mail.ReadWrite
+ * consent). ClearMail never uses it, but the user may want to take it back.
+ * @param {string[]|null|undefined} grantedScopes
+ */
+function grantsMailboxChanges(grantedScopes) {
+  return Array.isArray(grantedScopes) && grantedScopes.some((s) => typeof s === 'string' && WRITE_SCOPE_RE.test(s));
+}
+
+// The tenant of the id_token, read without checking its signature: it only decides which
+// Microsoft page ClearMail points to, never what ClearMail may do.
+function tenantOf(idToken) {
+  const part = typeof idToken === 'string' ? idToken.split('.')[1] : '';
+  if (!part || part.length > 16384) return null;
+  try {
+    const claims = JSON.parse(Buffer.from(part, 'base64url').toString('utf8'));
+    return typeof claims?.tid === 'string' ? claims.tid.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
 // ---------- tokens ----------
 
 async function tokenRequest(params, context, signal) {
@@ -225,24 +329,27 @@ async function tokenRequest(params, context, signal) {
 // newest one yet still shares the session; any other token means a fresh sign-in.
 const sessions = new Map();
 
+const accountKey = (account) => String(account.id || account.email || '');
+
 function sessionFor(account) {
-  const key = String(account.id || account.email || '');
+  const key = accountKey(account);
   let s = sessions.get(key);
   if (!s || !s.known.includes(account.refreshToken)) {
-    s = { token: null, expiresAt: 0, refreshToken: account.refreshToken, known: [account.refreshToken], pending: null };
+    s = { token: null, expiresAt: 0, refreshToken: account.refreshToken, known: [account.refreshToken], pending: null, scopes: null };
     sessions.set(key, s);
   }
   return s;
 }
 
-function tellNewToken(onRefreshToken, token) {
-  if (typeof onRefreshToken !== 'function') return;
+// Calls back main without letting its failure break the mail call.
+function tell(callback, value) {
+  if (typeof callback !== 'function') return;
   try {
-    Promise.resolve(onRefreshToken(token)).catch(() => {});
+    Promise.resolve(callback(value)).catch(() => {});
   } catch {}
 }
 
-async function refresh(s, { clientId, onRefreshToken }) {
+async function refresh(s, { clientId, onRefreshToken, onGrantedScopes }) {
   const data = await tokenRequest({
     client_id: checkClientId(clientId),
     grant_type: 'refresh_token',
@@ -257,7 +364,13 @@ async function refresh(s, { clientId, onRefreshToken }) {
     s.refreshToken = next;
     s.known.push(next);
     if (s.known.length > 20) s.known.splice(1, 1);
-    tellNewToken(onRefreshToken, next);
+    tell(onRefreshToken, next);
+  }
+  // What the token is valid for, so Settings can warn about an old Mail.ReadWrite consent.
+  const scopes = scopeList(data.scope);
+  if (scopes && scopes.join(' ') !== (s.scopes || []).join(' ')) {
+    s.scopes = scopes;
+    tell(onGrantedScopes, [...scopes]);
   }
   return s.token;
 }
@@ -272,20 +385,55 @@ async function accessToken(account, opts) {
 }
 
 function dropToken(account, token) {
-  const s = sessions.get(String(account.id || account.email || ''));
+  const s = sessions.get(accountKey(account));
   if (s && s.token === token) {
     s.token = null;
     s.expiresAt = 0;
   }
 }
 
+// ---------- the write guard ----------
+
+const REPLY_PATH_RE = /^\/me\/messages\/[^/]+\/reply$/;
+
+// A $batch ClearMail may send: 1–20 GETs of Graph paths, with no bodies.
+function getOnlyBatch(body) {
+  const list = body && typeof body === 'object' ? body.requests : null;
+  return Array.isArray(list) && list.length > 0 && list.length <= BATCH_LIMIT && list.every((r) => r && typeof r === 'object' &&
+    r.method === 'GET' && r.body === undefined && typeof r.url === 'string' && /^\/[^/\\]/.test(r.url));
+}
+
+// The only requests ClearMail makes: a read (GET, or a $batch of GETs) or a reply
+// (POST /me/messages/{id}/reply), and only to Graph itself. Anything else would change
+// the mailbox, or send the token elsewhere, so it is never sent.
+function allowed(method, url, body) {
+  let target;
+  let base;
+  try {
+    target = new URL(url);
+    base = new URL(endpoints.graph);
+  } catch {
+    return false;
+  }
+  if (target.origin !== base.origin || target.username || target.password) return false;
+  const root = `${base.pathname.replace(/\/+$/, '')}/v1.0/`;
+  if (!target.pathname.startsWith(root)) return false;
+  const path = target.pathname.slice(root.length - 1); // dot segments are already resolved by URL
+  if (method === 'GET') return body === undefined;
+  if (method !== 'POST') return false;
+  if (path === '/$batch') return !target.search && getOnlyBatch(body);
+  return REPLY_PATH_RE.test(path) && !target.search;
+}
+
 // A Graph call as this account. target is a path under /v1.0 or a full nextLink URL.
-async function graph(account, opts, method, target, { body, headers } = {}) {
-  const url = /^https?:\/\//.test(target) ? target : `${endpoints.graph}/v1.0${target}`;
+async function graph(account, opts, method, target, { body, headers, signal } = {}) {
+  const verb = String(method || '').toUpperCase();
+  const url = /^https?:\/\//i.test(target) ? target : `${endpoints.graph}/v1.0${target}`;
+  if (!allowed(verb, url, body)) throw fail('server', MSG.blocked, new Error(`Refused to send ${verb} to Microsoft Graph`));
   for (let attempt = 1; ; attempt++) {
     const token = await accessToken(account, opts);
     const res = await withRetry(() => send(url, {
-      method,
+      method: verb,
       headers: {
         Authorization: `Bearer ${token}`,
         Accept: 'application/json',
@@ -293,7 +441,7 @@ async function graph(account, opts, method, target, { body, headers } = {}) {
         ...headers,
       },
       body: body === undefined ? undefined : JSON.stringify(body),
-    }));
+    }, signal), signal);
     // An access token can stop working before it expires (a password change, say): refresh once.
     if (res.status === 401 && attempt === 1) {
       dropToken(account, token);
@@ -301,6 +449,35 @@ async function graph(account, opts, method, target, { body, headers } = {}) {
     }
     return res;
   }
+}
+
+// Up to 20 GETs in one JSON batch. Throttled ones are retried on their own, as Microsoft
+// asks; any that stay throttled come back with their 429. Answers are in the order of
+// `paths` as { status, body } (status 0: Microsoft didn't answer that one).
+async function batchGet(account, opts, paths, action, { signal } = {}) {
+  const out = paths.map(() => ({ status: 0, body: null }));
+  let pending = paths.map((url, i) => ({ id: String(i + 1), method: 'GET', url }));
+  for (let attempt = 1; pending.length; attempt++) {
+    const res = await graph(account, opts, 'POST', '/$batch', { body: { requests: pending }, signal });
+    if (res.status !== 200) throw graphError(res, action);
+    const answers = new Map((Array.isArray(res.data?.responses) ? res.data.responses : []).map((r) => [String(r?.id), r]));
+    const busy = [];
+    let wait = 0;
+    for (const request of pending) {
+      const answer = answers.get(request.id);
+      const status = Number(answer?.status) || 0;
+      out[Number(request.id) - 1] = { status, body: answer?.body ?? null };
+      if (!isBusy(status)) continue;
+      const headers = answer.headers && typeof answer.headers === 'object' ? answer.headers : {};
+      const after = Object.entries(headers).find(([k]) => k.toLowerCase() === 'retry-after')?.[1];
+      wait = Math.max(wait, retryDelay(after, attempt));
+      busy.push(request);
+    }
+    if (!busy.length || attempt >= timing.attempts || wait > timing.maxRetryWaitMs) break;
+    await sleep(wait, signal);
+    pending = busy;
+  }
+  return out;
 }
 
 // ---------- sign-in ----------
@@ -434,14 +611,24 @@ async function finishSignIn(params, { clientId, verifier, redirectUri, signal })
   const email = String(me.data?.mail || me.data?.userPrincipalName || '').trim().toLowerCase();
   if (!EMAIL_RE.test(email)) throw fail('server', MSG.noEmail);
   const name = String(me.data?.displayName || '').trim() || email;
-  return { email, name, refreshToken: tokens.refresh_token };
+  const tenant = tenantOf(tokens.id_token);
+  return {
+    email,
+    name,
+    refreshToken: tokens.refresh_token,
+    grantedScopes: scopeList(tokens.scope) || [],
+    // Decides which Microsoft page lists the app's permissions (personal or work account).
+    personal: tenant ? tenant === PERSONAL_TENANT : PERSONAL_DOMAIN_RE.test(email),
+  };
 }
 
 /**
- * Signs in to a Microsoft account in the system browser.
+ * Signs in to a Microsoft account in the system browser. grantedScopes are the
+ * permissions Microsoft granted, as short names; personal is true for Outlook.com-style
+ * accounts and false for work or school ones.
  * @param {{ clientId: string, openUrl: (url: string) => any, loginHint?: string,
  *   timeoutMs?: number, signal?: AbortSignal }} options
- * @returns {Promise<{ email: string, name: string, refreshToken: string }>}
+ * @returns {Promise<{ email: string, name: string, refreshToken: string, grantedScopes: string[], personal: boolean }>}
  */
 async function signIn({ clientId, openUrl, loginHint, timeoutMs = 300000, signal } = {}) {
   try {
@@ -502,6 +689,16 @@ function toAddress(recipient) {
   return { name: String(entry.name || '').trim() || address, address };
 }
 
+// A Graph recipient list as unique addresses, in order.
+function addressList(...lists) {
+  const out = new Map();
+  for (const recipient of lists.flatMap((list) => (Array.isArray(list) ? list : []))) {
+    const found = toAddress(recipient);
+    if (found && !out.has(found.address) && out.size < ADDRESS_LIMIT) out.set(found.address, found);
+  }
+  return [...out.values()];
+}
+
 function isoDate(...candidates) {
   for (const value of candidates) {
     const date = value ? new Date(value) : null;
@@ -531,21 +728,57 @@ function bodyOf(body) {
 // Same rule as mail.js: images embedded in the body are not attachments.
 const isAttachment = (a) => a && typeof a === 'object' && !(a.isInline && (!a.contentType || /^image\//i.test(a.contentType)));
 
+/**
+ * The email's "Open in Outlook on the web" link, if it is https on one of Outlook's own
+ * web hosts; null otherwise, so ClearMail never opens anywhere else.
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+function safeWebLink(value) {
+  if (typeof value !== 'string' || !value || value.length > 4096) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || url.username || url.password || url.port || !WEB_LINK_HOSTS.has(url.hostname)) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+const IMPORTANCE = new Set(['low', 'normal', 'high']);
+const importanceOf = (value) => (IMPORTANCE.has(String(value || '').toLowerCase()) ? String(value).toLowerCase() : 'normal');
+
+function focusedOf(value) {
+  const kind = String(value || '').toLowerCase();
+  return kind === 'focused' ? true : kind === 'other' ? false : null;
+}
+
+const idOrNull = (value) => (typeof value === 'string' && value.trim() ? value.trim() : null);
+
 function toRawEmail(msg) {
-  const messageId = typeof msg.internetMessageId === 'string' ? msg.internetMessageId.trim() : '';
   return {
     id: msg.id,
-    messageId: messageId || null,
+    messageId: idOrNull(msg.internetMessageId),
     uid: null,
     from: toAddress(msg.from) || toAddress(msg.sender) || { name: 'Unknown sender', address: '' },
     replyTo: [].concat(msg.replyTo || []).map(toAddress).find(Boolean) || null,
+    to: addressList(msg.toRecipients),
+    cc: addressList(msg.ccRecipients),
     subject: String(msg.subject ?? ''),
     date: isoDate(msg.sentDateTime, msg.receivedDateTime),
+    receivedAt: isoDate(msg.receivedDateTime, msg.sentDateTime),
     ...bodyOf(msg.body),
     seen: msg.isRead === true,
+    flagged: String(msg.flag?.flagStatus || '').toLowerCase() === 'flagged',
     references: [],
     attachments: [].concat(msg.attachments || []).filter(isAttachment)
       .map((a) => ({ filename: String(a.name || 'attachment'), size: Number(a.size) || 0 })),
+    headers: null, // filled in from the header cache once known
+    importance: importanceOf(msg.importance),
+    focused: focusedOf(msg.inferenceClassification),
+    conversationId: idOrNull(msg.conversationId),
+    inReplyTo: null, // from the headers too
+    webLink: safeWebLink(msg.webLink),
   };
 }
 
@@ -559,14 +792,92 @@ function nextPage(link) {
   }
 }
 
+// ---------- mailing-list headers ----------
+
+// Graph only returns internetMessageHeaders for one message at a time, so they are fetched
+// in batches the first time an email is seen and remembered: they never change.
+// `${account}\n${message id}` -> { headers, inReplyTo }, oldest first.
+const headerCache = new Map();
+
+const headerKey = (account, id) => `${accountKey(account)}\n${id}`;
+
+function tidyHeader(value) {
+  if (value == null) return null;
+  const text = String(value).replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 500);
+  return text || null;
+}
+
+const lowerHeader = (value) => tidyHeader(value)?.toLowerCase() ?? null;
+
+// The first <message-id> in a header value.
+function messageIdOf(value) {
+  const text = tidyHeader(value);
+  if (!text) return null;
+  return /<[^<>\s]+>/.exec(text)?.[0] ?? text.split(' ')[0];
+}
+
+function headersOf(list) {
+  const lines = Array.isArray(list) ? list : [];
+  const value = (name) => lines.find((h) => h && String(h.name || '').toLowerCase() === name)?.value;
+  return {
+    headers: {
+      listUnsubscribe: tidyHeader(value('list-unsubscribe')),
+      listId: tidyHeader(value('list-id')),
+      precedence: lowerHeader(value('precedence')),
+      autoSubmitted: lowerHeader(value('auto-submitted')),
+    },
+    inReplyTo: messageIdOf(value('in-reply-to')),
+  };
+}
+
+function rememberHeaders(key, value) {
+  headerCache.delete(key);
+  headerCache.set(key, value);
+  while (headerCache.size > HEADER_CACHE_LIMIT) headerCache.delete(headerCache.keys().next().value);
+}
+
+// Microsoft won't give this email's headers, and asking again won't change that.
+const refusedForGood = (status) => status >= 400 && status < 500 && ![404, 408, 409, 429].includes(status);
+
+// Fetches the headers of the emails not yet cached, newest first, for at most
+// headerBudgetMs. They only help sorting, so a failure or running out of time just leaves
+// those emails' headers unknown (null) until the next load. An email Microsoft refuses for
+// good stays unknown without being asked for again.
+async function loadHeaders(account, opts, ids) {
+  const budget = AbortSignal.timeout(timing.headerBudgetMs);
+  try {
+    for (let i = 0; i < ids.length && !budget.aborted; i += BATCH_LIMIT) {
+      const chunk = ids.slice(i, i + BATCH_LIMIT);
+      const paths = chunk.map((id) => `/me/messages/${encodeURIComponent(id)}?$select=internetMessageHeaders`);
+      const answers = await batchGet(account, opts, paths, ACTION.load, { signal: budget });
+      answers.forEach((answer, j) => {
+        const key = headerKey(account, chunk[j]);
+        if (answer.status >= 200 && answer.status < 300 && answer.body && typeof answer.body === 'object') {
+          rememberHeaders(key, headersOf(answer.body.internetMessageHeaders));
+        } else if (refusedForGood(answer.status)) {
+          rememberHeaders(key, { headers: null, inReplyTo: null });
+        }
+      });
+    }
+  } catch {}
+}
+
+// ---------- reading ----------
+
+function mailOptions({ clientId, onRefreshToken, onGrantedScopes } = {}) {
+  return { clientId, onRefreshToken, onGrantedScopes };
+}
+
 /**
  * The newest `limit` inbox messages, oldest first, in the shape mail.js fetchInbox returns.
+ * Reading never marks anything as read.
  * @param {{ id: string, refreshToken: string }} account
- * @param {{ clientId: string, limit?: number, onRefreshToken?: (token: string) => any }} options
+ * @param {GraphOptions & { limit?: number }} options
+ * @returns {Promise<RawEmail[]>}
  */
-async function fetchInbox(account, { clientId, limit = 60, onRefreshToken } = {}) {
+async function fetchInbox(account, { limit = 60, ...options } = {}) {
   const max = Math.min(Math.max(Math.floor(Number(limit)) || 60, 1), 500);
-  const opts = { clientId, onRefreshToken };
+  const opts = mailOptions(options);
   try {
     let next = `${endpoints.graph}/v1.0/me/mailFolders/inbox/messages?$top=${Math.min(max, PAGE_SIZE)}` +
       `&$orderby=receivedDateTime%20desc&$select=${MESSAGE_FIELDS}&$expand=attachments($select=${ATTACHMENT_FIELDS})`;
@@ -586,74 +897,106 @@ async function fetchInbox(account, { clientId, limit = 60, onRefreshToken } = {}
       // A page with nothing new would only lead to more of the same.
       next = found.size > before ? nextPage(res.data['@odata.nextLink']) : null;
     }
-    return [...found.values()].sort((a, b) => new Date(a.date) - new Date(b.date));
+    const emails = [...found.values()];
+    await loadHeaders(account, opts, emails.map((e) => e.id).filter((id) => !headerCache.has(headerKey(account, id))));
+    for (const email of emails) {
+      const key = headerKey(account, email.id);
+      const known = headerCache.get(key);
+      if (!known) continue;
+      rememberHeaders(key, known); // still in the inbox: keep it cached
+      email.headers = known.headers ? { ...known.headers } : null;
+      email.inReplyTo = known.inReplyTo;
+    }
+    return emails.sort((a, b) => new Date(a.date) - new Date(b.date));
   } catch (err) {
     throw friendly(err, ACTION.load);
   }
 }
 
-// Marks up to 20 messages read in one JSON batch, retrying the throttled ones.
-async function markBatch(account, opts, ids) {
-  let pending = ids.map((id, i) => ({
-    id: String(i + 1),
-    method: 'PATCH',
-    url: `/me/messages/${encodeURIComponent(id)}`,
-    headers: { 'Content-Type': 'application/json' },
-    body: { isRead: true },
-  }));
-  for (let attempt = 1; pending.length; attempt++) {
-    const res = await graph(account, opts, 'POST', '/$batch', { body: { requests: pending } });
-    if (res.status !== 200) throw graphError(res, ACTION.seen);
-    const answers = new Map((Array.isArray(res.data?.responses) ? res.data.responses : []).map((r) => [String(r?.id), r]));
-    const busy = [];
-    let wait = 0;
-    for (const request of pending) {
-      const answer = answers.get(request.id);
-      const status = Number(answer?.status);
-      if (!answer) throw fail('server', `${ACTION.seen}. Microsoft didn't confirm it. Please try again.`);
-      if (status >= 200 && status < 300) continue;
-      // Deleted or moved meanwhile: there is nothing left to mark (IMAP ignores these too).
-      if (status === 404) continue;
-      if (isBusy(status)) {
-        const headers = answer.headers && typeof answer.headers === 'object' ? answer.headers : {};
-        const after = Object.entries(headers).find(([k]) => k.toLowerCase() === 'retry-after')?.[1];
-        wait = Math.max(wait, retryDelay(after, attempt));
-        busy.push(request);
-        continue;
+// One sent email, or null without a usable date (it can't say when the user wrote).
+function sentEntry(msg) {
+  const date = new Date(typeof msg.sentDateTime === 'string' ? msg.sentDateTime : NaN);
+  if (Number.isNaN(date.getTime())) return null;
+  const from = toAddress(msg.from) || toAddress(msg.sender);
+  return {
+    from: from ? from.address : '',
+    to: addressList(msg.toRecipients, msg.ccRecipients, msg.bccRecipients).map((a) => a.address),
+    date: date.toISOString(),
+    conversationId: idOrNull(msg.conversationId),
+    inReplyTo: null, // Graph threads replies by conversationId
+  };
+}
+
+// A cursor from an earlier sync that can be continued, or null for a full rebuild.
+function continuable(cursor, now) {
+  if (!cursor || typeof cursor !== 'object' || cursor.kind !== 'graph') return null;
+  const since = typeof cursor.since === 'string' ? Date.parse(cursor.since) : NaN;
+  const fullAt = Number(cursor.fullAt);
+  if (Number.isNaN(since) || !Number.isFinite(fullAt) || fullAt > now || now - fullAt >= SENT_FULL_EVERY_MS) return null;
+  return { since: new Date(since).toISOString(), fullAt };
+}
+
+/**
+ * Who the user has written to, from Sent Items: the newest 500 on the first sync (and every
+ * 30 days), then only what was sent since the cursor. Reads only.
+ * @param {{ id: string, refreshToken: string }} account
+ * @param {SentBatch['cursor']|null} cursor  from the last SentBatch
+ * @param {GraphOptions} options
+ * @returns {Promise<SentBatch>}
+ */
+async function fetchSentHistory(account, cursor, options = {}) {
+  const opts = mailOptions(options);
+  const now = Date.now();
+  const last = continuable(cursor, now);
+  try {
+    let next = `${endpoints.graph}/v1.0/me/mailFolders/sentitems/messages?$top=${PAGE_SIZE}&$orderby=sentDateTime%20desc&$select=${SENT_FIELDS}` +
+      (last ? `&$filter=${encodeURIComponent(`sentDateTime gt ${last.since}`)}` : '');
+    const seen = new Set();
+    const entries = [];
+    while (next && seen.size < SENT_LIMIT) {
+      const res = await graph(account, opts, 'GET', next);
+      // No Sent Items folder: nothing has been sent from here.
+      if (res.status === 404 && /ItemNotFound/i.test(said(res.data?.error?.code))) break;
+      if (res.status !== 200) throw graphError(res, ACTION.history);
+      if (!Array.isArray(res.data?.value)) throw fail('server', `${ACTION.history}. Microsoft's answer couldn't be read. Please try again.`);
+      const before = seen.size;
+      for (const msg of res.data.value) {
+        if (seen.size >= SENT_LIMIT) break;
+        // New mail sent between pages can repeat a message on the next page.
+        if (!msg || typeof msg.id !== 'string' || !msg.id || seen.has(msg.id)) continue;
+        seen.add(msg.id);
+        const entry = sentEntry(msg);
+        if (entry) entries.push(entry);
       }
-      throw graphError({ status, data: answer.body }, ACTION.seen, { item: true });
+      next = seen.size > before ? nextPage(res.data['@odata.nextLink']) : null;
     }
-    if (busy.length && (attempt >= timing.attempts || wait > timing.maxRetryWaitMs)) {
-      throw fail('throttled', MSG.busy, new Error(`Microsoft Graph throttled ${busy.length} of a batch`));
-    }
-    if (busy.length) await sleep(wait);
-    pending = busy;
+    const newest = entries.reduce((max, e) => (e.date > max ? e.date : max), last ? last.since : '');
+    return {
+      cursor: { kind: 'graph', since: newest || null, fullAt: last ? last.fullAt : now },
+      full: !last,
+      entries,
+    };
+  } catch (err) {
+    throw friendly(err, ACTION.history);
   }
 }
 
-/** Marks messages (Graph ids) as read; rejects if Microsoft refused any of them. */
-async function markSeen(account, ids, { clientId, onRefreshToken } = {}) {
-  const list = [...new Set([].concat(ids || []).filter((id) => typeof id === 'string' && id))];
-  if (!list.length) return;
-  try {
-    for (let i = 0; i < list.length; i += BATCH_LIMIT) {
-      await markBatch(account, { clientId, onRefreshToken }, list.slice(i, i + BATCH_LIMIT));
-    }
-  } catch (err) {
-    throw friendly(err, ACTION.seen);
-  }
-}
+// ---------- replying ----------
 
 /**
  * Replies to the sender (or Reply-To) of rawEmail. Outlook threads the reply and files
  * it in Sent Items itself. The body is sent as plain text, like mail.js replies: Graph's
  * `comment` would run the lines together when the original is HTML.
+ * @param {{ id: string, refreshToken: string }} account
+ * @param {RawEmail} rawEmail
+ * @param {string} body
+ * @param {GraphOptions} options
  */
-async function sendReply(account, rawEmail, body, { clientId, onRefreshToken } = {}) {
+async function sendReply(account, rawEmail, body, options = {}) {
   try {
     const id = rawEmail && typeof rawEmail.id === 'string' ? rawEmail.id : '';
     if (!id) throw fail('server', MSG.gone);
-    const res = await graph(account, { clientId, onRefreshToken }, 'POST', `/me/messages/${encodeURIComponent(id)}/reply`, {
+    const res = await graph(account, mailOptions(options), 'POST', `/me/messages/${encodeURIComponent(id)}/reply`, {
       body: { message: { body: { contentType: 'text', content: String(body ?? '') } } },
     });
     if (res.status < 200 || res.status >= 300) throw graphError(res, ACTION.reply);
@@ -663,9 +1006,11 @@ async function sendReply(account, rawEmail, body, { clientId, onRefreshToken } =
   }
 }
 
-/** Forgets the cached access token of an account (when it is removed). */
+/** Forgets the cached access token and headers of an account (when it is removed). */
 function forgetAccount(id) {
-  sessions.delete(String(id || ''));
+  const key = String(id || '');
+  sessions.delete(key);
+  for (const cached of [...headerCache.keys()]) if (cached.startsWith(`${key}\n`)) headerCache.delete(cached);
 }
 
 // ---------- test hooks ----------
@@ -683,6 +1028,22 @@ function _setTiming(overrides = {}) {
 
 function _reset() {
   sessions.clear();
+  headerCache.clear();
 }
 
-module.exports = { SCOPES, signIn, fetchInbox, markSeen, sendReply, forgetAccount, _setEndpoints, _setTiming, _reset };
+module.exports = {
+  SCOPES,
+  PERSONAL_TENANT,
+  signIn,
+  fetchInbox,
+  fetchSentHistory,
+  sendReply,
+  forgetAccount,
+  safeWebLink,
+  grantsMailboxChanges,
+  scopeList,
+  _graph: graph,
+  _setEndpoints,
+  _setTiming,
+  _reset,
+};

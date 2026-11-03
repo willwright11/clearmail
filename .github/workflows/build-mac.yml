@@ -1,7 +1,7 @@
 # Builds the ClearMail Mac app (.dmg, Intel + Apple Silicon) on a GitHub-hosted Mac.
 # - Run it by hand: Actions tab -> "Build Mac app" -> "Run workflow". The .dmg is attached
 #   to the run as an artifact.
-# - Push a tag like v0.2.0 (matching "version" in package.json) to also publish a GitHub
+# - Push a tag like v0.3.0 (matching "version" in package.json) to also publish a GitHub
 #   Release with the .dmg, which is the easy download link for everyone else.
 # Optional: a repository variable MS_CLIENT_ID builds your Microsoft app ID into the app,
 # so Outlook users don't have to paste one (see "For the repo owner" in README.md).

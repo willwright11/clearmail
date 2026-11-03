@@ -6,6 +6,7 @@ const crypto = require('node:crypto');
 const http = require('node:http');
 const net = require('node:net');
 const ms = require('../src/microsoft');
+const { startMicrosoft, graphMessage, sentMessage } = require('./helpers/microsoft-server');
 
 // Whatever the module prints is kept, to check that no token or code ever reaches a log.
 const printed = [];
@@ -16,7 +17,12 @@ for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
 const CLIENT_ID = '11111111-2222-4333-8444-555555555555';
 const CODES = ['needs-sign-in', 'admin-approval', 'no-client-id', 'cancelled', 'timeout', 'network', 'throttled', 'server'];
 const TIMING = { requestTimeoutMs: 2000, backoffMs: 1, maxRetryWaitMs: 1000 };
-const RAW_EMAIL_KEYS = ['attachments', 'date', 'from', 'html', 'id', 'messageId', 'references', 'replyTo', 'seen', 'subject', 'text', 'uid'];
+const RAW_EMAIL_KEYS = [
+  'attachments', 'cc', 'conversationId', 'date', 'flagged', 'focused', 'from', 'headers', 'html', 'id', 'importance', 'inReplyTo',
+  'messageId', 'receivedAt', 'references', 'replyTo', 'seen', 'subject', 'text', 'to', 'uid', 'webLink',
+];
+const PERSONAL_TENANT = '9188040d-6c67-4c5b-b112-36a304b66dad';
+const BLOCKED = /stopped a request that would have changed your mailbox/;
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('base64url');
@@ -90,15 +96,61 @@ function refreshWith(fn = () => ({ json: { token_type: 'Bearer', access_token: '
   };
 }
 
-// Graph serving the inbox (and $batch / reply when given).
-function graphWith({ messages = [], batch, reply } = {}) {
+// A $batch answering each single-message headers GET with headers[id] (404 for other ids).
+function headerBatch(headers = {}) {
+  return (payload) => ({
+    json: {
+      responses: payload.requests.map((r) => {
+        const m = /^\/me\/messages\/([^/?]+)\?\$select=internetMessageHeaders$/.exec(r.url);
+        const id = m && decodeURIComponent(m[1]);
+        if (r.method !== 'GET' || !id || !Object.hasOwn(headers, id)) return { id: r.id, status: 404, body: { error: { code: 'ErrorItemNotFound', message: 'Not found.' } } };
+        return { id: r.id, status: 200, headers: { 'Content-Type': 'application/json' }, body: { id, internetMessageHeaders: headers[id] } };
+      }).reverse(), // Graph answers in any order
+    },
+  });
+}
+
+// Graph's $orderby=receivedDateTime desc (Graph sorts; the tests list messages in any order).
+const when = (m) => Date.parse(m.receivedDateTime || m.sentDateTime) || 0;
+const newestFirst = (a, b) => when(b) - when(a);
+
+// Sent Items as Graph pages them: newest first, $top at a time, $filter by sentDateTime.
+// A broken date sorts and filters as the newest, so the client has to cope with it.
+function sentWith(list) {
+  const sent = (x) => (Number.isNaN(Date.parse(x.sentDateTime)) ? Infinity : Date.parse(x.sentDateTime));
   return (request) => {
-    if (request.method === 'GET' && request.path === '/v1.0/me/mailFolders/inbox/messages') return { json: { value: messages } };
-    if (request.method === 'POST' && request.path === '/v1.0/$batch' && batch) return batch(JSON.parse(request.text), request);
+    const q = request.query;
+    let all = [...list].sort((a, b) => (sent(b) === sent(a) ? 0 : sent(b) > sent(a) ? 1 : -1));
+    const filter = q.get('$filter');
+    if (filter) {
+      const m = /^sentDateTime gt (\S+)$/.exec(filter);
+      if (!m) return { status: 400, json: { error: { code: 'BadRequest', message: 'Invalid filter clause' } } };
+      all = all.filter((x) => sent(x) > Date.parse(m[1]));
+    }
+    const top = Number(q.get('$top'));
+    const skip = Number(q.get('$skip') || 0);
+    const next = new URL(`${graph.base}${request.path}`);
+    for (const [k, v] of q) next.searchParams.set(k, v);
+    next.searchParams.set('$skip', String(skip + top));
+    return { json: { value: all.slice(skip, skip + top), ...(skip + top < all.length ? { '@odata.nextLink': next.toString() } : {}) } };
+  };
+}
+
+// Graph serving the inbox, headers through $batch, Sent Items and replies.
+function graphWith({ messages = [], headers = {}, batch, reply, sent } = {}) {
+  return (request) => {
+    if (request.method === 'GET' && request.path === '/v1.0/me/mailFolders/inbox/messages') return { json: { value: [...messages].sort(newestFirst) } };
+    if (request.method === 'POST' && request.path === '/v1.0/$batch') return (batch || headerBatch(headers))(JSON.parse(request.text), request);
+    if (request.method === 'GET' && request.path === '/v1.0/me/mailFolders/sentitems/messages' && sent) return sent(request);
     if (request.method === 'POST' && /^\/v1\.0\/me\/messages\/[^/]+\/reply$/.test(request.path) && reply) return reply(request);
     return null;
   };
 }
+
+const inboxCalls = () => graph.requests.filter((r) => r.path === '/v1.0/me/mailFolders/inbox/messages');
+const batchCalls = () => graph.requests.filter((r) => r.path === '/v1.0/$batch');
+const batchIds = (request) => JSON.parse(request.text).requests.map((r) => decodeURIComponent(/^\/me\/messages\/([^/?]+)/.exec(r.url)[1]));
+const idToken = (claims) => `header.${Buffer.from(JSON.stringify(claims)).toString('base64url')}.signature`;
 
 // Checks a rejection is one of the contract's errors, written for a person, with no secret in it.
 function rejectsWith(promise, code, pattern) {
@@ -152,7 +204,12 @@ function browser(visit = async () => {}) {
 // Codes "Microsoft" has issued, so the token endpoint can check PKCE and the redirect URI.
 const issued = new Map();
 
-function signInServers({ me = { displayName: 'Will Wright', mail: null, userPrincipalName: 'WillW6311@Outlook.com' } } = {}) {
+const ECHOED = 'openid profile email https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send';
+
+function signInServers({
+  me = { displayName: 'Will Wright', mail: null, userPrincipalName: 'WillW6311@Outlook.com' },
+  tokens = { scope: ECHOED, id_token: idToken({ tid: PERSONAL_TENANT }) },
+} = {}) {
   login.handler = (request) => {
     if (request.method !== 'POST' || request.path !== '/common/oauth2/v2.0/token') return null;
     const f = form(request);
@@ -161,7 +218,7 @@ function signInServers({ me = { displayName: 'Will Wright', mail: null, userPrin
     const ok = grant && f.get('grant_type') === 'authorization_code' && f.get('client_id') === CLIENT_ID &&
       grant.challenge === sha256(f.get('code_verifier') || '') && grant.redirect === f.get('redirect_uri') && !f.has('client_secret');
     if (!ok) return { status: 400, json: { error: 'invalid_grant', error_description: 'AADSTS54005: OAuth2 Authorization code was already redeemed.', error_codes: [54005] } };
-    return { json: { token_type: 'Bearer', access_token: 'SECRET-at-signin', refresh_token: 'SECRET-rt-signin', expires_in: 3600, scope: 'Mail.ReadWrite' } };
+    return { json: { token_type: 'Bearer', access_token: 'SECRET-at-signin', refresh_token: 'SECRET-rt-signin', expires_in: 3600, ...tokens } };
   };
   graph.handler = (request) => (request.method === 'GET' && request.path === '/v1.0/me' ? { json: me } : null);
 }
@@ -187,7 +244,15 @@ test('signIn: authorization code + PKCE through a one-off loopback page', async 
   });
   const result = await ms.signIn({ clientId: ` ${CLIENT_ID} `, openUrl: b.openUrl, loginHint: 'willw6311@outlook.com' });
   await b.done;
-  assert.deepStrictEqual(result, { email: 'willw6311@outlook.com', name: 'Will Wright', refreshToken: 'SECRET-rt-signin' });
+  assert.deepStrictEqual(result, {
+    email: 'willw6311@outlook.com',
+    name: 'Will Wright',
+    refreshToken: 'SECRET-rt-signin',
+    // What Microsoft says the token may do, as short names: read and send, never change.
+    grantedScopes: ['Mail.Read', 'Mail.Send', 'User.Read', 'email', 'openid', 'profile'],
+    personal: true, // the id_token's tenant is the one for personal accounts
+  });
+  assert.strictEqual(ms.grantsMailboxChanges(result.grantedScopes), false);
 
   // The authorize request.
   assert.strictEqual(`${b.url.origin}${b.url.pathname}`, `${login.base}/common/oauth2/v2.0/authorize`);
@@ -216,15 +281,55 @@ test('signIn: authorization code + PKCE through a one-off loopback page', async 
 
 test('signIn: the work address comes from mail when there is one', async () => {
   fresh();
-  signInServers({ me: { displayName: '', mail: 'CVWW@lunet.lboro.ac.uk', userPrincipalName: 'cvww@lboro.ac.uk' } });
+  signInServers({
+    me: { displayName: '', mail: 'CVWW@lunet.lboro.ac.uk', userPrincipalName: 'cvww@lboro.ac.uk' },
+    tokens: { scope: 'Mail.Read Mail.Send User.Read openid profile email', id_token: idToken({ tid: 'B1C2D3E4-0000-4000-8000-000000000001' }) },
+  });
   const b = browser(async (b, p) => {
     issued.set('SECRET-code-2', { challenge: p.get('code_challenge'), redirect: p.get('redirect_uri') });
     await b.back('code=SECRET-code-2');
   });
   const result = await ms.signIn({ clientId: CLIENT_ID, openUrl: b.openUrl });
-  assert.deepStrictEqual(result, { email: 'cvww@lunet.lboro.ac.uk', name: 'cvww@lunet.lboro.ac.uk', refreshToken: 'SECRET-rt-signin' });
+  assert.deepStrictEqual(result, {
+    email: 'cvww@lunet.lboro.ac.uk',
+    name: 'cvww@lunet.lboro.ac.uk',
+    refreshToken: 'SECRET-rt-signin',
+    grantedScopes: ['Mail.Read', 'Mail.Send', 'User.Read', 'email', 'openid', 'profile'],
+    personal: false, // a university tenant
+  });
   assert.strictEqual(b.params.get('login_hint'), null);
   await assertClosed(b.port);
+});
+
+test('signIn: an old consent that still grants Mail.ReadWrite shows in grantedScopes', async () => {
+  fresh();
+  // No id_token: an Outlook.com address is taken as a personal account.
+  signInServers({ tokens: { scope: `${ECHOED} https://graph.microsoft.com/Mail.ReadWrite` } });
+  const b = browser(async (b, p) => {
+    issued.set('SECRET-code-legacy', { challenge: p.get('code_challenge'), redirect: p.get('redirect_uri') });
+    await b.back('code=SECRET-code-legacy');
+  });
+  const result = await ms.signIn({ clientId: CLIENT_ID, openUrl: b.openUrl });
+  assert.deepStrictEqual(result.grantedScopes, ['Mail.Read', 'Mail.ReadWrite', 'Mail.Send', 'User.Read', 'email', 'openid', 'profile']);
+  assert.strictEqual(ms.grantsMailboxChanges(result.grantedScopes), true);
+  assert.strictEqual(result.personal, true);
+  // ClearMail itself still only asked to read and send.
+  assert.ok(!b.params.get('scope').includes('ReadWrite'));
+  await assertClosed(b.port);
+});
+
+test('scopes: ClearMail asks to read and send mail, never to change the mailbox', () => {
+  assert.strictEqual(ms.SCOPES, 'openid profile email offline_access https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send');
+  assert.ok(!/ReadWrite|Mail\.Send\.Shared|MailboxSettings/i.test(ms.SCOPES));
+  assert.strictEqual(ms.markSeen, undefined, 'there is no way to mark as read');
+
+  assert.deepStrictEqual(ms.scopeList(' https://graph.microsoft.com/Mail.Read  Mail.Read profile https://graph.microsoft.com/User.Read '), ['Mail.Read', 'User.Read', 'profile']);
+  assert.strictEqual(ms.scopeList(''), null);
+  assert.strictEqual(ms.scopeList(undefined), null);
+  assert.strictEqual(ms.grantsMailboxChanges(['Mail.Read', 'mail.readwrite']), true);
+  assert.strictEqual(ms.grantsMailboxChanges(['Mail.ReadWrite.Shared']), true);
+  assert.strictEqual(ms.grantsMailboxChanges(['Mail.Read', 'Mail.Send', 'Mail.ReadBasic']), false);
+  assert.strictEqual(ms.grantsMailboxChanges(null), false);
 });
 
 test('signIn: closing or declining in the browser is "cancelled", and the page says so', async () => {
@@ -362,9 +467,29 @@ const MESSAGES = [
   { id: 'AAMk-mid', subject: 'Nobody', sentDateTime: '2026-10-14T12:00:00Z', isRead: false, body: { contentType: 'text', content: '' } },
 ];
 
-test('fetchInbox: Graph messages become the same RawEmail shape mail.js returns, oldest first', async () => {
+// Mailing-list headers as Graph gives them for one message.
+const NEWSLETTER_HEADERS = [
+  { name: 'Received', value: 'from mail.example by outlook.com' },
+  { name: 'list-unsubscribe', value: '<https://news.example/u?id=1>,\r\n <mailto:unsub@news.example>' },
+  { name: 'List-Id', value: 'Weekly Builder <weekly.builder.example>' },
+  { name: 'Precedence', value: 'Bulk' },
+  { name: 'Auto-Submitted', value: 'Auto-Generated' },
+  { name: 'In-Reply-To', value: '  <parent-1@lboro.ac.uk> ' },
+];
+
+test('fetchInbox: Graph messages become RawEmail v3, the same shape mail.js returns, oldest first', async () => {
   fresh();
-  graph.handler = graphWith({ messages: MESSAGES });
+  const messages = MESSAGES.map((m, i) => (i === 0 ? {
+    ...m,
+    toRecipients: [{ emailAddress: { name: 'Will', address: 'WillW6311@Outlook.com' } }, { emailAddress: { name: '', address: 'tom@example.com' } }, { emailAddress: { address: 'TOM@example.com' } }],
+    ccRecipients: [{ emailAddress: { name: 'Ann', address: 'Ann@Example.com' } }, { emailAddress: { name: 'nobody' } }],
+    importance: 'High',
+    inferenceClassification: 'other',
+    flag: { flagStatus: 'flagged' },
+    conversationId: 'AAQkConv1=',
+    webLink: 'https://outlook.live.com/owa/?ItemID=AAMk-new%3D&exvsurl=1&viewmodel=ReadMessageItem',
+  } : m));
+  graph.handler = graphWith({ messages, headers: { 'AAMk-new=': NEWSLETTER_HEADERS, 'AAMk-old': [] } });
   const emails = await ms.fetchInbox(account(), opts());
   assert.deepStrictEqual(emails.map((e) => e.id), ['AAMk-old', 'AAMk-mid', 'AAMk-new=']);
   for (const e of emails) assert.deepStrictEqual(Object.keys(e).sort(), RAW_EMAIL_KEYS);
@@ -376,38 +501,73 @@ test('fetchInbox: Graph messages become the same RawEmail shape mail.js returns,
     uid: null,
     from: { name: 'Exams Office', address: 'exams@lboro.ac.uk' },
     replyTo: { name: 'no-reply@lboro.ac.uk', address: 'no-reply@lboro.ac.uk' },
+    // Lower-cased, once each, and only real addresses.
+    to: [{ name: 'Will', address: 'willw6311@outlook.com' }, { name: 'tom@example.com', address: 'tom@example.com' }],
+    cc: [{ name: 'Ann', address: 'ann@example.com' }],
     subject: 'Exam timetable',
     date: '2026-10-15T09:00:00.000Z',
+    receivedAt: '2026-10-15T09:00:05.000Z',
     text: 'Hi Will,\nYour exam is on Monday.\n',
     html: '',
     seen: false,
+    flagged: true,
     references: [],
     // Inline images are part of the body; an inline PDF and an attached email are still attachments.
     attachments: [{ filename: 'timetable.pdf', size: 52000 }, { filename: 'notes.pdf', size: 900 }, { filename: 'Forwarded email', size: 4100 }],
+    headers: {
+      listUnsubscribe: '<https://news.example/u?id=1>, <mailto:unsub@news.example>',
+      listId: 'Weekly Builder <weekly.builder.example>',
+      precedence: 'bulk',
+      autoSubmitted: 'auto-generated',
+    },
+    importance: 'high',
+    focused: false, // Outlook filed it under Other
+    conversationId: 'AAQkConv1=',
+    inReplyTo: '<parent-1@lboro.ac.uk>',
+    webLink: 'https://outlook.live.com/owa/?ItemID=AAMk-new%3D&exvsurl=1&viewmodel=ReadMessageItem',
   });
   assert.deepStrictEqual(old.from, { name: 'friend@outlook.com', address: 'friend@outlook.com' });
   assert.strictEqual(old.replyTo, null);
   assert.strictEqual(old.messageId, null);
   assert.strictEqual(old.subject, '');
   assert.strictEqual(old.date, '2026-10-14T08:00:00.000Z');
+  assert.strictEqual(old.receivedAt, '2026-10-14T08:00:00.000Z');
   assert.strictEqual(old.seen, true);
   assert.match(old.text, /Lunch\s+tomorrow\?/);
   assert.strictEqual(old.html, '<p>Lunch <b>tomorrow</b>?</p>');
+  // Headers Graph answered with but without list headers: known, and none of them set.
+  assert.deepStrictEqual(old.headers, { listUnsubscribe: null, listId: null, precedence: null, autoSubmitted: null });
   assert.deepStrictEqual(mid.from, { name: 'Unknown sender', address: '' });
   assert.deepStrictEqual(mid.attachments, []);
+  // Graph didn't give this one's headers: unknown, not "no headers".
+  assert.deepStrictEqual([mid.headers, mid.inReplyTo], [null, null]);
+  assert.deepStrictEqual([mid.to, mid.cc, mid.importance, mid.focused, mid.flagged, mid.conversationId, mid.webLink], [[], [], 'normal', null, false, null, null]);
 
-  // The request: newest first, only the needed fields, plain-text bodies, no attachment content.
-  assert.strictEqual(graph.requests.length, 1);
-  const r = graph.requests[0];
+  // The request: newest first, the needed fields, plain-text bodies, no attachment content, 50 a page.
+  assert.strictEqual(inboxCalls().length, 1);
+  const r = inboxCalls()[0];
   assert.strictEqual(r.headers.authorization, 'Bearer SECRET-at-1');
   assert.strictEqual(r.headers.prefer, 'outlook.body-content-type="text"');
-  assert.strictEqual(r.query.get('$top'), '60');
+  assert.strictEqual(r.query.get('$top'), '50');
   assert.strictEqual(r.query.get('$orderby'), 'receivedDateTime desc');
-  for (const field of ['id', 'internetMessageId', 'subject', 'from', 'sender', 'replyTo', 'sentDateTime', 'isRead', 'body']) {
-    assert.ok(r.query.get('$select').split(',').includes(field), field);
+  const select = r.query.get('$select').split(',');
+  for (const field of ['id', 'internetMessageId', 'subject', 'from', 'sender', 'replyTo', 'toRecipients', 'ccRecipients', 'sentDateTime', 'receivedDateTime',
+    'isRead', 'importance', 'inferenceClassification', 'flag', 'conversationId', 'webLink', 'body']) {
+    assert.ok(select.includes(field), field);
   }
+  assert.ok(!select.includes('internetMessageHeaders'), 'not documented on a list');
   assert.strictEqual(r.query.get('$expand'), 'attachments($select=name,size,isInline,contentType)');
   assert.ok(!/contentBytes/.test(r.query.toString()));
+
+  // The headers: one $batch of single-message GETs, newest first.
+  assert.strictEqual(batchCalls().length, 1);
+  const batch = JSON.parse(batchCalls()[0].text).requests;
+  assert.deepStrictEqual(batch.map((x) => [x.id, x.method, x.url]), [
+    ['1', 'GET', '/me/messages/AAMk-new%3D?$select=internetMessageHeaders'],
+    ['2', 'GET', '/me/messages/AAMk-mid?$select=internetMessageHeaders'],
+    ['3', 'GET', '/me/messages/AAMk-old?$select=internetMessageHeaders'],
+  ]);
+  assert.ok(batch.every((x) => x.body === undefined));
 
   // The token came from the refresh token: a public client, so no secret.
   const refresh = form(tokenCalls()[0]);
@@ -418,25 +578,209 @@ test('fetchInbox: Graph messages become the same RawEmail shape mail.js returns,
   assert.ok(!refresh.has('client_secret'));
 });
 
+test('fetchInbox: an "Open in Outlook" link is kept only if it is https on an Outlook web host', async () => {
+  fresh();
+  const links = {
+    personal: 'https://outlook.live.com/owa/?ItemID=a&exvsurl=1',
+    office: 'https://outlook.office.com/owa/?ItemID=b',
+    office365: 'https://outlook.office365.com/owa/?ItemID=c',
+    cloud: 'https://outlook.cloud.microsoft/mail/inbox/id/d',
+    caps: 'HTTPS://Outlook.Live.com/owa/?ItemID=e',
+    http: 'http://outlook.live.com/owa/?ItemID=f',
+    lookalike: 'https://outlook.live.com.evil.example/owa/',
+    other: 'https://evil.example/?https://outlook.live.com/',
+    login: 'https://user:pass@outlook.live.com/owa/',
+    port: 'https://outlook.live.com:8443/owa/',
+    script: 'javascript:alert(1)//outlook.live.com',
+    file: 'file:///etc/passwd',
+    junk: 'not a url',
+    number: 42,
+  };
+  graph.handler = graphWith({ messages: Object.entries(links).map(([id, webLink], i) => ({ id, webLink, sentDateTime: `2026-10-0${(i % 9) + 1}T10:00:00Z`, body: { content: '' } })) });
+  const got = Object.fromEntries((await ms.fetchInbox(account(), opts())).map((e) => [e.id, e.webLink]));
+  assert.deepStrictEqual(got, {
+    personal: links.personal,
+    office: links.office,
+    office365: links.office365,
+    cloud: links.cloud,
+    caps: 'https://outlook.live.com/owa/?ItemID=e',
+    http: null,
+    lookalike: null,
+    other: null,
+    login: null,
+    port: null,
+    script: null,
+    file: null,
+    junk: null,
+    number: null,
+  });
+  assert.strictEqual(ms.safeWebLink('https://outlook.office365.com/owa/'), 'https://outlook.office365.com/owa/');
+  assert.strictEqual(ms.safeWebLink(`https://outlook.live.com/${'x'.repeat(5000)}`), null);
+  assert.strictEqual(ms.safeWebLink(undefined), null);
+});
+
+test('fetchInbox: headers are fetched once per email, 20 to a batch, and only for emails not seen before', async () => {
+  fresh();
+  const msg = (n) => ({ id: `m${n}`, subject: `#${n}`, sentDateTime: new Date(Date.UTC(2026, 9, 1, n)).toISOString(), body: { content: `${n}` } });
+  const messages = Array.from({ length: 25 }, (_, i) => msg(i));
+  const headers = Object.fromEntries(messages.map((m) => [m.id, [{ name: 'List-Id', value: `<list-${m.id}.example>` }]]));
+  delete headers.m3; // Microsoft couldn't find this one just now
+  graph.handler = graphWith({ messages, headers });
+  const acct = account();
+  let emails = await ms.fetchInbox(acct, opts());
+  assert.deepStrictEqual(batchCalls().map((r) => batchIds(r).length), [20, 5]);
+  assert.deepStrictEqual(batchIds(batchCalls()[0])[0], 'm24', 'newest first');
+  assert.strictEqual(emails.find((e) => e.id === 'm7').headers.listId, '<list-m7.example>');
+  assert.strictEqual(emails.find((e) => e.id === 'm3').headers, null);
+
+  // A refresh asks only for the new email and the one that failed.
+  messages.push(msg(30));
+  headers.m30 = [];
+  graph.requests = [];
+  emails = await ms.fetchInbox(acct, opts());
+  assert.deepStrictEqual(batchCalls().map(batchIds), [['m30', 'm3']]);
+  assert.deepStrictEqual(emails.find((e) => e.id === 'm30').headers, { listUnsubscribe: null, listId: null, precedence: null, autoSubmitted: null });
+  assert.strictEqual(emails.find((e) => e.id === 'm7').headers.listId, '<list-m7.example>', 'still known from the first load');
+
+  // Everything is known now except m3: no batch for anything else.
+  graph.requests = [];
+  await ms.fetchInbox(acct, opts());
+  assert.deepStrictEqual(batchCalls().map(batchIds), [['m3']]);
+
+  // Each account keeps its own: another account's same ids are fetched for it.
+  graph.requests = [];
+  await ms.fetchInbox(account(), opts());
+  assert.deepStrictEqual(batchCalls().map((r) => batchIds(r).length), [20, 6]);
+
+  // A removed account's headers are forgotten with it.
+  ms.forgetAccount(acct.id);
+  graph.requests = [];
+  await ms.fetchInbox(acct, opts());
+  assert.deepStrictEqual(batchCalls().map((r) => batchIds(r).length), [20, 6]);
+});
+
+test('fetchInbox: throttled header requests are retried on their own, and given up on without failing the load', async () => {
+  fresh();
+  const messages = ['a', 'b', 'c'].map((id, i) => ({ id, sentDateTime: `2026-10-0${i + 1}T10:00:00Z`, body: { content: id } }));
+  const answer = headerBatch({ a: [{ name: 'Precedence', value: 'list' }], b: [], c: [] });
+  let calls = 0;
+  graph.handler = graphWith({
+    messages,
+    batch: (payload) => {
+      calls++;
+      const out = answer(payload);
+      for (const r of out.json.responses) {
+        if (calls === 1 && r.id === payload.requests.find((x) => x.url.startsWith('/me/messages/a?')).id) {
+          Object.assign(r, { status: 429, headers: { 'Retry-After': '0' }, body: { error: { code: 'ApplicationThrottled' } } });
+        }
+      }
+      return out;
+    },
+  });
+  let emails = await ms.fetchInbox(account(), opts());
+  assert.deepStrictEqual(batchCalls().map(batchIds), [['c', 'b', 'a'], ['a']]);
+  assert.strictEqual(emails.find((e) => e.id === 'a').headers.precedence, 'list');
+
+  // Throttled every time: three tries, then the emails show without their headers.
+  fresh();
+  graph.handler = graphWith({
+    messages,
+    batch: (payload) => ({ json: { responses: payload.requests.map((r) => ({ id: r.id, status: 429, headers: { 'retry-after': '0' } })) } }),
+  });
+  emails = await ms.fetchInbox(account(), opts());
+  assert.strictEqual(batchCalls().length, 3);
+  assert.deepStrictEqual(emails.map((e) => e.headers), [null, null, null]);
+
+  // One email Microsoft refuses for good (not a passing problem): not asked for again.
+  fresh();
+  const refusing = headerBatch({ a: [], b: [] });
+  graph.handler = graphWith({
+    messages,
+    batch: (payload) => {
+      const out = refusing(payload);
+      for (const r of out.json.responses) {
+        if (payload.requests.find((x) => x.id === r.id).url.startsWith('/me/messages/c?')) Object.assign(r, { status: 403, body: { error: { code: 'ErrorAccessDenied' } } });
+      }
+      return out;
+    },
+  });
+  const acct = account();
+  emails = await ms.fetchInbox(acct, opts());
+  assert.deepStrictEqual(emails.map((e) => [e.id, e.headers === null]), [['a', false], ['b', false], ['c', true]]);
+  graph.requests = [];
+  emails = await ms.fetchInbox(acct, opts());
+  assert.deepStrictEqual(batchCalls(), []);
+  assert.deepStrictEqual(emails.map((e) => [e.id, e.headers === null]), [['a', false], ['b', false], ['c', true]]);
+
+  // A batch Microsoft refuses outright, or a Retry-After longer than the cap: the same.
+  for (const batch of [
+    () => ({ status: 500, json: { error: { code: 'InternalServerError', message: 'Oops' } } }),
+    (payload) => ({ json: { responses: payload.requests.map((r) => ({ id: r.id, status: 429, headers: { 'Retry-After': '3600' } })) } }),
+    () => ({ json: { nothing: true } }),
+  ]) {
+    fresh();
+    graph.handler = graphWith({ messages, batch });
+    emails = await ms.fetchInbox(account(), opts());
+    assert.deepStrictEqual(emails.map((e) => [e.id, e.headers]), [['a', null], ['b', null], ['c', null]]);
+    assert.strictEqual(batchCalls().length, 1);
+  }
+});
+
+test('fetchInbox: headers get 15 seconds; after that the emails show without them, and the next load tries again', async () => {
+  fresh();
+  ms._setTiming({ ...TIMING, headerBudgetMs: 150 });
+  const messages = Array.from({ length: 30 }, (_, i) => ({ id: `m${i}`, sentDateTime: new Date(Date.UTC(2026, 9, 1, i)).toISOString(), body: { content: '' } }));
+  graph.handler = graphWith({ messages, batch: () => ({ hang: true }) });
+  const started = Date.now();
+  let emails = await ms.fetchInbox(account(), opts());
+  assert.ok(Date.now() - started < 1500, 'did not wait for Microsoft');
+  assert.strictEqual(emails.length, 30);
+  assert.ok(emails.every((e) => e.headers === null));
+  assert.strictEqual(batchCalls().length, 1, 'no second batch once the time is up');
+
+  // Slow batches: as many as fit in the time.
+  fresh();
+  ms._setTiming({ ...TIMING, headerBudgetMs: 150 });
+  const answer = headerBatch(Object.fromEntries(messages.map((m) => [m.id, []])));
+  graph.handler = graphWith({ messages, batch: async (payload) => { await delay(200); return answer(payload); } });
+  const acct = account();
+  emails = await ms.fetchInbox(acct, opts());
+  assert.ok(emails.every((e) => e.headers === null));
+  ms._setTiming(TIMING);
+  graph.handler = graphWith({ messages, batch: answer });
+  emails = await ms.fetchInbox(acct, opts());
+  assert.ok(emails.every((e) => e.headers !== null));
+});
+
 test('fetchInbox: follows nextLink only as far as the limit, and never off Graph', async () => {
   fresh();
   const msg = (n) => ({ id: `m${n}`, subject: `#${n}`, sentDateTime: `2026-10-0${n}T10:00:00Z`, isRead: true, body: { contentType: 'text', content: `${n}` } });
-  graph.handler = (request) => {
+  const pages = (request) => {
+    if (request.path !== '/v1.0/me/mailFolders/inbox/messages') return graphWith()(request);
     const page = request.query.get('$skiptoken');
     if (!page) return { json: { value: [msg(9), msg(8)], '@odata.nextLink': `${graph.base}/v1.0/me/mailFolders/inbox/messages?$skiptoken=p2` } };
     if (page === 'p2') return { json: { value: [msg(8), msg(7), msg(6)], '@odata.nextLink': `${graph.base}/v1.0/me/mailFolders/inbox/messages?$skiptoken=p3` } };
     return { json: { value: [msg(1)] } };
   };
+  graph.handler = pages;
   const emails = await ms.fetchInbox(account(), opts({ limit: 3 }));
   assert.deepStrictEqual(emails.map((e) => e.id), ['m7', 'm8', 'm9']);
-  assert.strictEqual(graph.requests.length, 2);
-  assert.strictEqual(graph.requests[0].query.get('$top'), '3');
-  assert.strictEqual(graph.requests[1].headers.authorization, 'Bearer SECRET-at-1');
+  assert.strictEqual(inboxCalls().length, 2);
+  assert.strictEqual(inboxCalls()[0].query.get('$top'), '3');
+  assert.strictEqual(inboxCalls()[1].headers.authorization, 'Bearer SECRET-at-1');
+
+  // A bigger limit is read 50 at a time.
+  fresh();
+  graph.handler = pages;
+  await ms.fetchInbox(account(), opts({ limit: 200 }));
+  assert.strictEqual(inboxCalls()[0].query.get('$top'), '50');
 
   fresh();
-  graph.handler = () => ({ json: { value: [msg(5)], '@odata.nextLink': 'https://evil.example/v1.0/steal-the-token' } });
+  graph.handler = (request) => (request.path === '/v1.0/me/mailFolders/inbox/messages'
+    ? { json: { value: [msg(5)], '@odata.nextLink': 'https://evil.example/v1.0/steal-the-token' } }
+    : graphWith()(request));
   assert.deepStrictEqual((await ms.fetchInbox(account(), opts())).map((e) => e.id), ['m5']);
-  assert.strictEqual(graph.requests.length, 1);
+  assert.strictEqual(inboxCalls().length, 1);
 });
 
 test('fetchInbox: a long body is cut with a note, and an unreadable answer is an error, not an empty inbox', async () => {
@@ -449,6 +793,111 @@ test('fetchInbox: a long body is cut with a note, and an unreadable answer is an
   fresh();
   graph.handler = () => ({ status: 200, json: { not: 'graph' } });
   await rejectsWith(ms.fetchInbox(account(), opts()), 'server', /Couldn't load your Outlook inbox/);
+});
+
+// ---------- sent history ----------
+
+const sentItem = (n, over = {}) => ({
+  id: `s${n}`,
+  from: { emailAddress: { name: 'Will', address: 'WillW6311@Outlook.com' } },
+  toRecipients: [{ emailAddress: { name: 'Sarah', address: `Sarah${n % 7}@Example.com` } }],
+  ccRecipients: [],
+  bccRecipients: [],
+  conversationId: `conv-${n % 50}`,
+  sentDateTime: new Date(Date.UTC(2026, 8, 1) + n * 3600_000).toISOString(),
+  ...over,
+});
+
+test('fetchSentHistory: the first sync reads the newest 500 sent emails, 50 a page, recipients only', async () => {
+  fresh();
+  const items = Array.from({ length: 520 }, (_, i) => sentItem(i));
+  items[519] = sentItem(519, {
+    toRecipients: [{ emailAddress: { name: 'Sarah', address: 'SARAH@example.com' } }],
+    ccRecipients: [{ emailAddress: { name: 'Tom', address: 'tom@example.com' } }, { emailAddress: { address: 'sarah@example.com' } }],
+    bccRecipients: [{ emailAddress: { name: 'Dad', address: 'dad@example.com' } }],
+    conversationId: 'AAQkLast=',
+  });
+  graph.handler = graphWith({ sent: sentWith(items) });
+  const before = Date.now();
+  const batch = await ms.fetchSentHistory(account(), null, opts());
+  assert.strictEqual(batch.full, true);
+  assert.strictEqual(batch.entries.length, 500);
+  assert.deepStrictEqual(batch.entries[0], {
+    from: 'willw6311@outlook.com',
+    to: ['sarah@example.com', 'tom@example.com', 'dad@example.com'],
+    date: items[519].sentDateTime,
+    conversationId: 'AAQkLast=',
+    inReplyTo: null,
+  });
+  assert.strictEqual(batch.entries.at(-1).date, items[20].sentDateTime, 'the oldest 20 are left out');
+  assert.deepStrictEqual(batch.cursor.kind, 'graph');
+  assert.strictEqual(batch.cursor.since, items[519].sentDateTime);
+  assert.ok(batch.cursor.fullAt >= before && batch.cursor.fullAt <= Date.now());
+
+  const calls = graph.requests.filter((r) => r.path === '/v1.0/me/mailFolders/sentitems/messages');
+  assert.strictEqual(calls.length, 10);
+  assert.ok(calls.every((r) => r.method === 'GET'));
+  assert.strictEqual(calls[0].query.get('$top'), '50');
+  assert.strictEqual(calls[0].query.get('$orderby'), 'sentDateTime desc');
+  assert.strictEqual(calls[0].query.get('$filter'), null);
+  assert.deepStrictEqual(calls[0].query.get('$select').split(',').sort(), ['bccRecipients', 'ccRecipients', 'conversationId', 'from', 'id', 'sentDateTime', 'toRecipients']);
+  assert.ok(!/body/i.test(calls[0].query.get('$select')), 'no email content');
+  assert.strictEqual(graph.requests.length, 10, 'nothing else was asked for');
+});
+
+test('fetchSentHistory: later syncs read only what was sent since, and rebuild every 30 days', async () => {
+  fresh();
+  const items = Array.from({ length: 30 }, (_, i) => sentItem(i));
+  graph.handler = graphWith({ sent: sentWith(items) });
+  const acct = account();
+  const first = await ms.fetchSentHistory(acct, null, opts());
+  assert.deepStrictEqual([first.full, first.entries.length], [true, 30]);
+
+  items.push(sentItem(30), sentItem(31, { sentDateTime: 'not a date' }), sentItem(32));
+  graph.requests = [];
+  const second = await ms.fetchSentHistory(acct, first.cursor, opts());
+  assert.strictEqual(second.full, false);
+  assert.deepStrictEqual(second.entries.map((e) => e.date), [items[32].sentDateTime, items[30].sentDateTime], 'one with no date is skipped');
+  assert.strictEqual(graph.requests[0].query.get('$filter'), `sentDateTime gt ${items[29].sentDateTime}`);
+  assert.deepStrictEqual(second.cursor, { kind: 'graph', since: items[32].sentDateTime, fullAt: first.cursor.fullAt });
+
+  // Nothing new: nothing to add, and the cursor stays.
+  const third = await ms.fetchSentHistory(acct, second.cursor, opts());
+  assert.deepStrictEqual([third.full, third.entries, third.cursor], [false, [], second.cursor]);
+
+  // 30 days on, or a cursor that doesn't fit: everything again.
+  for (const cursor of [
+    { ...second.cursor, fullAt: Date.now() - 31 * 24 * 3600_000 },
+    { ...second.cursor, fullAt: Date.now() + 3600_000 },
+    { ...second.cursor, since: 'yesterday' },
+    { kind: 'imap', lastUid: 4, uidValidity: '1', fullAt: Date.now() },
+    { kind: 'graph', since: null, fullAt: Date.now() },
+    'junk',
+  ]) {
+    graph.requests = [];
+    const again = await ms.fetchSentHistory(acct, cursor, opts());
+    assert.deepStrictEqual([again.full, again.entries.length], [true, 32], JSON.stringify(cursor));
+    assert.strictEqual(graph.requests[0].query.get('$filter'), null);
+  }
+});
+
+test('fetchSentHistory: no Sent Items is an empty history; other failures are sentences', async () => {
+  fresh();
+  graph.handler = graphWith({ sent: () => ({ status: 404, json: { error: { code: 'ErrorItemNotFound', message: 'The specified object was not found in the store.' } } }) });
+  const empty = await ms.fetchSentHistory(account(), null, opts());
+  assert.deepStrictEqual([empty.full, empty.entries, empty.cursor.since], [true, [], null]);
+
+  fresh();
+  graph.handler = graphWith({ sent: () => ({ status: 403, json: { error: { code: 'ErrorAccessDenied', message: 'Access is denied.' } } }) });
+  await rejectsWith(ms.fetchSentHistory(account(), null, opts()), 'needs-sign-in', /didn't let ClearMail into this mailbox/);
+
+  fresh();
+  graph.handler = graphWith({ sent: () => ({ status: 400, json: { error: { code: 'BadRequest', message: 'Invalid filter clause' } } }) });
+  await rejectsWith(ms.fetchSentHistory(account(), null, opts()), 'server', /^Couldn't read your sent emails\. Microsoft said: "Invalid filter clause"$/);
+
+  fresh();
+  graph.handler = graphWith({ sent: () => ({ json: { value: 'nope' } }) });
+  await rejectsWith(ms.fetchSentHistory(account(), null, opts()), 'server', /Couldn't read your sent emails/);
 });
 
 // ---------- tokens ----------
@@ -524,92 +973,91 @@ test('a failing onRefreshToken never breaks the call', async () => {
   assert.deepStrictEqual(await ms.fetchInbox(account(), opts({ onRefreshToken: async () => { throw new Error('disk full'); } })), []);
 });
 
-// ---------- mark as read ----------
-
-test('markSeen: PATCH isRead in JSON batches of at most 20, matched by id whatever the order', async () => {
+test('tokens: the permissions of each refreshed token are reported when they change', async () => {
   fresh();
-  const batches = [];
-  graph.handler = graphWith({
-    batch: (payload) => {
-      batches.push(payload.requests);
-      return { json: { responses: payload.requests.map((r) => ({ id: r.id, status: 200, headers: {}, body: { isRead: true } })).reverse() } };
-    },
-  });
-  const ids = [...Array.from({ length: 24 }, (_, i) => `id-${i}`), 'AAMk+/x=', 'id-3', 7, null, ''];
-  assert.strictEqual(await ms.markSeen(account(), ids, opts()), undefined);
-  assert.deepStrictEqual(batches.map((b) => b.length), [20, 5]);
-  const all = batches.flat();
-  for (const r of all) {
-    assert.strictEqual(r.method, 'PATCH');
-    assert.deepStrictEqual(r.headers, { 'Content-Type': 'application/json' });
-    assert.deepStrictEqual(r.body, { isRead: true });
+  let scope = 'https://graph.microsoft.com/Mail.Read https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/User.Read openid profile email';
+  login.handler = refreshWith(() => ({ json: { access_token: 'SECRET-at-1', expires_in: 1, scope } }));
+  graph.handler = graphWith({ sent: sentWith([]) });
+  const reported = [];
+  const acct = account();
+  const o = opts({ onGrantedScopes: (scopes) => reported.push(scopes) });
+  await ms.fetchInbox(acct, o);
+  await ms.fetchInbox(acct, o); // the 1-second token is refreshed again: the same permissions aren't reported twice
+  assert.strictEqual(tokenCalls().length, 2);
+  assert.deepStrictEqual(reported, [['Mail.Read', 'Mail.Send', 'User.Read', 'email', 'openid', 'profile']]);
+
+  // An old consent shows up: Settings can warn about it.
+  scope += ' https://graph.microsoft.com/Mail.ReadWrite';
+  await ms.fetchSentHistory(acct, null, o);
+  assert.strictEqual(reported.length, 2);
+  assert.ok(ms.grantsMailboxChanges(reported[1]));
+
+  // No scope in the answer says nothing new; a failing callback breaks nothing.
+  scope = undefined;
+  await ms.fetchInbox(acct, opts({ onGrantedScopes: () => { throw new Error('disk full'); } }));
+  assert.strictEqual(reported.length, 2);
+  scope = 'Mail.Read';
+  assert.deepStrictEqual(await ms.fetchInbox(acct, opts({ onGrantedScopes: async () => { throw new Error('disk full'); } })), []);
+});
+
+// ---------- read and reply only ----------
+
+test('write guard: nothing that could change the mailbox is ever sent to Microsoft', async () => {
+  fresh();
+  graph.handler = () => ({ json: {} });
+  const acct = account();
+  const refused = [
+    ['PATCH', '/me/messages/AAMk', { isRead: true }],
+    ['patch', '/me/messages/AAMk', { isRead: true }],
+    ['DELETE', '/me/messages/AAMk'],
+    ['PUT', '/me/messages/AAMk', {}],
+    ['POST', '/me/messages/AAMk/move', { destinationId: 'deleteditems' }],
+    ['POST', '/me/messages/AAMk/copy', { destinationId: 'archive' }],
+    ['POST', '/me/messages/AAMk/forward', { toRecipients: [] }],
+    ['POST', '/me/messages/AAMk/send'],
+    ['POST', '/me/messages/AAMk/createReply'],
+    ['POST', '/me/messages/AAMk/replyAll', { comment: 'hi' }],
+    ['POST', '/me/messages', { subject: 'draft' }],
+    ['POST', '/me/sendMail', { message: {} }],
+    ['POST', '/me/mailFolders', { displayName: 'x' }],
+    ['POST', '/me/messages/AAMk/reply/../move', { destinationId: 'deleteditems' }],
+    ['POST', '/me/messages/AAMk/reply?x=1', { message: {} }],
+    ['POST', '/me/messages/a/b/reply', { message: {} }],
+    ['POST', '/$batch', { requests: [{ id: '1', method: 'PATCH', url: '/me/messages/AAMk', body: { isRead: true } }] }],
+    ['POST', '/$batch', { requests: [{ id: '1', method: 'GET', url: '/me/messages/a' }, { id: '2', method: 'DELETE', url: '/me/messages/b' }] }],
+    ['POST', '/$batch', { requests: [{ id: '1', method: 'get', url: '/me/messages/a' }] }],
+    ['POST', '/$batch', { requests: [{ id: '1', method: 'GET', url: 'https://evil.example/me/messages/a' }] }],
+    ['POST', '/$batch', { requests: [{ id: '1', method: 'GET', url: '//evil.example/x' }] }],
+    ['POST', '/$batch', { requests: [{ id: '1', method: 'GET', url: '/me/messages/a', body: {} }] }],
+    ['POST', '/$batch', { requests: Array.from({ length: 21 }, (_, i) => ({ id: String(i + 1), method: 'GET', url: `/me/messages/${i}` })) }],
+    ['POST', '/$batch', { requests: [] }],
+    ['POST', '/$batch'],
+    ['POST', '/$batch?x=1', { requests: [{ id: '1', method: 'GET', url: '/me/messages/a' }] }],
+    ['GET', '/me/messages/AAMk', {}], // a GET with a body
+    ['GET', 'https://evil.example/v1.0/me/messages'],
+    ['POST', 'https://evil.example/v1.0/me/messages/AAMk/reply', { message: {} }],
+    ['GET', `${graph.base}/beta/me/messages`],
+  ];
+  for (const [method, target, body] of refused) {
+    await rejectsWith(ms._graph(acct, opts(), method, target, body === undefined ? {} : { body }), 'server', BLOCKED);
   }
-  for (const b of batches) assert.strictEqual(new Set(b.map((r) => r.id)).size, b.length);
-  assert.deepStrictEqual(all.map((r) => r.url), [...Array.from({ length: 24 }, (_, i) => `/me/messages/id-${i}`), '/me/messages/AAMk%2B%2Fx%3D']);
-  const post = graph.requests.find((r) => r.path === '/v1.0/$batch');
-  assert.match(post.headers['content-type'], /^application\/json/);
-  assert.strictEqual(post.headers.authorization, 'Bearer SECRET-at-1');
-
-  graph.requests = [];
-  await ms.markSeen(account(), [], opts());
-  await ms.markSeen(account(), undefined, opts());
+  // Refused before anything was sent: no token was even fetched.
+  assert.strictEqual(tokenCalls().length, 0);
   assert.strictEqual(graph.requests.length, 0);
-});
 
-test('markSeen: any refused message rejects, and later batches are not sent', async () => {
-  fresh();
-  let posts = 0;
-  graph.handler = graphWith({
-    batch: (payload) => {
-      posts++;
-      return {
-        json: {
-          responses: payload.requests.map((r) => (r.url === '/me/messages/id-2'
-            ? { id: r.id, status: 400, body: { error: { code: 'ErrorInvalidIdMalformed', message: 'Id is malformed.' } } }
-            : { id: r.id, status: 200, body: {} })),
-        },
-      };
-    },
-  });
-  const ids = Array.from({ length: 25 }, (_, i) => `id-${i}`);
-  await rejectsWith(ms.markSeen(account(), ids, opts()), 'server', /^Couldn't mark the email as read\. Microsoft said: "Id is malformed\."$/);
-  assert.strictEqual(posts, 1);
-
-  // One message Microsoft won't touch is that message's problem, not a reason to sign in again.
-  fresh();
-  graph.handler = graphWith({ batch: (payload) => ({ json: { responses: payload.requests.map((r) => ({ id: r.id, status: 403, body: { error: { code: 'ErrorAccessDenied', message: 'Access is denied.' } } })) } }) });
-  await rejectsWith(ms.markSeen(account(), ['a'], opts()), 'server', /Microsoft said: "Access is denied\."/);
-
-  // A batch Graph answers without all our ids is not taken as done.
-  fresh();
-  graph.handler = graphWith({ batch: () => ({ json: { responses: [] } }) });
-  await rejectsWith(ms.markSeen(account(), ['a'], opts()), 'server', /mark the email as read/);
-});
-
-test('markSeen: throttled messages are retried on their own; deleted ones count as done', async () => {
-  fresh();
-  const batches = [];
-  graph.handler = graphWith({
-    batch: (payload) => {
-      batches.push(payload.requests.map((r) => r.url));
-      return {
-        json: {
-          responses: payload.requests.map((r) => {
-            if (r.url === '/me/messages/busy' && batches.length === 1) return { id: r.id, status: 429, headers: { 'Retry-After': '0' }, body: { error: { code: 'ApplicationThrottled' } } };
-            if (r.url === '/me/messages/gone') return { id: r.id, status: 404, body: { error: { code: 'ErrorItemNotFound', message: 'Not found.' } } };
-            return { id: r.id, status: 200, body: {} };
-          }),
-        },
-      };
-    },
-  });
-  await ms.markSeen(account(), ['ok', 'busy', 'gone'], opts());
-  assert.deepStrictEqual(batches, [['/me/messages/ok', '/me/messages/busy', '/me/messages/gone'], ['/me/messages/busy']]);
-
-  fresh();
-  graph.handler = graphWith({ batch: (payload) => ({ json: { responses: payload.requests.map((r) => ({ id: r.id, status: 429, headers: { 'retry-after': '0' } })) } }) });
-  await rejectsWith(ms.markSeen(account(), ['a', 'b'], opts()), 'throttled', /too many requests/);
-  assert.strictEqual(graph.requests.length, 3);
+  // What ClearMail does use still works.
+  const ok = [
+    ['GET', '/me/mailFolders/inbox/messages?$top=1'],
+    ['get', '/me/messages/AAMk%2B%2F%3D'],
+    ['GET', `${graph.base}/v1.0/me/mailFolders/sentitems/messages?$skip=50`],
+    ['POST', '/$batch', { requests: [{ id: '1', method: 'GET', url: '/me/messages/a?$select=internetMessageHeaders' }] }],
+    ['POST', '/me/messages/AAMk%2B%2F%3D/reply', { message: { body: { contentType: 'text', content: 'Hi' } } }],
+    ['POST', '/me/messages/AAMk/reply'],
+  ];
+  for (const [method, target, body] of ok) {
+    assert.strictEqual((await ms._graph(acct, opts(), method, target, body === undefined ? {} : { body })).status, 200, `${method} ${target}`);
+  }
+  assert.deepStrictEqual(graph.requests.map((r) => r.method), ['GET', 'GET', 'GET', 'POST', 'POST', 'POST']);
 });
 
 // ---------- reply ----------
@@ -658,7 +1106,7 @@ test('errors: an expired or revoked refresh token means signing in again', async
     json: { error: 'invalid_grant', error_description: 'AADSTS700082: The refresh token has expired due to inactivity. User: willw6311@outlook.com', error_codes: [700082] },
   }));
   await rejectsWith(ms.fetchInbox(account(), opts()), 'needs-sign-in', /sign in to this account again/);
-  await rejectsWith(ms.markSeen(account(), ['a'], opts()), 'needs-sign-in');
+  await rejectsWith(ms.fetchSentHistory(account(), null, opts()), 'needs-sign-in');
   await rejectsWith(ms.sendReply(account(), { id: 'a' }, 'Hi', opts()), 'needs-sign-in');
   assert.strictEqual(graph.requests.length, 0);
 
@@ -709,7 +1157,8 @@ test('errors: throttling honours Retry-After a few times, then says so', async (
 test('errors: client ID, network, timeout and Graph refusals', async () => {
   fresh();
   await rejectsWith(ms.fetchInbox(account(), {}), 'no-client-id', /Settings/);
-  await rejectsWith(ms.markSeen(account(), ['a'], { clientId: '  ' }), 'no-client-id');
+  await rejectsWith(ms.fetchSentHistory(account(), null, { clientId: '  ' }), 'no-client-id');
+  await rejectsWith(ms.sendReply(account(), { id: 'a' }, 'Hi', { clientId: 'nope' }), 'no-client-id');
   assert.strictEqual(tokenCalls().length, 0);
 
   // Nothing listening.
@@ -752,6 +1201,117 @@ test('errors: client ID, network, timeout and Graph refusals', async () => {
   fresh();
   graph.handler = () => ({ status: 502 });
   await rejectsWith(ms.fetchInbox(account(), opts()), 'server', /having problems/);
+});
+
+// ---------- the shared Microsoft stand-in (test/helpers/microsoft-server.js) ----------
+
+test('against the Microsoft stand-in: sign in, read, read Sent and reply, and nothing else reaches the mailbox', async () => {
+  fresh();
+  const stand = await startMicrosoft({ clientId: CLIENT_ID });
+  stand.installFetch();
+  ms._setEndpoints({}); // the real Microsoft addresses, routed to the stand-in
+  try {
+    const me = 'willw6311@outlook.com';
+    stand.addMailbox({
+      email: me,
+      displayName: 'Will Wright',
+      messages: [
+        graphMessage({ id: 'o1', from: ['Sarah', 'sarah@example.com'], to: [['Will', me]], subject: 'Quote', text: 'Could you sign it by Friday?', minutesAgo: 30, flagged: true }),
+        graphMessage({
+          id: 'o2', from: ['Weekly Builder', 'news@builder.example'], subject: 'Issue 12', text: 'News', minutesAgo: 90, focused: false,
+          headers: { 'List-Unsubscribe': '<https://builder.example/u>', 'List-Id': '<weekly.builder.example>' }, inReplyTo: '<x@y>',
+        }),
+      ],
+      sent: [sentMessage({ id: 's1', to: [['Sarah', 'Sarah@Example.com']], cc: [['Tom', 'tom@example.com']], minutesAgo: 10, conversationId: 'conv-o1' })],
+    });
+    stand.choose = () => ({ email: me });
+    const signedIn = await ms.signIn({ clientId: CLIENT_ID, openUrl: stand.openBrowser });
+    await stand.browsing;
+    assert.deepStrictEqual([signedIn.email, signedIn.personal, signedIn.grantedScopes], [me, true, ['Mail.Read', 'Mail.Send', 'User.Read', 'email', 'openid', 'profile']]);
+
+    const scopes = [];
+    const acct = { id: 'acc-stand', email: me, refreshToken: signedIn.refreshToken };
+    const o = opts({ onGrantedScopes: (s) => scopes.push(s) });
+    const emails = await ms.fetchInbox(acct, o);
+    assert.deepStrictEqual(emails.map((e) => [e.id, e.flagged, e.focused, e.conversationId]), [['o2', false, false, 'conv-o2'], ['o1', true, true, 'conv-o1']]);
+    assert.deepStrictEqual(emails[0].headers, { listUnsubscribe: '<https://builder.example/u>', listId: '<weekly.builder.example>', precedence: null, autoSubmitted: null });
+    assert.strictEqual(emails[0].inReplyTo, '<x@y>');
+    assert.match(emails[1].webLink, /^https:\/\/outlook\.live\.com\/owa\//);
+    assert.deepStrictEqual(emails[1].to, [{ name: 'Will', address: me }]);
+    assert.deepStrictEqual(stand.batches, [{ mailbox: me, ids: ['o1', 'o2'] }]);
+
+    const sent = await ms.fetchSentHistory(acct, null, o);
+    assert.deepStrictEqual(sent.entries, [{ from: me, to: ['sarah@example.com', 'tom@example.com'], date: sent.entries[0].date, conversationId: 'conv-o1', inReplyTo: null }]);
+    assert.deepStrictEqual(await ms.sendReply(acct, emails[1], 'Signed, thanks.', o), { sent: true });
+    assert.deepStrictEqual(stand.replies, [{ mailbox: me, id: 'o1', body: { message: { body: { contentType: 'text', content: 'Signed, thanks.' } } } }]);
+    assert.deepStrictEqual(scopes, [['Mail.Read', 'Mail.Send', 'User.Read', 'email', 'openid', 'profile']]);
+
+    // Every call was a read, a $batch of reads, or the one reply.
+    const graphCalls = stand.requests.filter((r) => r.path !== '/common/oauth2/v2.0/token');
+    assert.ok(graphCalls.every((r) => r.method === 'GET' || r.path === '/v1.0/$batch' || r.path === '/v1.0/me/messages/o1/reply'), JSON.stringify(graphCalls));
+    assert.ok(stand.batchRequests.every((r) => r.method === 'GET'));
+    assert.deepStrictEqual(stand.refused, []);
+
+    // An unknown token gets nowhere.
+    const direct = await fetch('https://graph.microsoft.com/v1.0/me/messages/o1', { method: 'PATCH', headers: { Authorization: 'Bearer nobody' } });
+    assert.strictEqual(direct.status, 401);
+  } finally {
+    ms._setEndpoints({ login: login.base, graph: graph.base });
+    await stand.close();
+  }
+});
+
+test('against the Microsoft stand-in: an old consent is reported, and a 0.2 sign-in must be renewed', async () => {
+  fresh();
+  const stand = await startMicrosoft({ clientId: CLIENT_ID });
+  stand.installFetch();
+  ms._setEndpoints({});
+  try {
+    const uni = 'cvww@lunet.lboro.ac.uk';
+    stand.addMailbox({ email: uni, displayName: 'Will', legacyConsent: true, messages: [] });
+    stand.choose = () => ({ email: uni });
+    const signedIn = await ms.signIn({ clientId: CLIENT_ID, openUrl: stand.openBrowser });
+    await stand.browsing;
+    assert.strictEqual(signedIn.personal, false);
+    assert.ok(ms.grantsMailboxChanges(signedIn.grantedScopes), 'the old consent shows');
+    assert.ok(!/ReadWrite/.test(stand.visits.at(-1).params.get('scope')), 'but ClearMail never asked for it');
+
+    // A refresh token ClearMail 0.2 saved was granted for Mail.ReadWrite: Microsoft won't
+    // refresh it for Mail.Read, so the account has to sign in again.
+    const old = stand.issueRefreshToken(uni);
+    await rejectsWith(ms.fetchInbox({ id: 'acc-old', email: uni, refreshToken: old }, opts()), 'needs-sign-in', /sign in to this account again/);
+
+    // Refreshed tokens carry the old consent too, and main hears about it.
+    const scopes = [];
+    const acct = { id: 'acc-uni', email: uni, refreshToken: signedIn.refreshToken };
+    const routed = globalThis.fetch;
+    let bearer = null;
+    globalThis.fetch = (input, init) => {
+      bearer = init?.headers?.Authorization || bearer;
+      return routed(input, init);
+    };
+    await ms.fetchInbox(acct, opts({ onGrantedScopes: (s) => scopes.push(s) }));
+    globalThis.fetch = routed;
+    assert.ok(ms.grantsMailboxChanges(scopes[0]));
+    assert.deepStrictEqual(stand.tokenScopes.map((t) => t.grant), ['authorization_code', 'refresh_token']);
+
+    // The stand-in itself turns away anything that would change the mailbox (also inside a
+    // $batch) with a 405, and notes it, so other tests can check ms.refused stays empty.
+    const call = (method, path, body) => fetch(`https://graph.microsoft.com/v1.0${path}`, {
+      method, headers: { Authorization: bearer, 'Content-Type': 'application/json' }, body: body && JSON.stringify(body),
+    });
+    assert.strictEqual((await call('PATCH', '/me/messages/x', { isRead: true })).status, 405);
+    assert.strictEqual((await call('DELETE', '/me/messages/x')).status, 405);
+    assert.strictEqual((await call('POST', '/me/messages/x/move', { destinationId: 'deleteditems' })).status, 405);
+    const batch = await (await call('POST', '/$batch', { requests: [{ id: '1', method: 'PATCH', url: '/me/messages/x', body: { isRead: true } }] })).json();
+    assert.strictEqual(batch.responses[0].status, 405);
+    assert.deepStrictEqual(stand.refused.map((r) => `${r.method} ${r.path}`), [
+      'PATCH /v1.0/me/messages/x', 'DELETE /v1.0/me/messages/x', 'POST /v1.0/me/messages/x/move', 'PATCH /v1.0/me/messages/x',
+    ]);
+  } finally {
+    ms._setEndpoints({ login: login.base, graph: graph.base });
+    await stand.close();
+  }
 });
 
 test('nothing was logged, and no token or code was ever printed', () => {

@@ -1,8 +1,8 @@
 {
   "name": "clearmail",
   "productName": "ClearMail",
-  "version": "0.2.0",
-  "description": "Reads your email like a chat app: strips the waffle, highlights what matters.",
+  "version": "0.3.0",
+  "description": "An inbox assistant: sorts your email into Needs you, Worth knowing and Noise, shortens it, and lets you reply. It never changes your mailbox.",
   "main": "main.js",
   "private": true,
   "scripts": {
@@ -52,7 +52,6 @@
     }
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "0.131.0",
     "imapflow": "2.2.1",
     "mailparser": "3.9.33",
     "nodemailer": "10.0.13"

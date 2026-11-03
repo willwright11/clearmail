@@ -1,7 +1,7 @@
 // Offline "waffle remover": strips quoted replies, signatures, legal footers and
 // pleasantries, then pulls out the bits people tend to miss (asks, dates, money,
-// links). Works with no network and no API key; the AI summariser builds on it.
-// When in doubt it keeps text: a bit of leftover waffle beats a lost fact.
+// links). Works entirely offline; summarize.js (short versions) and dates.js (deadlines)
+// build on it. When in doubt it keeps text: a bit of leftover waffle beats a lost fact.
 
 // ---------- Dates, money, links ----------
 
@@ -670,7 +670,8 @@ const DETAIL_LIMIT = 50_000;
 
 /**
  * @param {{ text?: string, html?: string, subject?: string, from?: string, bulk?: boolean }} email
- *   bulk: optional, true when the message has List-Unsubscribe/List-Id or Precedence: bulk headers.
+ *   bulk: optional, and true switches off actions and questions. The app leaves it out:
+ *   mailing-list headers are weighed in triage.js, where they can't hide a real ask.
  */
 function clean(email = {}) {
   const raw = (typeof email.text === 'string' && email.text.trim()) ? email.text : htmlToText(email.html);
@@ -785,4 +786,15 @@ function clean(email = {}) {
   };
 }
 
-module.exports = { clean, htmlToText, splitSentences };
+module.exports = {
+  clean,
+  htmlToText,
+  splitSentences,
+  countWords,
+  realDate,
+  // Regex sources (not the regexes, whose lastIndex is shared state) for dates.js and
+  // summarize.js. DATE_SOURCE has one capture group, so use it on its own, not wrapped.
+  DATE_SOURCE: DATE_RE.source,
+  TIME_SOURCE: TIME_RE.source,
+  MONEY_SOURCE: MONEY_RE.source,
+};

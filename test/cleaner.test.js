@@ -1,11 +1,156 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const { simpleParser } = require('mailparser');
-const { clean, htmlToText, splitSentences } = require('../src/cleaner');
+const { clean, htmlToText, splitSentences, countWords, realDate, DATE_SOURCE, TIME_SOURCE, MONEY_SOURCE } = require('../src/cleaner');
 const demo = require('../src/demo');
 
-const byId = (id) => demo.find((m) => m.id === id);
-const run = (m) => clean({ text: m.text, subject: m.subject, from: m.from.address });
+// The demo inbox works its dates out from today, so these tests use fixed copies of the
+// original demo emails.
+const FIXTURES = {
+  'demo-1': {
+    from: 'sarah.collins@brightbuild.co.uk',
+    subject: 'RE: Site visit + quote for the Harrow extension',
+    text: `Hi Will,
+
+I hope this email finds you well and that you had a lovely weekend.
+
+Just wanted to reach out regarding the Harrow extension. We had a look at the drawings with the team on Friday.
+
+Could you send over the revised drawings showing the steel beam position? We'll need them before we can finalise anything.
+
+Let me know if you have any questions.
+
+Kind regards,
+Sarah Collins
+Project Coordinator | BrightBuild Ltd
+Registered in England No. 0123456. This email and any attachments are confidential and intended solely for the intended recipient.`,
+  },
+  'demo-2': {
+    from: 'sarah.collins@brightbuild.co.uk',
+    subject: 'RE: Site visit + quote for the Harrow extension',
+    text: `Hi Will,
+
+I hope you're well and thank you so much for getting back to me so promptly, it's really appreciated.
+
+Following on from our conversation last week, and further to the drawings you kindly sent over, I'm pleased to say that we've now had the opportunity to review everything internally with the wider team. I've attached the revised quote, which comes to £14,750 including VAT. This is slightly higher than the initial estimate, mainly because of the additional steelwork that was identified.
+
+In terms of next steps, we would need you to confirm you're happy to proceed by Friday 17th October so that we can hold the start date of Monday 3rd November. If we don't hear back by then, we may have to release the slot to another client, as our schedule is quite busy at the moment.
+
+Also, would you be able to make a site meeting on Wednesday at 10am to go over the access arrangements?
+
+Please don't hesitate to get in touch if you have any questions at all.
+
+Looking forward to hearing from you.
+
+Kind regards,
+Sarah
+
+On Mon, 6 Oct 2026 at 09:12, Will Wright <will@example.com> wrote:
+> Hi Sarah, drawings attached. Thanks, Will
+> Previous message text...`,
+  },
+  'demo-4': {
+    from: 'noreply@notifications.service.gov.uk',
+    subject: 'Action required: your Self Assessment tax return',
+    text: `Dear Customer,
+
+This is a reminder that your online Self Assessment tax return for the 2025 to 2026 tax year must be submitted by 31 January 2027.
+
+You must also pay any tax you owe by 31 January 2027. If you miss the deadline you may have to pay a penalty of £100.
+
+Sign in to your account at https://www.gov.uk/log-in-file-self-assessment-tax-return to file your return.
+
+Do not reply to this email. This mailbox is not monitored.
+
+HM Revenue and Customs`,
+  },
+  'demo-5': {
+    from: 'orders@screwfix.com',
+    subject: 'Your order confirmation #SF-4471920',
+    text: `Thanks for your order!
+
+Order number: SF-4471920
+DeWalt 18V Combi Drill x1 — £129.99
+Total paid: £129.99
+
+Your order will be ready to collect from Harrow Wealdstone tomorrow after 2pm. Please bring your order number and photo ID.
+
+View your order: https://www.screwfix.com/orders/SF-4471920?utm_source=email&utm_campaign=order_conf
+
+You are receiving this email because you placed an order with Screwfix. Privacy policy | Unsubscribe | Manage preferences`,
+  },
+  'demo-6': {
+    from: 'newsletter@weeklybuilder.com',
+    subject: "🏗️ This week in construction: 12 trends you can't ignore",
+    text: `View this email in your browser
+
+Happy Monday!
+
+Welcome to another bumper edition of The Weekly Builder. We've got loads for you this week so grab a cuppa and settle in.
+
+Timber prices fell 4% in September, the third monthly drop in a row.
+
+New Part L building regulations guidance is due in December.
+
+Our top 12 trends piece is here: https://weeklybuilder.com/trends?ref=nl
+
+Have a great week!
+
+The Weekly Builder team
+You are receiving this because you signed up at weeklybuilder.com. Unsubscribe here.`,
+  },
+  'demo-7': {
+    from: 'priya@shahaccounting.co.uk',
+    subject: 'Quick one — VAT receipts',
+    text: `Hi Will,
+
+Hope all is good with you!
+
+Quick one — I'm missing receipts for three purchases in August totalling £412.60. Could you dig them out and upload them to the shared folder by end of the week? The VAT return is due on 7 November so I need a few days to get it done.
+
+Also, did you buy the van outright or is it on finance?
+
+Cheers,
+Priya
+
+--
+Priya Shah ACCA
+Shah Accounting | 020 7946 0000`,
+  },
+  'demo-8': {
+    from: 'jo.patel@example.com',
+    subject: 'Fwd: Planning decision - 12 Elm Road',
+    text: `Hi Will,
+
+FYI - see below. Can you get the appeal in? I'm away until Monday.
+
+Thanks,
+Jo
+
+---------- Forwarded message ---------
+From: Northfield Borough Council Planning <planning@northfield-council.example>
+Date: Wed, 14 Oct 2026 at 16:05
+Subject: Planning decision - 12 Elm Road
+To: Jo Patel <jo.patel@example.com>
+
+Dear Ms Patel,
+
+Application 26/1234: single-storey rear extension at 12 Elm Road.
+
+We have refused this application because the extension is too close to the boundary with number 14.
+
+You can appeal within 28 days of this notice, so by 11 November 2026. The appeal fee of £462 is non-refundable.
+
+Yours sincerely,
+Planning Services
+Northfield Borough Council
+
+This email and any attachments are confidential and intended solely for the intended recipient.`,
+  },
+};
+
+const byId = (id) => FIXTURES[id];
+const run = (m) => clean({ text: m.text, subject: m.subject, from: m.from });
 const text = (t, extra = {}) => clean({ text: t, ...extra });
 
 test('strips greetings, pleasantries, sign-off, signature and quoted reply', () => {
@@ -362,4 +507,26 @@ test('promos and newsletters are never marked time-sensitive', () => {
   assert.strictEqual(promo.urgency, 'low');
   const person = clean({ from: 'sam@builder.example', subject: 'Skip', text: 'The skip permit expires tomorrow, can you renew it?' });
   assert.strictEqual(person.urgency, 'high');
+});
+
+test('the date, time and money patterns are exported for dates.js and summarize.js', () => {
+  const dates = [...'Pay by Friday 17th October, or 16/10/2026, or by end of the week. We offer 24/7 support.'.matchAll(new RegExp(DATE_SOURCE, 'g'))].map((m) => m[0]).filter(realDate);
+  assert.deepStrictEqual(dates, ['by Friday 17th October', '16/10/2026', 'end of the week']);
+  assert.strictEqual(realDate('24/7'), false);
+  assert.strictEqual(realDate('12-34-56'), false);
+  assert.strictEqual(realDate('17/10'), true);
+  assert.deepStrictEqual([...'Meet at 10am or 14:30'.matchAll(new RegExp(TIME_SOURCE, 'gi'))].map((m) => m[0]), ['10am', '14:30']);
+  assert.deepStrictEqual([...'£14,750, then £500 more and 20 GBP'.matchAll(new RegExp(MONEY_SOURCE, 'gi'))].map((m) => m[0]), ['£14,750', '£500', '20 GBP']);
+  assert.strictEqual(countWords('  one two\nthree\t four  '), 4);
+  assert.strictEqual(countWords(''), 0);
+});
+
+test('every email in the demo inbox cleans with its amounts and asks intact', () => {
+  for (const m of demo) {
+    const c = clean({ text: m.text, html: m.html, subject: m.subject, from: m.from.address });
+    assert.ok(c.body.trim(), `${m.id} keeps some text`);
+    for (const a of c.amounts) assert.ok(c.body.includes(a), `${m.id}: ${a} is in the body`);
+    for (const q of [...c.questions, ...c.actions]) assert.ok(c.body.includes(q), `${m.id}: "${q}" is in the body`);
+    assert.ok(c.stats.keptWords <= c.stats.rawWords, m.id);
+  }
 });

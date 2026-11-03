@@ -1,22 +1,36 @@
 const path = require('path');
-const { app, BrowserWindow, Menu, ipcMain, shell, dialog } = require('electron');
-const { clean } = require('./src/cleaner');
-const { summarize, heuristicSummary, normalizeSummary, originalText } = require('./src/summarize');
+const { app, BrowserWindow, Menu, ipcMain, shell, dialog, Notification, powerMonitor, net, nativeTheme } = require('electron');
 const mail = require('./src/mail');
 const microsoft = require('./src/microsoft');
 const store = require('./src/store');
 const config = require('./src/config');
-const demoEmails = require('./src/demo');
+const demo = require('./src/demo');
+const { buildSentBatch } = require('./src/demo-sent');
+const history = require('./src/history');
+const brief = require('./src/brief');
+const view = require('./src/view');
+const { orderForLocale } = require('./src/dates');
+const { isValidRuleKey } = require('./src/triage');
+
+// ClearMail reads email and sends the replies the user writes. Nothing here can delete,
+// move, flag or mark anything as read: the backends only read, and a reply is held for
+// REPLY_DELAY_MS so it can be undone before it goes.
 
 const FORCE_DEMO = process.argv.includes('--demo');
-const WORKERS = 4;
 const DEMO_ACCOUNT = 'demo'; // the accountId of the sample emails
-const KEY_LOCKED = "ClearMail couldn't unlock your saved Claude API key from the macOS Keychain. Quit and reopen ClearMail and choose Always Allow when asked, or paste the key again in Settings.";
+const REPLY_DELAY_MS = 5000; // a reply waits this long, so Undo can stop it
+const REUSE_MS = 60 * 1000; // a load this recent is reused instead of fetching again
+const HISTORY_EVERY_MS = 5 * 60 * 1000; // the Sent folder is read at most this often per account
+const HISTORY_WAIT_MS = 15 * 1000; // how long a load waits for it before sorting without it
+const MAX_REPLY = 100000; // characters
+const MAX_IDS = 5000;
 const NO_CLIENT_ID = 'ClearMail needs a Microsoft app ID (the "Application (client) ID") before it can use Outlook. Add it in Settings. See "Using Outlook" in the README for the 5-minute setup.';
-const ACCOUNT_GONE = 'That account has been removed from ClearMail. Refresh to update your chats.';
+const ACCOUNT_GONE = 'That account has been removed from ClearMail. Refresh to update your inbox.';
+const EMAIL_GONE = 'This email is no longer in your inbox. Refresh and try again.';
 const passLocked = (user) => `ClearMail couldn't unlock the saved app password for ${user} from the macOS Keychain. Quit and reopen ClearMail and choose Always Allow when asked, or enter the password again in Settings.`;
 const signInLocked = (email) => `ClearMail couldn't unlock your saved Microsoft sign-in for ${email} from the macOS Keychain. Quit and reopen ClearMail and choose Always Allow when asked, or click "Sign in again".`;
 const signInAgain = (email) => `Microsoft needs you to sign in to ${email} again. Use "Sign in again" to reconnect it.`;
+const reconnect = (email) => `ClearMail no longer needs permission to change your mailbox. Click "Sign in again" to reconnect ${email}.`;
 
 // The error codes src/microsoft.js uses, with wording for when its error has no message.
 const MS_ERRORS = {
@@ -30,23 +44,35 @@ const MS_ERRORS = {
   server: 'Microsoft had a problem. Please try again in a few minutes.',
 };
 
+// Only these pages are ever opened from Settings (never a URL from the window).
+const SYSTEM_SETTINGS = {
+  notifications: 'x-apple.systempreferences:com.apple.Notifications-Settings.extension',
+  'login-items': 'x-apple.systempreferences:com.apple.LoginItems-Settings.extension',
+};
+const CONSENT_PAGES = { personal: 'https://account.live.com/consent/Manage', work: 'https://myapps.microsoft.com' };
+const OUTLOOK_WEB = { personal: 'https://outlook.live.com/mail/0/inbox', work: 'https://outlook.office.com/mail/inbox' };
+const LOGIN_STATUSES = ['enabled', 'requires-approval', 'not-registered', 'not-found'];
+const MESSAGE_ID_RE = /^<[^<>\s"\\]{1,900}@[^<>\s"\\]{1,200}>$/;
+
 let win = null;
-let settings = { accounts: [], apiKey: '', limit: 60, demo: false, msClientId: '', locked: {} }; // until the app is ready
-// The inbox the UI is showing. Each email remembers the account it came from (as it was
-// when loaded), so mark-as-read and replies always go to that account.
-let inbox = { demo: true, emails: new Map() };
-let loadGen = 0; // bumped by every inbox load; older loads give way to newer ones
+let settings = { accounts: [], limit: 60, demo: false, msClientId: '', brief: { ...brief.BRIEF_DEFAULTS } }; // until the app is ready
+let marks = store.emptyState(); // state.json: sorting rules, Done, Not noise, the brief
+let histories = {}; // history.json: who the user has written to, per account id
+// The emails the window is showing. Each remembers the account it came from (as it was when
+// loaded), so a reply always goes from the account that received the email.
+let inbox = { demo: null, demoReason: null, entries: new Map(), accounts: [], key: null, at: 0 };
+let prepared = new Map(); // email id -> cleaned text, deadlines and short version (src/view.js)
+let loadGen = 0; // bumped by every fetch; older fetches give way to newer ones
 let latestLoad = null;
-let summaryRun = 0; // bumped by every summary run; older runs stop taking new work
-const inFlight = new Set(); // email ids being summarised right now
-let aiProblem = null; // { key, message, sticky }: why AI is off for this key
-let summaryCache = {};
-let prepared = new Map(); // email id -> cleaned text etc. from the last load
-let saveTimer = null;
-const seenChains = new Map(); // account id -> its mark-as-read queue
-const demoSeen = new Set(); // demo emails opened this session, so a refresh keeps them read
+let demoHistory = history.emptyHistory(); // the sample Sent folder, plus replies "sent" in demo mode
+const demoReplies = []; // { email, at } for replies sent to sample emails this session
+const historySyncing = new Map(); // account id -> its Sent folder read in progress
 const needsSignIn = new Set(); // Microsoft account ids whose last call said to sign in again
+const pending = new Map(); // email id -> a reply waiting to be sent: { timer, body, entry, sendAt }
 let signInRun = null; // AbortController of the Microsoft sign-in waiting in the browser
+let scheduler = null; // the morning brief (src/brief.js)
+let notification = null; // the last one shown, kept so it isn't garbage-collected before a click
+const briefRun = { lastError: null, notificationsBlocked: false };
 
 // Electron sends err.toString() to the renderer; an empty name leaves just the message.
 function ipcError(message, cause, code) {
@@ -68,7 +94,7 @@ function createWindow() {
     minHeight: 520,
     title: 'ClearMail',
     titleBarStyle: 'hiddenInset',
-    backgroundColor: '#0b141a',
+    backgroundColor: nativeTheme?.shouldUseDarkColors ? '#14171b' : '#f5f6f8', // the page's own background, so opening doesn't flash
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -77,12 +103,13 @@ function createWindow() {
     },
   });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
-  // A closed window must not be used again (on macOS the app keeps running).
+  // A closed window must not be used again (on macOS the app keeps running for the brief).
   win.on('closed', () => { win = null; });
 
   // Never navigate the app window away; send links to the default browser.
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   win.webContents.on('will-navigate', (e) => e.preventDefault());
+  return win;
 }
 
 // Electron's default menu binds ⌘R to reloading the page, which would throw away unsent
@@ -111,25 +138,55 @@ function demoState() {
   return { active: false, reason: null };
 }
 
-function aiState() {
-  if (settings.locked?.apiKey) return { aiEnabled: false, aiError: KEY_LOCKED };
-  if (!settings.apiKey) return { aiEnabled: false, aiError: null };
-  if (aiProblem && aiProblem.key === settings.apiKey) return { aiEnabled: false, aiError: aiProblem.message };
-  return { aiEnabled: true, aiError: null };
+const addressOf = (account) => (account.kind === 'microsoft' ? account.email : account.user) || '';
+const accountExists = (accountId) => accountId === DEMO_ACCOUNT || settings.accounts.some((a) => a.id === accountId);
+const isPersonal = (account) => (typeof account.personal === 'boolean' ? account.personal : store.MICROSOFT_MAIL_RE.test(account.email || ''));
+
+// state.json. Marks older than 60 days are only dropped for emails ClearMail knows have gone
+// (their account loaded this session without them), so a Done email still in the inbox stays
+// done however old, and nothing is lost before the first load or while an account fails.
+function saveMarks(next = marks) {
+  const loaded = new Set(inbox.accounts.filter((r) => !r.error).map((r) => r.account.id));
+  if (inbox.demo) loaded.add(DEMO_ACCOUNT);
+  const keep = new Set(inbox.entries.keys());
+  for (const list of [next.done, next.notNoise]) {
+    for (const id of Object.keys(list || {})) if (!loaded.has(id.slice(0, id.indexOf(':')))) keep.add(id);
+  }
+  marks = store.saveState(next, { keep });
 }
 
-function publicView() {
-  const demo = demoState();
+function saveHistories() {
+  try {
+    store.saveHistory(histories);
+  } catch (err) {
+    console.error('Could not save the sent-email history:', err.message);
+  }
+}
+
+// What "What ClearMail can see" in Settings shows: counts only, from the last load.
+function canSee() {
+  if (inbox.demo !== false) return null;
+  const real = [...inbox.entries.values()].filter((e) => e.accountId !== DEMO_ACCOUNT);
   return {
-    ...store.publicSettings(settings, { needsSignIn }),
-    demoActive: demo.active,
-    demoReason: demo.reason,
-    providers: Object.fromEntries(Object.entries(mail.PROVIDERS).map(([k, v]) => [k, v.label])),
-    msClientIdBuiltIn: Boolean(config.msClientId),
+    emails: real.length,
+    withListHeaders: real.filter((e) => e.raw.headers && (e.raw.headers.listUnsubscribe || e.raw.headers.listId)).length,
+    focusedOther: real.some((e) => typeof e.raw.focused === 'boolean'),
+    people: history.historyCounts(histories).people,
   };
 }
 
-const addressOf = (account) => (account.kind === 'microsoft' ? account.email : account.user) || '';
+function publicView() {
+  const d = demoState();
+  return {
+    ...store.publicSettings(settings, { needsSignIn }),
+    demoActive: d.active,
+    demoReason: d.reason,
+    providers: Object.fromEntries(Object.entries(mail.PROVIDERS).map(([k, v]) => [k, v.label])),
+    msClientIdBuiltIn: Boolean(config.msClientId),
+    rules: { ...marks.rules },
+    canSee: canSee(),
+  };
+}
 
 // ---------- Microsoft accounts ----------
 
@@ -147,15 +204,30 @@ function keepRefreshToken(accountId, token) {
   }
 }
 
+// What the account's token may do, so Settings can warn about an old Mail.ReadWrite consent.
+function keepGrantedScopes(accountId, scopes) {
+  try {
+    const next = store.setGrantedScopes(accountId, scopes);
+    if (next) settings = next;
+  } catch (err) {
+    console.error('Could not save what Microsoft allows ClearMail to do:', err.message);
+  }
+}
+
 // Options for every src/microsoft.js call made for this account.
 function msOptions(account) {
+  if (account.upgrade === 'reconnect') throw ipcError(reconnect(account.email), null, 'needs-sign-in');
   if (!account.refreshToken) {
     const text = account.locked ? signInLocked(account.email) : signInAgain(account.email);
     throw ipcError(text, null, 'needs-sign-in');
   }
   const id = clientId();
   if (!id) throw ipcError(NO_CLIENT_ID, null, 'no-client-id');
-  return { clientId: id, onRefreshToken: (token) => keepRefreshToken(account.id, token) };
+  return {
+    clientId: id,
+    onRefreshToken: (token) => keepRefreshToken(account.id, token),
+    onGrantedScopes: (scopes) => keepGrantedScopes(account.id, scopes),
+  };
 }
 
 // src/microsoft.js writes its errors for the user when they carry one of its codes;
@@ -168,7 +240,7 @@ function msError(err, fallback) {
 }
 
 // A failed call for an account, as an error for the user. Notes Microsoft accounts that
-// need signing in again, so Settings and the chat list can offer the button.
+// need signing in again, so Settings and the error box can offer the button.
 function accountError(account, err, fallback) {
   const microsoftAccount = account.kind === 'microsoft';
   if (microsoftAccount && err?.code === 'needs-sign-in') needsSignIn.add(account.id);
@@ -195,118 +267,6 @@ function accountFor(entry) {
   return store.accountIdentity(current) === store.accountIdentity(entry.account) ? current : entry.account;
 }
 
-// ---------- summary cache ----------
-
-function saveCacheNow() {
-  clearTimeout(saveTimer);
-  saveTimer = null;
-  try {
-    store.cache.save(summaryCache);
-  } catch (err) {
-    console.error('Could not save the summary cache:', err.message);
-  }
-}
-
-// Written shortly after each change, so quitting or crashing mid-run loses almost nothing.
-function saveCacheSoon() {
-  if (!saveTimer) saveTimer = setTimeout(saveCacheNow, 1000);
-}
-
-function remember(id, entry) {
-  summaryCache[id] = { at: Date.now(), ...entry };
-  saveCacheSoon();
-}
-
-function cachedSummary(id, offline) {
-  const entry = summaryCache[id];
-  if (entry?.summary) return normalizeSummary({ ...entry.summary, source: 'ai' }, offline);
-  if (entry?.failed) return { ...offline, error: entry.failed };
-  return offline;
-}
-
-// Summaries saved before ClearMail had several accounts are filed under the bare email
-// id. Move them under the new id instead of paying for them again.
-function adoptOldSummary(id, rawId) {
-  const old = summaryCache[rawId];
-  if (!old || summaryCache[id] || rawId.includes(':')) return;
-  summaryCache[id] = old;
-  delete summaryCache[rawId];
-  saveCacheSoon();
-}
-
-// A removed account's summaries and cleaned text are dropped with it.
-function forgetAccount(accountId) {
-  const prefix = `${accountId}:`;
-  let changed = false;
-  for (const id of Object.keys(summaryCache)) {
-    if (id.startsWith(prefix)) {
-      delete summaryCache[id];
-      changed = true;
-    }
-  }
-  if (changed) saveCacheSoon();
-  for (const id of [...prepared.keys()]) if (id.startsWith(prefix)) prepared.delete(id);
-  for (const id of [...inbox.emails.keys()]) if (id.startsWith(prefix)) inbox.emails.delete(id);
-  needsSignIn.delete(accountId);
-  seenChains.delete(accountId);
-  if (typeof microsoft.forgetAccount === 'function') microsoft.forgetAccount(accountId); // its access token
-}
-
-const accountExists = (accountId) => accountId === DEMO_ACCOUNT || settings.accounts.some((a) => a.id === accountId);
-
-// ---------- inbox ----------
-
-function emptyCleaned(original) {
-  const n = original.split(/\s+/).filter(Boolean).length;
-  return {
-    body: original, keyPoints: [], questions: [], actions: [], dates: [], times: [], amounts: [], links: [],
-    category: 'person', urgency: 'normal', stats: { rawWords: n, keptWords: n, saved: 0 },
-  };
-}
-
-// Cleaning is the slow part of a load. An email never changes for its id, so refreshes
-// reuse the work (the lengths catch an email that couldn't be read last time).
-function prepare(entry, previous, next) {
-  const email = { ...entry.raw, id: entry.id, seen: entry.seen };
-  const key = `${String(email.text || '').length}:${String(email.html || '').length}`;
-  let done = previous.get(email.id);
-  if (!done || done.key !== key) {
-    const original = originalText(email);
-    let cleaned;
-    try {
-      // original is already the text (or the HTML as text), so clean() needn't convert it again.
-      cleaned = clean({ text: original, html: email.html, subject: email.subject, from: email.from?.address || '', bulk: email.bulk });
-    } catch (err) {
-      // Never lose an email because the cleaner choked on it: show it uncleaned.
-      console.error('Could not clean an email:', err);
-      cleaned = emptyCleaned(original);
-    }
-    done = { key, cleaned, original, offline: heuristicSummary(cleaned, email.subject, original) };
-  }
-  next.set(email.id, done);
-  adoptOldSummary(email.id, String(entry.raw.id));
-  return { entry, email, cleaned: done.cleaned, original: done.original, summary: cachedSummary(email.id, done.offline) };
-}
-
-function toView({ entry, email, cleaned, original, summary }) {
-  const date = new Date(email.date);
-  return {
-    id: entry.id,
-    accountId: entry.accountId,
-    accountEmail: entry.accountEmail,
-    messageId: email.messageId || null,
-    from: { name: String(email.from?.name || email.from?.address || 'Unknown sender'), address: String(email.from?.address || '') },
-    replyTo: email.replyTo?.address ? { name: String(email.replyTo.name || email.replyTo.address), address: String(email.replyTo.address) } : null,
-    subject: String(email.subject || ''),
-    date: Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString(),
-    seen: Boolean(email.seen),
-    attachments: (email.attachments || []).map((a) => ({ filename: String(a.filename || 'attachment'), size: Number(a.size) || 0 })),
-    cleaned,
-    summary,
-    original,
-  };
-}
-
 // An IMAP account whose password the Keychain won't unlock says so, instead of "add a password".
 function imapReady(account) {
   // An Outlook account saved by the first ClearMail version, which offered Outlook over IMAP.
@@ -317,6 +277,74 @@ function imapReady(account) {
   return account;
 }
 
+// A removed account's emails, sorting marks, Sent history and waiting replies go with it.
+function forgetAccount(accountId) {
+  const prefix = `${accountId}:`;
+  for (const id of [...prepared.keys()]) if (id.startsWith(prefix)) prepared.delete(id);
+  for (const id of [...inbox.entries.keys()]) if (id.startsWith(prefix)) inbox.entries.delete(id);
+  inbox.accounts = inbox.accounts.filter((r) => r.account.id !== accountId);
+  for (const [id, job] of [...pending]) {
+    if (!id.startsWith(prefix)) continue;
+    clearTimeout(job.timer);
+    pending.delete(id);
+    send('reply:result', { id, ok: false, error: ACCOUNT_GONE });
+  }
+  const next = { ...marks, done: { ...marks.done }, notNoise: { ...marks.notNoise } };
+  for (const list of [next.done, next.notNoise]) for (const id of Object.keys(list)) if (id.startsWith(prefix)) delete list[id];
+  try {
+    saveMarks(next);
+  } catch (err) {
+    console.error('Could not save after removing an account:', err.message);
+  }
+  if (Object.hasOwn(histories, accountId)) {
+    delete histories[accountId];
+    saveHistories();
+  }
+  needsSignIn.delete(accountId);
+  if (typeof microsoft.forgetAccount === 'function') microsoft.forgetAccount(accountId); // its access token and cached headers
+}
+
+// ---------- loading the inbox ----------
+
+// Waits for promise, but no longer than ms. Never rejects.
+const within = (promise, ms) => new Promise((resolve) => {
+  const timer = setTimeout(resolve, ms);
+  timer.unref?.();
+  Promise.resolve(promise).catch(() => {}).finally(() => {
+    clearTimeout(timer);
+    resolve();
+  });
+});
+
+// Reads the account's Sent folder (only what is new since last time), at most every few
+// minutes. Never rejects: without it, sorting just knows less about who the user writes to.
+function syncHistory(account) {
+  if (historySyncing.has(account.id)) return historySyncing.get(account.id);
+  const known = histories[account.id];
+  const last = Date.parse(known?.syncedAt || '');
+  if (!Number.isNaN(last) && Date.now() - last < HISTORY_EVERY_MS) return Promise.resolve();
+  const identity = store.accountIdentity(account);
+  const run = (async () => {
+    try {
+      const cursor = known?.cursor || null;
+      const batch = account.kind === 'imap'
+        ? await mail.fetchSentHistory(imapReady(account), cursor)
+        : await microsoft.fetchSentHistory(account, cursor, msOptions(account));
+      // Not for an account removed or pointed at another mailbox meanwhile.
+      const current = settings.accounts.find((a) => a.id === account.id);
+      if (!current || store.accountIdentity(current) !== identity) return;
+      histories[account.id] = history.mergeSent(histories[account.id] || null, batch, { accountEmail: addressOf(account), now: Date.now() });
+      saveHistories();
+    } catch (err) {
+      console.warn(`Couldn't read the sent emails of a ${account.kind} account:`, err?.message);
+    } finally {
+      historySyncing.delete(account.id);
+    }
+  })();
+  historySyncing.set(account.id, run);
+  return run;
+}
+
 function fetchAccount(account, limit) {
   if (account.kind === 'imap') return mail.fetchInbox(imapReady(account), { limit });
   return microsoft.fetchInbox(account, { ...msOptions(account), limit });
@@ -325,7 +353,7 @@ function fetchAccount(account, limit) {
 // Never rejects: one account failing must not hide the others.
 async function loadAccount(account, limit) {
   try {
-    const raw = await fetchAccount(account, limit);
+    const [raw] = await Promise.all([fetchAccount(account, limit), within(syncHistory(account), HISTORY_WAIT_MS)]);
     signedIn(account);
     return { account, raw: Array.isArray(raw) ? raw : [], error: null };
   } catch (err) {
@@ -335,22 +363,42 @@ async function loadAccount(account, limit) {
   }
 }
 
-async function loadInbox(gen) {
-  if (aiProblem && !aiProblem.sticky) aiProblem = null; // retry account-level failures on refresh
-  const demo = demoState();
+// What a load depends on: a load for the same key that is recent enough is reused.
+function fetchKey() {
+  const d = demoState();
+  return JSON.stringify([d.active, d.reason, settings.limit, clientId(), settings.accounts.map((a) => [
+    a.id, store.accountIdentity(a), a.kind === 'imap' ? Boolean(a.pass) : Boolean(a.refreshToken) && !a.upgrade,
+  ])]);
+}
+
+function localeOrder() {
+  try {
+    return orderForLocale(app.getLocale());
+  } catch {
+    return 'dmy';
+  }
+}
+
+async function fetchInbox(gen) {
+  const d = demoState();
+  const key = fetchKey();
   let results;
-  if (demo.active) {
-    const raw = demoEmails.map((e) => ({ ...e, seen: e.seen || demoSeen.has(e.id) }));
+  if (d.active) {
+    // Built for now, so the sample deadlines always look current.
+    const now = Date.now();
+    const raw = demo.build(now);
+    demoHistory = history.mergeSent(null, buildSentBatch({ now, emails: raw }), { accountEmail: demo.ME.address, now });
+    for (const r of demoReplies) demoHistory = history.noteReply(demoHistory, r.email, r.at);
     results = [{ account: { id: DEMO_ACCOUNT, kind: 'demo' }, raw, error: null }];
   } else {
     const limit = settings.limit;
     results = await Promise.all(settings.accounts.map((account) => loadAccount(account, limit)));
   }
   // A newer load started while this one was downloading: answer with that one instead.
-  if (gen !== loadGen) return latestLoad;
+  if (gen !== loadGen) return latestLoad || currentView();
   // An account removed while it was loading is left out.
   results = results.filter((r) => accountExists(r.account.id));
-  if (!demo.active && results.length && results.every((r) => r.error)) {
+  if (!d.active && results.length && results.every((r) => r.error)) {
     if (results.length === 1) throw ipcError(results[0].error);
     throw ipcError(`ClearMail couldn't load any of your accounts. ${results.map((r) => `${addressOf(r.account)}: ${r.error}`).join(' ')}`);
   }
@@ -358,9 +406,9 @@ async function loadInbox(gen) {
   const entries = new Map();
   for (const { account, raw, error } of results) {
     if (error) {
-      // Like a failed refresh with one account, an account that couldn't load this time
-      // keeps the emails it showed last time, so a network blip doesn't empty its chats.
-      for (const entry of inbox.emails.values()) {
+      // An account that couldn't load this time keeps the emails it showed last time, so a
+      // network blip doesn't empty it.
+      for (const entry of inbox.entries.values()) {
         const same = entry.accountId === account.id && store.accountIdentity(entry.account) === store.accountIdentity(account);
         if (same && !entries.has(entry.id)) entries.set(entry.id, entry);
       }
@@ -372,78 +420,284 @@ async function loadInbox(gen) {
       const id = `${account.id}:${email.id}`;
       if (entries.has(id)) continue;
       const accountEmail = account.kind === 'demo' ? '' : addressOf(account);
-      entries.set(id, { id, accountId: account.id, accountEmail, account, raw: email, seen: Boolean(email.seen) });
+      entries.set(id, { id, accountId: account.id, accountEmail, account, raw: email });
     }
   }
-  // Oldest first across all accounts (the sort is stable, so ties keep each account's order).
-  const time = (entry) => {
-    const t = new Date(entry.raw.date).getTime();
-    return Number.isNaN(t) ? Date.now() : t;
-  };
-  const list = [...entries.values()].sort((a, b) => time(a) - time(b));
-
+  const order = localeOrder();
   const next = new Map();
-  const items = list.map((entry) => prepare(entry, prepared, next));
+  for (const entry of entries.values()) next.set(entry.id, view.prepareEmail(entry.raw, { order, previous: prepared.get(entry.id) }));
   prepared = next;
-  inbox = { demo: demo.active, emails: new Map(list.map((entry) => [entry.id, entry])) };
-  if (store.cache.prune(summaryCache, new Set(inbox.emails.keys()))) saveCacheSoon();
-  startSummaries(items);
-  return {
-    demo: demo.active,
-    demoReason: demo.reason,
-    ...aiState(),
-    accounts: demo.active ? [] : results.map(({ account, error }) => ({
-      id: account.id,
-      email: addressOf(account),
-      kind: account.kind,
-      error,
-      needsSignIn: account.kind === 'microsoft' && needsSignIn.has(account.id),
-    })),
-    emails: items.map(toView),
+  inbox = {
+    demo: d.active,
+    demoReason: d.reason,
+    entries,
+    accounts: d.active ? [] : results.map(({ account, error }) => ({ account, error })),
+    key,
+    at: Date.now(),
   };
+  return currentView();
 }
 
-// ---------- AI summaries ----------
+/**
+ * Fetches the inbox from every account and sorts it. A load less than a minute old is
+ * reused unless force is set; a load already on its way is shared.
+ */
+function loadInbox({ force = false } = {}) {
+  const key = fetchKey();
+  if (!force && inbox.key === key && Date.now() - inbox.at < REUSE_MS) return Promise.resolve(currentView());
+  if (!force && latestLoad && latestLoad.key === key) return latestLoad;
+  const gen = ++loadGen;
+  const run = fetchInbox(gen);
+  run.key = key;
+  latestLoad = run;
+  const clear = () => {
+    if (latestLoad === run) latestLoad = null;
+  };
+  run.then(clear, clear);
+  return run;
+}
 
-// Summarises with a small concurrency limit, pushing each result to the UI as it lands
-// and caching it straight away. A newer run (or a new key) makes this one stop taking work.
-function startSummaries(items) {
-  const run = ++summaryRun;
-  const apiKey = settings.apiKey;
-  if (!aiState().aiEnabled) return;
-  const queue = items.filter(({ email }) => !summaryCache[email.id] && !inFlight.has(email.id));
-  const current = () => run === summaryRun && settings.apiKey === apiKey && aiState().aiEnabled;
+// Whose Sent history the sorting uses: the loaded accounts', or the sample one in demo mode.
+function historyContext() {
+  if (inbox.demo) return history.historyContext([demoHistory], { accountEmails: [demo.ME.address] });
+  const list = settings.accounts.map((a) => histories[a.id]).filter(Boolean);
+  return history.historyContext(list, { accountEmails: settings.accounts.map(addressOf).filter(Boolean) });
+}
 
-  const worker = async () => {
-    while (queue.length && current()) {
-      const item = queue.shift();
-      const id = item.email.id;
-      if (summaryCache[id] || inFlight.has(id) || !accountExists(item.entry.accountId)) continue;
-      inFlight.add(id);
+function canOpen(entry) {
+  if (entry.accountId === DEMO_ACCOUNT) return false;
+  if (entry.account.kind === 'microsoft') return true;
+  return MESSAGE_ID_RE.test(String(entry.raw.messageId || ''));
+}
+
+/** The BriefView for what is loaded now, sorted again (no fetching). */
+function currentView() {
+  const now = Date.now();
+  const window = brief.briefWindow(now, marks.brief);
+  const d = inbox.demo === null ? demoState() : { active: inbox.demo, reason: inbox.demoReason };
+  const items = [...inbox.entries.values()].filter((e) => prepared.has(e.id)).map((entry) => ({
+    id: entry.id,
+    accountId: entry.accountId,
+    accountEmail: entry.accountEmail,
+    raw: entry.raw,
+    prep: prepared.get(entry.id),
+    canOpen: canOpen(entry),
+  }));
+  return view.buildBriefView({
+    now,
+    demo: d.active,
+    demoReason: d.reason,
+    since: window.since,
+    sinceLabel: window.label,
+    accounts: inbox.accounts.filter((r) => accountExists(r.account.id)).map(({ account, error }) => {
+      const current = settings.accounts.find((a) => a.id === account.id) || account;
+      return {
+        id: account.id,
+        email: addressOf(account),
+        kind: account.kind,
+        error,
+        needsSignIn: account.kind === 'microsoft' && (needsSignIn.has(account.id) || current.upgrade === 'reconnect'),
+      };
+    }),
+    items,
+    history: historyContext(),
+    marks,
+  });
+}
+
+// ---------- replying (held for 5 seconds so it can be undone) ----------
+
+// Sends a reply whose 5 seconds are up, from the account that received the email, to the
+// email's Reply-To or From address (the backends decide; the window can't choose).
+async function sendQueued(id) {
+  const job = pending.get(id);
+  if (!job) return;
+  pending.delete(id);
+  const { entry, body } = job;
+  try {
+    if (entry.accountId === DEMO_ACCOUNT) {
+      demoReplies.push({ email: { conversationId: entry.raw.conversationId, messageId: entry.raw.messageId }, at: Date.now() });
+      demoHistory = history.noteReply(demoHistory, demoReplies.at(-1).email, demoReplies.at(-1).at);
+    } else {
+      const account = accountFor(entry);
       try {
-        const { errorKind, ...summary } = await summarize({ apiKey, email: item.email, cleaned: item.cleaned, original: item.original });
-        const keep = accountExists(item.entry.accountId); // not if its account was removed meanwhile
-        if (keep && summary.source === 'ai') remember(id, { summary });
-        else if (keep && errorKind === 'permanent') remember(id, { failed: summary.error });
-        send('summary:update', { id, summary });
-        if (errorKind === 'auth' || errorKind === 'account') {
-          queue.length = 0;
-          if (settings.apiKey === apiKey && aiProblem?.key !== apiKey) {
-            // Several workers can hit the same rejected key; tell the UI once.
-            aiProblem = { key: apiKey, message: summary.error, sticky: errorKind === 'auth' };
-            send('ai:status', aiState());
-          }
-        } else if (errorKind === 'busy') {
-          queue.length = 0; // no point hammering; the next refresh tries again
+        if (account.kind === 'imap') {
+          await mail.sendReply(imapReady(account), entry.raw, body);
+        } else {
+          await microsoft.sendReply(account, entry.raw, body, msOptions(account));
+          signedIn(account);
         }
       } catch (err) {
-        console.error('Summary failed:', err);
-      } finally {
-        inFlight.delete(id);
+        throw accountError(account, err, "Couldn't send your reply. Please try again.");
       }
+      // "You've already replied" until the next Sent sync says the same.
+      histories[account.id] = history.noteReply(histories[account.id] || null, { conversationId: entry.raw.conversationId, messageId: entry.raw.messageId }, Date.now());
+      saveHistories();
     }
+  } catch (err) {
+    if (err?.name !== '') console.error('A reply failed:', err);
+    send('reply:result', { id, ok: false, error: err?.name === '' ? err.message : "Couldn't send your reply. Please try again." });
+    return;
+  }
+  // Replied to, so it's done (only in ClearMail: nothing changes in the mailbox).
+  try {
+    saveMarks({ ...marks, done: { ...marks.done, [id]: Date.now() } });
+  } catch (err) {
+    console.error('Could not mark a replied email done:', err.message);
+  }
+  send('reply:result', { id, ok: true, ...(entry.accountId === DEMO_ACCOUNT ? { demo: true } : {}) });
+  send('inbox:updated', currentView());
+}
+
+// Quitting, or anything else that drops the waiting replies, never sends them.
+function dropPendingReplies() {
+  for (const job of pending.values()) clearTimeout(job.timer);
+  pending.clear();
+}
+
+// ---------- the morning brief ----------
+
+// Shows a notification. It never names a sender or subject (it can show on the lock screen).
+function notify(text) {
+  if (typeof Notification?.isSupported === 'function' && !Notification.isSupported()) {
+    briefRun.lastError = "This Mac doesn't let ClearMail show notifications.";
+    return false;
+  }
+  const n = new Notification({ title: text.title, body: text.body, ...(text.subtitle ? { subtitle: text.subtitle } : {}) });
+  n.on('click', () => showBrief());
+  n.on('show', () => { briefRun.notificationsBlocked = false; });
+  n.on('failed', (_e, error) => {
+    briefRun.notificationsBlocked = true;
+    briefRun.lastError = "macOS didn't show the notification. Turn on notifications for ClearMail in System Settings → Notifications.";
+    console.warn('A notification could not be shown:', error);
+  });
+  n.show();
+  notification = n;
+  return true;
+}
+
+// The notification was clicked: show the Brief.
+function showBrief() {
+  if (!win) createWindow();
+  if (win.isMinimized?.()) win.restore();
+  win.show?.();
+  try {
+    app.focus({ steal: true });
+  } catch {}
+  if (win.webContents.isLoading?.()) win.webContents.once('did-finish-load', () => send('brief:show'));
+  else send('brief:show');
+}
+
+// Called by the scheduler when the brief is due. Resolves { ok }.
+async function deliverBrief(slot, { final = false } = {}) {
+  const now = Date.now();
+  if (final) {
+    // Three tries failed: say so, and that day is over.
+    notify(brief.failedBriefText());
+    briefRun.lastError = "ClearMail couldn't check your email for the morning brief.";
+    try {
+      saveMarks({ ...marks, brief: { ...marks.brief, lastSlot: slot } });
+    } catch (err) {
+      console.error('Could not save the brief state:', err.message);
+    }
+    return { ok: true };
+  }
+  const window = brief.briefWindow(now, marks.brief);
+  let result;
+  try {
+    result = await loadInbox({ force: true });
+  } catch (err) {
+    briefRun.lastError = err?.name === '' ? err.message : "ClearMail couldn't check your email.";
+    return { ok: false };
+  }
+  const counts = brief.briefCounts(result.emails, { since: window.since, now });
+  const failedAccounts = result.accounts.filter((a) => a.error).map((a) => a.email);
+  notify(brief.briefText(counts, { failedAccounts, sinceLabel: window.label }));
+  if (!briefRun.notificationsBlocked) briefRun.lastError = null;
+  try {
+    saveMarks({ ...marks, brief: { lastSlot: slot, lastAt: now, lastSince: window.since } });
+  } catch (err) {
+    console.error('Could not save the brief state:', err.message);
+  }
+  send('inbox:updated', currentView());
+  return { ok: true };
+}
+
+// The brief only runs for real accounts: in demo mode it is off (the test brief still works).
+const briefSettings = () => (demoState().active ? { ...settings.brief, enabled: false } : settings.brief);
+
+function startScheduler() {
+  scheduler = brief.createBriefScheduler({
+    now: () => Date.now(),
+    getSettings: briefSettings,
+    getBriefState: () => marks.brief,
+    deliver: deliverBrief,
+    isOnline: () => (typeof net?.isOnline === 'function' ? net.isOnline() : true),
+    isLocked: () => powerMonitor.getSystemIdleState(60) === 'locked',
+  });
+  scheduler.start();
+  // A wall-clock poll survives sleep, but checking on wake means the brief isn't a minute late.
+  for (const event of ['resume', 'unlock-screen', 'user-did-become-active']) powerMonitor.on(event, () => scheduler.check(event));
+}
+
+// Turning the brief on (or changing its time or days) after today's time has passed starts
+// tomorrow, rather than popping up a brief straight away (also later, when Demo mode is
+// turned off).
+function skipTodayIfPassed(before) {
+  const now = Date.now();
+  const after = settings.brief;
+  const changed = after.enabled && (!before.enabled || before.time !== after.time || before.days.join() !== after.days.join());
+  const due = changed && brief.dueBrief(now, after, marks.brief.lastSlot);
+  if (!due) return;
+  try {
+    saveMarks({ ...marks, brief: { ...marks.brief, lastSlot: due.slot } });
+  } catch (err) {
+    console.error('Could not save the brief state:', err.message);
+  }
+}
+
+// What macOS says about opening ClearMail at login.
+function loginItem() {
+  if (!settings.brief.openAtLogin) return { status: 'off', message: null };
+  try {
+    const s = app.getLoginItemSettings();
+    const status = LOGIN_STATUSES.includes(s?.status) ? s.status : s?.openAtLogin ? 'enabled' : 'not-registered';
+    return { status, message: null };
+  } catch (err) {
+    console.warn('Could not read the login item:', err.message);
+    return { status: 'not-found', message: null };
+  }
+}
+
+function applyLoginItem() {
+  try {
+    app.setLoginItemSettings({ openAtLogin: Boolean(settings.brief.openAtLogin) });
+  } catch (err) {
+    console.warn('Could not change the login item:', err.message);
+  }
+}
+
+function openedAtLogin() {
+  try {
+    return process.platform === 'darwin' && Boolean(app.getLoginItemSettings().wasOpenedAtLogin);
+  } catch {
+    return false;
+  }
+}
+
+function briefStatus() {
+  const s = settings.brief;
+  const paused = s.enabled && demoState().active;
+  const next = paused ? null : brief.nextBriefTime(Date.now(), s, marks.brief.lastSlot);
+  return {
+    enabled: s.enabled,
+    paused: paused ? 'The morning brief is paused while ClearMail shows sample emails (Demo mode).' : null,
+    nextAt: next,
+    lastAt: marks.brief.lastAt,
+    lastError: briefRun.lastError,
+    notificationsBlocked: briefRun.notificationsBlocked,
+    loginItem: loginItem(),
   };
-  Promise.all(Array.from({ length: Math.min(WORKERS, queue.length) }, worker)).catch((err) => console.error('Summaries failed:', err));
 }
 
 // ---------- IPC ----------
@@ -471,22 +725,47 @@ function saveWith(fn) {
   return publicView();
 }
 
+// Runs a change to state.json; its errors are written for the user.
+function markWith(change) {
+  const next = { ...marks, rules: { ...marks.rules }, done: { ...marks.done }, notNoise: { ...marks.notNoise } };
+  change(next);
+  try {
+    saveMarks(next);
+  } catch (err) {
+    throw ipcError(err.message, err);
+  }
+  return currentView();
+}
+
+const loadedEntry = (id) => (typeof id === 'string' ? inbox.entries.get(id) || null : null);
+
 handle('settings:get', "Couldn't read your settings.", () => publicView());
 
 handle('settings:save', "Couldn't save your settings. Please try again.", (_e, input) => {
-  const before = settings;
-  const view = saveWith(() => store.saveSettings(input));
-  if (settings.apiKey !== before.apiKey) aiProblem = null;
-  return view;
+  const before = settings.brief;
+  const result = saveWith(() => store.saveSettings(input));
+  if (before.openAtLogin !== settings.brief.openAtLogin) applyLoginItem();
+  skipTodayIfPassed(before);
+  return result;
 });
 
-handle('account:save', "Couldn't save the account. Please try again.", (_e, input) => saveWith(() => store.saveAccount(input)));
+handle('account:save', "Couldn't save the account. Please try again.", (_e, input) => {
+  const before = settings.accounts.find((a) => a.id === input?.id);
+  const result = saveWith(() => store.saveAccount(input));
+  const after = before && settings.accounts.find((a) => a.id === before.id);
+  // Pointed at another mailbox: what was known about the old one's Sent folder no longer applies.
+  if (before && after && store.accountIdentity(before) !== store.accountIdentity(after) && Object.hasOwn(histories, before.id)) {
+    delete histories[before.id];
+    saveHistories();
+  }
+  return result;
+});
 
 handle('account:remove', "Couldn't remove the account. Please try again.", (_e, id) => {
   if (typeof id !== 'string' || !id) throw ipcError("Couldn't remove the account. Please try again.");
-  const view = saveWith(() => store.removeAccount(id));
+  const result = saveWith(() => store.removeAccount(id));
   forgetAccount(id);
-  return view;
+  return result;
 });
 
 // Opens the Microsoft sign-in page in the browser and waits for it. With accountId, that
@@ -519,8 +798,8 @@ handle('microsoft:signIn', "Couldn't sign in to Microsoft. Please try again.", a
   } finally {
     if (signInRun === run) signInRun = null;
   }
-  const { email, name, refreshToken } = result || {};
-  saveWith(() => store.saveMicrosoftAccount({ id: target?.id, email, name, refreshToken }));
+  const { email, name, refreshToken, grantedScopes, personal } = result || {};
+  saveWith(() => store.saveMicrosoftAccount({ id: target?.id, email, name, refreshToken, grantedScopes, personal }));
   const address = String(email).trim().toLowerCase();
   for (const a of settings.accounts) if (a.kind === 'microsoft' && a.email.toLowerCase() === address) needsSignIn.delete(a.id);
   return publicView();
@@ -530,87 +809,66 @@ handle('microsoft:cancelSignIn', "Couldn't cancel signing in.", () => {
   if (signInRun) signInRun.abort();
 });
 
-handle('inbox:load', "Couldn't load your inbox. Please try again.", () => {
-  const gen = ++loadGen;
-  latestLoad = loadInbox(gen);
-  return latestLoad;
+// Microsoft's page for taking back an old permission: fixed addresses, never one from the window.
+handle('microsoft:openConsentPage', "Couldn't open Microsoft's permissions page.", async (_e, accountId) => {
+  const account = settings.accounts.find((a) => a.id === accountId && a.kind === 'microsoft');
+  if (!account) throw ipcError('That account is no longer in ClearMail. Close Settings and try again.');
+  await shell.openExternal(isPersonal(account) ? CONSENT_PAGES.personal : CONSENT_PAGES.work);
 });
 
-// Mark-as-read runs one batch at a time per account, so fast browsing never opens a pile
-// of IMAP logins or Microsoft requests.
-function queueFor(accountId, fn) {
-  const run = (seenChains.get(accountId) || Promise.resolve()).then(fn);
-  const tail = run.catch(() => {});
-  seenChains.set(accountId, tail);
-  tail.then(() => {
-    if (seenChains.get(accountId) === tail) seenChains.delete(accountId);
-  });
-  return run;
-}
+handle('inbox:load', "Couldn't load your inbox. Please try again.", (_e, options) => loadInbox({ force: options?.force === true }));
 
-async function markAccountSeen(list) {
-  const account = accountFor(list[0]);
-  try {
-    if (account.kind === 'imap') {
-      await queueFor(account.id, () => mail.markSeen(imapReady(account), list.map((m) => m.raw.uid)));
-    } else {
-      await queueFor(account.id, () => microsoft.markSeen(account, list.map((m) => m.raw.id), msOptions(account)));
-      signedIn(account);
-    }
-  } catch (err) {
-    throw accountError(account, err, "Couldn't mark the email as read.");
-  }
-  for (const m of list) m.seen = true; // only once the server has confirmed it
-}
-
-handle('email:markSeen', "Couldn't mark the email as read.", async (_e, ids) => {
-  const { demo, emails } = inbox;
-  const wanted = [...new Set([].concat(ids || []).filter((id) => typeof id === 'string'))];
-  const targets = wanted.map((id) => emails.get(id)).filter((m) => m && !m.seen);
-  if (!targets.length) return;
-  if (demo) {
-    for (const m of targets) {
-      m.seen = true;
-      demoSeen.add(m.raw.id);
-    }
+// Opens the email in Outlook on the web (its own link, if it is on Outlook's web hosts) or,
+// for other accounts, in Mail (message: link by Message-ID). Main builds the address.
+handle('email:open', "Couldn't open the email.", async (_e, id) => {
+  const entry = loadedEntry(id);
+  if (!entry) throw ipcError(EMAIL_GONE);
+  if (entry.accountId === DEMO_ACCOUNT) throw ipcError('Sample emails only exist in ClearMail, so there is nothing to open.');
+  if (entry.account.kind === 'microsoft') {
+    const link = microsoft.safeWebLink(entry.raw.webLink) || (isPersonal(entry.account) ? OUTLOOK_WEB.personal : OUTLOOK_WEB.work);
+    await shell.openExternal(link);
     return;
   }
-  // Each account's emails go to that account's server, all at once.
-  const byAccount = new Map();
-  const idOf = new Map(wanted.map((id) => [emails.get(id), id]));
-  for (const m of targets) byAccount.set(m.accountId, [...(byAccount.get(m.accountId) || []), m]);
-  const groups = [...byAccount.values()];
-  const results = await Promise.allSettled(groups.map(markAccountSeen));
-  const failedAt = results.map((r, i) => (r.status === 'rejected' ? i : -1)).filter((i) => i >= 0);
-  if (!failedAt.length) return;
-  if (failedAt.length === groups.length) throw results[failedAt[0]].reason;
-  // Some accounts worked: say which emails are still unread so only those are shown unread.
-  return {
-    failed: failedAt.flatMap((i) => groups[i].map((m) => idOf.get(m))),
-    error: results[failedAt[0]].reason.message,
-  };
+  const messageId = String(entry.raw.messageId || '');
+  if (!MESSAGE_ID_RE.test(messageId)) throw ipcError("This email can't be opened in Mail. Find it in your mail app instead.");
+  await shell.openExternal(`message://${encodeURIComponent(messageId)}`);
 });
 
-handle('email:reply', "Couldn't send your reply. Please try again.", async (_e, payload) => {
+// Holds the reply for 5 seconds (Undo stops it), then sends it from the account that
+// received the email. Only the body comes from the window: never the address.
+handle('email:reply', "Couldn't send your reply. Please try again.", (_e, payload) => {
   const { id, body } = payload || {};
   if (typeof body !== 'string' || !body.trim()) throw ipcError('Type a reply first.');
-  const { demo, emails } = inbox;
-  const entry = typeof id === 'string' ? emails.get(id) : null;
-  if (!entry) throw ipcError('This email is no longer in your inbox. Refresh and try again.');
-  if (demo) return { demo: true };
-  // Sent from the account that received the email.
-  const account = accountFor(entry);
-  try {
-    if (account.kind === 'imap') {
-      await mail.sendReply(imapReady(account), entry.raw, body);
-    } else {
-      await microsoft.sendReply(account, entry.raw, body, msOptions(account));
-      signedIn(account);
+  if (body.length > MAX_REPLY) throw ipcError('Your reply is too long to send from ClearMail. Shorten it, or reply in your usual mail app.');
+  const entry = loadedEntry(id);
+  if (!entry) throw ipcError(EMAIL_GONE);
+  if (pending.has(id)) throw ipcError('A reply to this email is already waiting to be sent. Undo it first, or wait a moment.');
+  // Problems that are known now are said now, not in 5 seconds.
+  if (entry.accountId !== DEMO_ACCOUNT) {
+    const account = accountFor(entry);
+    try {
+      if (account.kind === 'imap') imapReady(account);
+      else if (needsSignIn.has(account.id)) throw ipcError(signInAgain(account.email), null, 'needs-sign-in');
+      else msOptions(account);
+    } catch (err) {
+      throw accountError(account, err, "Couldn't send your reply. Please try again.");
     }
-  } catch (err) {
-    throw accountError(account, err, "Couldn't send your reply. Please try again.");
   }
-  return { sent: true };
+  const sendAt = Date.now() + REPLY_DELAY_MS;
+  const timer = setTimeout(() => {
+    sendQueued(id).catch((err) => console.error('A reply failed:', err));
+  }, REPLY_DELAY_MS);
+  pending.set(id, { timer, body, entry, sendAt });
+  return { queued: true, sendAt };
+});
+
+handle('email:undoReply', "Couldn't undo. The reply may already be on its way.", (_e, payload) => {
+  const id = payload?.id;
+  const job = typeof id === 'string' ? pending.get(id) : null;
+  if (!job) return { undone: false }; // already sent (or sending), or never queued
+  clearTimeout(job.timer);
+  pending.delete(id);
+  return { undone: true };
 });
 
 handle('link:open', "Couldn't open the link.", async (e, url) => {
@@ -634,11 +892,90 @@ handle('link:open', "Couldn't open the link.", async (e, url) => {
   if (response === 0) await shell.openExternal(parsed.href);
 });
 
+// Sorting changes: saved in state.json, then everything loaded is sorted again (no fetching).
+
+handle('triage:setRule', "Couldn't change how that sender is sorted. Please try again.", (_e, payload) => {
+  const key = typeof payload?.address === 'string' ? payload.address.trim().toLowerCase() : '';
+  const rule = payload?.rule ?? null;
+  if (rule !== null && rule !== 'important' && rule !== 'noise') throw ipcError("ClearMail didn't understand that sorting choice. Please try again.");
+  if (rule === null) return markWith((next) => { delete next.rules[key]; });
+  if (!isValidRuleKey(key)) {
+    throw ipcError(key.startsWith('@')
+      ? "ClearMail can't make a rule for everyone at a public email service like Gmail or Outlook. Make one for the sender's own address instead."
+      : "This sender's address can't be used for a rule.");
+  }
+  if (!Object.hasOwn(marks.rules, key) && Object.keys(marks.rules).length >= store.STATE_LIMITS.rules) {
+    throw ipcError(`You have ${store.STATE_LIMITS.rules} sorting rules, the most ClearMail keeps. Remove some in Settings first.`);
+  }
+  return markWith((next) => { next.rules[key] = rule; });
+});
+
+handle('triage:notNoise', "Couldn't move that email. Please try again.", (_e, payload) => {
+  const id = payload?.id;
+  if (payload?.on === true) {
+    if (!loadedEntry(id)) throw ipcError(EMAIL_GONE);
+    return markWith((next) => { next.notNoise[id] = Date.now(); });
+  }
+  return markWith((next) => { if (typeof id === 'string') delete next.notNoise[id]; });
+});
+
+handle('triage:done', "Couldn't change that. Please try again.", (_e, payload) => {
+  const ids = [...new Set((Array.isArray(payload?.ids) ? payload.ids : []).filter((id) => typeof id === 'string'))].slice(0, MAX_IDS);
+  const on = payload?.on === true;
+  return markWith((next) => {
+    for (const id of ids) {
+      if (!on) delete next.done[id];
+      else if (loadedEntry(id) && !Object.hasOwn(next.done, id)) next.done[id] = Date.now();
+    }
+  });
+});
+
+// ClearMail 0.2 kept the Done marks in the window's own storage: they move here, once.
+handle('triage:importDone', "Couldn't move your Done emails.", (_e, map) => {
+  const now = Date.now();
+  let imported = 0;
+  markWith((next) => {
+    for (const [id, at] of Object.entries(map && typeof map === 'object' && !Array.isArray(map) ? map : {})) {
+      if (imported >= MAX_IDS) break;
+      if (!store.isEmailId(id) || Object.hasOwn(next.done, id)) continue;
+      next.done[id] = Number.isFinite(at) && at > 0 ? Math.min(at, now) : now;
+      imported++;
+    }
+    next.migrated = { ...next.migrated, localDone: now };
+  });
+  return { imported };
+});
+
+// "Send a test brief now": the real notification (so macOS asks for permission while the
+// user is looking), without counting as today's brief.
+handle('brief:test', "Couldn't send a test brief.", async () => {
+  const now = Date.now();
+  const window = brief.briefWindow(now, marks.brief);
+  let text;
+  try {
+    const result = inbox.key ? currentView() : await loadInbox();
+    const failedAccounts = result.accounts.filter((a) => a.error).map((a) => a.email);
+    text = brief.briefText(brief.briefCounts(result.emails, { since: window.since, now }), { failedAccounts, sinceLabel: window.label });
+  } catch {
+    text = { title: 'Morning brief', body: "This is how ClearMail's morning brief will look." };
+  }
+  briefRun.lastError = null;
+  if (!notify({ ...text, title: 'Morning brief (test)' })) return { ok: false, error: briefRun.lastError };
+  return { ok: true };
+});
+
+handle('brief:status', "Couldn't read the morning brief settings.", () => briefStatus());
+
+handle('system:openSettings', "Couldn't open System Settings.", async (_e, which) => {
+  if (!Object.hasOwn(SYSTEM_SETTINGS, which)) throw ipcError("Couldn't open System Settings.");
+  await shell.openExternal(SYSTEM_SETTINGS[which]);
+});
+
 // ---------- app ----------
 
 process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
 
-// One copy at a time, so two windows never overwrite each other's settings or cache.
+// One copy at a time, so two windows never overwrite each other's settings.
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
@@ -650,18 +987,26 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   app.whenReady().then(() => {
+    store.migrate();
     settings = store.loadSettings();
-    summaryCache = store.cache.load();
+    marks = store.loadState();
+    histories = store.loadHistory();
     setMenu();
-    createWindow();
+    // Opened at login for the brief: no window until the user asks for one.
+    if (!(settings.brief.enabled && settings.brief.openAtLogin && openedAtLogin())) createWindow();
+    startScheduler();
     app.on('activate', () => BrowserWindow.getAllWindows().length === 0 && createWindow());
   });
 
+  // A reply still in its 5 seconds is never sent once the user quits.
+  app.on('before-quit', dropPendingReplies);
   app.on('will-quit', () => {
+    dropPendingReplies();
+    scheduler?.stop();
     if (signInRun) signInRun.abort(); // closes the sign-in's local web server
-    if (saveTimer) saveCacheNow();
   });
 
+  // On macOS ClearMail keeps running with no window, so the morning brief still comes.
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') app.quit();
   });

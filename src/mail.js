@@ -1,5 +1,47 @@
 // IMAP (read) + SMTP (reply). Works with any provider that supports app passwords.
 // Outlook / Office 365 is not offered: Microsoft has turned off app-password IMAP and SMTP.
+//
+// ClearMail reads and replies, and never changes the mailbox. The inbox and the Sent folder
+// are opened read-only (EXAMINE), and imapflow fetches every body with BODY.PEEK, so reading
+// never marks anything as read. Nothing here sets a flag, moves, copies or deletes. The only
+// thing ever added is a copy of a reply the user sent, appended to the Sent folder.
+
+/**
+ * An email as both backends return it (src/microsoft.js builds the same shape).
+ * @typedef {{ name: string, address: string }} Address  the address is lower-cased
+ * @typedef {{ listUnsubscribe: string|null, listId: string|null, precedence: string|null,
+ *   autoSubmitted: string|null }} MailHeaders  raw values (precedence and autoSubmitted lower-cased)
+ * @typedef {Object} RawEmail
+ * @property {string} id
+ * @property {string|null} messageId
+ * @property {number|null} uid
+ * @property {Address} from
+ * @property {Address|null} replyTo
+ * @property {Address[]} to
+ * @property {Address[]} cc
+ * @property {string} subject
+ * @property {string} date  ISO: when it was sent
+ * @property {string} receivedAt  ISO: when it arrived (the server's INTERNALDATE)
+ * @property {string} text
+ * @property {string} html  kept as data, never rendered
+ * @property {boolean} seen  the mailbox's own read state (ClearMail never changes it)
+ * @property {boolean} flagged
+ * @property {string[]} references
+ * @property {{ filename: string, size: number }[]} attachments
+ * @property {MailHeaders|null} headers  null when the email couldn't be read
+ * @property {'low'|'normal'|'high'} importance
+ * @property {null} focused  Outlook only
+ * @property {null} conversationId  Outlook only
+ * @property {string|null} inReplyTo
+ * @property {null} webLink  Outlook only
+ *
+ * What fetchSentHistory returns. `full` means the entries are the whole history (start
+ * again from them); otherwise they are only what was sent since the cursor passed in.
+ * @typedef {{ from: string, to: string[], date: string, conversationId: null,
+ *   inReplyTo: string|null }} SentEntry  addresses lower-cased; to holds To, Cc and Bcc
+ * @typedef {{ cursor: { kind: 'imap', path: string|null, uidValidity: string|null, lastUid: number,
+ *   fullAt: number }, full: boolean, entries: SentEntry[] }} SentBatch
+ */
 
 const crypto = require('crypto');
 const { ImapFlow } = require('imapflow');
@@ -41,12 +83,14 @@ const UNREADABLE = "ClearMail couldn't read this email. Open it in your usual ma
 const TRUNCATED = 'This email is very long, so ClearMail only downloaded the start of it. Open it in your usual mail app to read the rest.';
 const LOGIN_REJECTED = 'Your email provider rejected the login. Check your email address and app password in Settings.';
 const EMAIL_RE = /^[^\s@]+@[^\s@]+$/;
+const ADDRESS_LIMIT = 500; // recipients kept per email
+const SENT_LIMIT = 500; // sent emails read at most per sync
+const SENT_FULL_EVERY_MS = 30 * 24 * 3600 * 1000; // the sent history is rebuilt from scratch this often
 
 // Parsed emails from each account's last load, so a refresh only downloads new messages.
 // account fingerprint -> { key, emails }; only the most recently loaded accounts are kept.
 const inboxCache = new Map();
 const CACHED_ACCOUNTS = 20;
-const uidValidityByAccount = new Map();
 
 function userError(message) {
   const err = new Error(message);
@@ -152,9 +196,10 @@ async function withImap(account, fn) {
   }
 }
 
+// The inbox, opened read-only (EXAMINE): nothing done inside can change it.
 function withInbox(account, fn) {
   return withImap(account, async (client) => {
-    const lock = await client.getMailboxLock('INBOX');
+    const lock = await client.getMailboxLock('INBOX', { readOnly: true });
     try {
       return await fn(client);
     } finally {
@@ -177,6 +222,63 @@ function firstAddress(list) {
   }
   return null;
 }
+
+// Every real address in mailparser or envelope address lists, once each (groups flattened).
+function addressList(...lists) {
+  const out = new Map();
+  const add = (entry) => {
+    if (!entry || out.size >= ADDRESS_LIMIT) return;
+    if (entry.group) return [].concat(entry.group || []).forEach(add);
+    const found = toAddress(entry);
+    if (found && !out.has(found.address)) out.set(found.address, found);
+  };
+  for (const list of lists) [].concat(list || []).forEach(add);
+  return [...out.values()];
+}
+
+// mailparser's To/Cc: one { value: [...] } per header line.
+const parsedAddresses = (field) => [].concat(field || []).flatMap((header) => [].concat(header?.value || []));
+
+function tidyHeader(value) {
+  if (value == null) return null;
+  const text = String(value).replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 500);
+  return text || null;
+}
+
+const lowerHeader = (value) => tidyHeader(value)?.toLowerCase() ?? null;
+
+// The first <message-id> in a header value.
+function messageIdOf(value) {
+  const text = tidyHeader(value);
+  if (!text) return null;
+  return /<[^<>\s]+>/.exec(text)?.[0] ?? text.split(' ')[0];
+}
+
+// Mailing-list and automatic-mail headers as written (like Graph's internetMessageHeaders),
+// for sorting newsletters and notifications in src/triage.js.
+function headerSignals(parsed) {
+  const lines = Array.isArray(parsed.headerLines) ? parsed.headerLines : [];
+  const raw = (key) => {
+    const line = lines.find((l) => l && l.key === key);
+    if (line) return String(line.line || '').replace(/^[^:]*:/, '');
+    const value = parsed.headers?.get?.(key);
+    return typeof value === 'string' ? value : null;
+  };
+  return {
+    listUnsubscribe: tidyHeader(raw('list-unsubscribe')),
+    listId: tidyHeader(raw('list-id')),
+    precedence: lowerHeader(raw('precedence')),
+    autoSubmitted: lowerHeader(raw('auto-submitted')),
+  };
+}
+
+// mailparser reads Importance, Priority and X-Priority into one 'priority' header.
+function importanceOf(parsed) {
+  const value = String(parsed?.headers?.get?.('priority') || '').toLowerCase();
+  return ['low', 'normal', 'high'].includes(value) ? value : 'normal';
+}
+
+const hasFlag = (meta, flag) => (meta.flags && typeof meta.flags.has === 'function' ? meta.flags.has(flag) : null);
 
 function isoDate(...candidates) {
   for (const value of candidates) {
@@ -251,13 +353,23 @@ function buildEmail(id, meta, parsed, attachments) {
     uid: meta.uid,
     from: firstAddress(parsed?.from?.value) || firstAddress(env.from) || { name: 'Unknown sender', address: '' },
     replyTo: parsed ? firstAddress(parsed.replyTo?.value) : firstAddress(env.replyTo),
+    to: parsed?.to ? addressList(parsedAddresses(parsed.to)) : addressList(env.to),
+    cc: parsed?.cc ? addressList(parsedAddresses(parsed.cc)) : addressList(env.cc),
     subject: String(parsed?.subject ?? env.subject ?? ''),
     date: isoDate(parsed?.date, env.date, meta.internalDate),
+    receivedAt: isoDate(meta.internalDate, parsed?.date, env.date),
     text: parsed ? parsed.text || '' : UNREADABLE,
     html: typeof parsed?.html === 'string' ? parsed.html : '',
-    seen: meta.flags?.has('\\Seen') ?? false,
+    seen: hasFlag(meta, '\\Seen') ?? false,
+    flagged: hasFlag(meta, '\\Flagged') ?? false,
     references: [].concat(parsed?.references || []).filter((ref) => typeof ref === 'string' && ref.trim()),
     attachments,
+    headers: parsed ? headerSignals(parsed) : null,
+    importance: importanceOf(parsed),
+    focused: null,
+    conversationId: null,
+    inReplyTo: messageIdOf(parsed ? parsed.inReplyTo : env.inReplyTo),
+    webLink: null,
   };
 }
 
@@ -289,13 +401,18 @@ async function fetchTextOnly(client, uid) {
   return { parsed, attachments };
 }
 
+/**
+ * The newest `limit` inbox messages, oldest first. Reading never marks anything as read.
+ * @param {object} account
+ * @param {{ limit?: number }} options
+ * @returns {Promise<RawEmail[]>}
+ */
 async function fetchInbox(account, { limit = 60 } = {}) {
   const max = Math.min(Math.max(Math.floor(Number(limit)) || 60, 1), 500);
   try {
     const fp = accountKey(account);
     return await withInbox(account, async (client) => {
       const uidValidity = String(client.mailbox.uidValidity);
-      uidValidityByAccount.set(fp, uidValidity);
       const total = client.mailbox.exists;
       if (!total) return [];
       const key = `${fp}-${uidValidity}`;
@@ -322,7 +439,8 @@ async function fetchInbox(account, { limit = 60 } = {}) {
       const small = [];
       for (const meta of wanted) {
         const hit = cached.get(meta.uid);
-        if (hit) emails.set(meta.uid, { ...hit, seen: meta.flags?.has('\\Seen') ?? hit.seen });
+        // Read and flagged can change in the user's mail app; the rest of an email never does.
+        if (hit) emails.set(meta.uid, { ...hit, seen: hasFlag(meta, '\\Seen') ?? hit.seen, flagged: hasFlag(meta, '\\Flagged') ?? hit.flagged });
         else if (meta.size <= FULL_FETCH_LIMIT) small.push(meta);
       }
       if (small.length) {
@@ -362,47 +480,44 @@ async function fetchInbox(account, { limit = 60 } = {}) {
   }
 }
 
-async function markSeen(account, uids) {
-  const list = [...new Set([].concat(uids || []).map(Number))].filter((n) => Number.isInteger(n) && n > 0);
-  if (!list.length) return;
-  try {
-    const fp = accountKey(account);
-    await withInbox(account, async (client) => {
-      // UIDs only mean the same messages while UIDVALIDITY is unchanged.
-      const known = uidValidityByAccount.get(fp);
-      if (known && known !== String(client.mailbox.uidValidity)) {
-        throw userError('Your inbox changed on the server. Refresh and try again.');
-      }
-      const ok = await client.messageFlagsAdd(list.join(','), ['\\Seen'], { uid: true });
-      if (!ok) throw userError("Your mail server didn't let ClearMail mark the email as read.");
-    });
-  } catch (err) {
-    throw friendlyError(err, "Couldn't mark the email as read");
-  }
-}
-
 // SMTP servers that file submitted mail in Sent themselves, so a copy would be a duplicate.
 const SELF_FILING_SMTP = /(?:^|\.)(?:gmail|googlemail|google|yahoo|fastmail|office365|outlook)\.com$/i;
 
-// Files a copy of a sent reply in the Sent mailbox. A failure is only logged: the reply went out.
+// The Sent folder: the one marked \Sent, else one with a usual name such as "Sent Items"
+// (imapflow works that out). null when there is none.
+async function sentFolder(client) {
+  return (await client.list()).find((box) => box.specialUse === '\\Sent') || null;
+}
+
+// Files a copy of a sent reply in the Sent folder. This APPEND is the only change ClearMail
+// ever makes to a mailbox, and only right after the user sent a reply. A failure is only
+// logged: the reply went out.
 async function saveToSent(account, raw, messageId) {
   if (presetFor(account)?.savesSent) return true;
   if (SELF_FILING_SMTP.test(String(account.smtpHost || '').trim())) return true;
   try {
-    return await withImap(account, async (client) => {
-      const sent = (await client.list()).find((box) => box.specialUse === '\\Sent');
-      if (!sent) return false;
+    const path = await withImap(account, async (client) => {
+      const sent = await sentFolder(client);
+      if (!sent) return null;
       if (messageId) {
         // Some servers file SMTP mail in Sent on their own; don't add a second copy.
-        const lock = await client.getMailboxLock(sent.path);
+        // Looking needs the folder open, read-only.
+        const lock = await client.getMailboxLock(sent.path, { readOnly: true });
         try {
           const found = await client.search({ header: { 'message-id': messageId } }, { uid: true }).catch(() => []);
-          if (found && found.length) return true;
+          if (found && found.length) return false;
         } finally {
           lock.release();
         }
       }
-      await client.append(sent.path, raw, ['\\Seen']);
+      return sent.path;
+    });
+    if (path === null) return false; // no Sent folder to file it in
+    if (path === false) return true; // the server filed it already
+    // A fresh connection with no folder open: one opened read-only takes no flags, and the
+    // copy should arrive as read (\Seen), like any email the user sent.
+    return await withImap(account, async (client) => {
+      await client.append(path, raw, ['\\Seen']);
       return true;
     });
   } catch (err) {
@@ -411,6 +526,96 @@ async function saveToSent(account, raw, messageId) {
   }
 }
 
+// ---------- sent history ----------
+
+// One sent email from its envelope, or null without a usable date.
+function sentEntry(env) {
+  const date = env.date ? new Date(env.date) : null;
+  if (!date || Number.isNaN(date.getTime())) return null;
+  return {
+    from: firstAddress(env.from)?.address || '',
+    to: addressList(env.to, env.cc, env.bcc).map((a) => a.address),
+    date: date.toISOString(),
+    conversationId: null,
+    inReplyTo: messageIdOf(env.inReplyTo),
+  };
+}
+
+// The cursor of an earlier sync of this same folder that can be continued, else null.
+// UIDs only mean the same messages while UIDVALIDITY is unchanged.
+function continuable(cursor, path, uidValidity, now) {
+  if (!cursor || typeof cursor !== 'object' || cursor.kind !== 'imap') return null;
+  const fullAt = Number(cursor.fullAt);
+  const lastUid = Number(cursor.lastUid);
+  if (cursor.path !== path || !uidValidity || String(cursor.uidValidity) !== uidValidity) return null;
+  if (!Number.isInteger(lastUid) || lastUid < 0 || !Number.isFinite(fullAt) || fullAt > now || now - fullAt >= SENT_FULL_EVERY_MS) return null;
+  return { lastUid, fullAt };
+}
+
+/**
+ * Who the user has written to, from the Sent folder, opened read-only and read by envelope
+ * only (no bodies): the newest 500 on the first sync, after the folder's UIDVALIDITY changes
+ * and every 30 days; otherwise only what was sent since the cursor. No Sent folder means
+ * an empty history, not an error.
+ * @param {object} account
+ * @param {SentBatch['cursor']|null} cursor  from the last SentBatch
+ * @returns {Promise<SentBatch>}
+ */
+async function fetchSentHistory(account, cursor) {
+  const now = Date.now();
+  try {
+    return await withImap(account, async (client) => {
+      const sent = await sentFolder(client);
+      if (!sent) return { cursor: { kind: 'imap', path: null, uidValidity: null, lastUid: 0, fullAt: now }, full: true, entries: [] };
+      const lock = await client.getMailboxLock(sent.path, { readOnly: true });
+      try {
+        const box = client.mailbox;
+        const uidValidity = box.uidValidity != null ? String(box.uidValidity) : null;
+        const last = continuable(cursor, sent.path, uidValidity, now);
+        const exists = Number(box.exists) || 0;
+        const uidNext = Number(box.uidNext) || 0;
+        const after = last ? last.lastUid : 0;
+        let lastUid = after;
+        const found = new Map(); // uid -> entry
+        // First sync: the newest messages by position. Later: UIDs above the last one seen,
+        // unless UIDNEXT says nothing new arrived.
+        const range = !exists ? null
+          : !last ? { set: `${Math.max(1, exists - SENT_LIMIT + 1)}:*`, uid: false }
+            : !uidNext || uidNext > after + 1 ? { set: `${after + 1}:*`, uid: true } : null;
+        if (range) {
+          for await (const msg of client.fetch(range.set, { uid: true, envelope: true }, { uid: range.uid })) {
+            // "n:*" also returns the newest message when n is past it, so old UIDs are skipped.
+            if (!msg.uid || !msg.envelope || msg.uid <= after) continue;
+            lastUid = Math.max(lastUid, msg.uid);
+            const entry = sentEntry(msg.envelope);
+            if (entry) found.set(msg.uid, entry);
+          }
+        }
+        const entries = [...found.keys()].sort((a, b) => a - b).slice(-SENT_LIMIT).map((uid) => found.get(uid));
+        return {
+          cursor: { kind: 'imap', path: sent.path, uidValidity, lastUid, fullAt: last ? last.fullAt : now },
+          full: !last,
+          entries,
+        };
+      } finally {
+        lock.release();
+      }
+    });
+  } catch (err) {
+    throw friendlyError(err, "Couldn't read your sent emails");
+  }
+}
+
+// ---------- replying ----------
+
+/**
+ * Sends the user's reply over SMTP, to the email's Reply-To or else its From address only,
+ * threaded under it. `filedInSent` resolves to whether a copy is in Sent (it never rejects).
+ * @param {object} account
+ * @param {RawEmail} original
+ * @param {string} body  plain text, as typed
+ * @returns {Promise<{ sent: true, filedInSent: Promise<boolean> }>}
+ */
 async function sendReply(account, original, body) {
   // Reply-To wins over From, as in every mail client (contact forms, support desks, lists).
   const target = [original.replyTo, original.from].find((a) => a && EMAIL_RE.test(String(a.address || '')));
@@ -460,4 +665,4 @@ async function sendReply(account, original, body) {
   return { sent: true, filedInSent: saveToSent(account, raw, messageId) };
 }
 
-module.exports = { PROVIDERS, fetchInbox, markSeen, sendReply };
+module.exports = { PROVIDERS, fetchInbox, fetchSentHistory, sendReply };
