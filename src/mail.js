@@ -49,6 +49,7 @@ const { simpleParser } = require('mailparser');
 const nodemailer = require('nodemailer');
 const MailComposer = require('nodemailer/lib/mail-composer');
 const { htmlToText } = require('./cleaner');
+const { EMAIL_RE, isEmail, replyTarget } = require('./reply-target');
 
 // savesSent: the provider files mail sent over SMTP in Sent itself, so we must not add a copy.
 const PROVIDERS = {
@@ -82,7 +83,6 @@ const PARSE_OPTIONS = { keepCidLinks: true, skipTextToHtml: true, skipHtmlToText
 const UNREADABLE = "ClearMail couldn't read this email. Open it in your usual mail app to see it.";
 const TRUNCATED = 'This email is very long, so ClearMail only downloaded the start of it. Open it in your usual mail app to read the rest.';
 const LOGIN_REJECTED = 'Your email provider rejected the login. Check your email address and app password in Settings.';
-const EMAIL_RE = /^[^\s@]+@[^\s@]+$/;
 const ADDRESS_LIMIT = 500; // recipients kept per email
 const SENT_LIMIT = 500; // sent emails read at most per sync
 const SENT_FULL_EVERY_MS = 30 * 24 * 3600 * 1000; // the sent history is rebuilt from scratch this often
@@ -223,6 +223,15 @@ function firstAddress(list) {
   return null;
 }
 
+// The first address in a list that a reply could be sent to ("Team <fraud-team>" can't).
+function firstEmail(list) {
+  for (const entry of [].concat(list || [])) {
+    const found = entry && (entry.group ? firstEmail(entry.group) : toAddress(entry));
+    if (found && isEmail(found.address)) return found;
+  }
+  return null;
+}
+
 // Every real address in mailparser or envelope address lists, once each (groups flattened).
 function addressList(...lists) {
   const out = new Map();
@@ -352,7 +361,8 @@ function buildEmail(id, meta, parsed, attachments) {
     messageId: parsed?.messageId || env.messageId || null,
     uid: meta.uid,
     from: firstAddress(parsed?.from?.value) || firstAddress(env.from) || { name: 'Unknown sender', address: '' },
-    replyTo: parsed ? firstAddress(parsed.replyTo?.value) : firstAddress(env.replyTo),
+    // Only a Reply-To a reply can actually go to (src/reply-target.js decides where it goes).
+    replyTo: parsed ? firstEmail(parsed.replyTo?.value) : firstEmail(env.replyTo),
     to: parsed?.to ? addressList(parsedAddresses(parsed.to)) : addressList(env.to),
     cc: parsed?.cc ? addressList(parsedAddresses(parsed.cc)) : addressList(env.cc),
     subject: String(parsed?.subject ?? env.subject ?? ''),
@@ -618,7 +628,8 @@ async function fetchSentHistory(account, cursor) {
  */
 async function sendReply(account, original, body) {
   // Reply-To wins over From, as in every mail client (contact forms, support desks, lists).
-  const target = [original.replyTo, original.from].find((a) => a && EMAIL_RE.test(String(a.address || '')));
+  // The same rule shows the address in the reply box, so it is the one the user saw.
+  const target = replyTarget(original);
   if (!target) throw userError('This email has no address to reply to.');
   const subject = /^re:/i.test(original.subject || '') ? original.subject : `Re: ${original.subject || ''}`;
   const parentId = typeof original.messageId === 'string' && original.messageId.trim() ? original.messageId.trim() : null;

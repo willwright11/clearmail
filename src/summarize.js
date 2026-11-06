@@ -106,6 +106,19 @@ function upperFirst(s) {
 
 // ---------- tighten ----------
 
+// A roundabout request ("we need you to sign") is only rewritten where it opens a clause: at
+// the start, after a full stop, semicolon, colon or dash, or after a comma (and "so", "and" or
+// "but") that doesn't carry on a condition. "If we need you to sign anything, we will write",
+// "Let us know if we need you to…" and "If prices change, and we need you to sign again, …"
+// stay as they are: they aren't asking for anything.
+const CONDITION = /\b(?:if|when|whenever|unless|whether|once|until|till|in case|should|where|while|as soon as|after|before|provided)\b/i;
+function opensClause(s, offset) {
+  const before = s.slice(0, offset);
+  if (/(?:^|[.!?;:—–])[ \t]*$/.test(before)) return true;
+  return /,[ \t]*(?:(?:so|and|but)[ \t]+)?$/.test(before) && !CONDITION.test(before.split(/[.!?;:—–]/).pop());
+}
+const request = (to) => (m, offset, s) => (opensClause(s, offset) ? to : m);
+
 const BASIS = { daily: 'daily', weekly: 'weekly', monthly: 'monthly', yearly: 'yearly', annual: 'annually', regular: 'regularly' };
 
 // Case-insensitive, whole words. Each entry is [pattern, replacement]; '' removes the phrase.
@@ -141,9 +154,10 @@ const PHRASES = [
   [/\bhas the ability to\b/gi, 'can'],
   [/\bmake a decision\b/gi, 'decide'],
   [/\b(?:take into consideration|give consideration to)\b/gi, 'consider'],
-  // Roundabout requests.
-  [/\b(?:we would need you to|we need you to|i need you to|we would like you to)\b/gi, 'please'],
-  [/\b(?:would you be able to|would it be possible(?: for you)? to|i was wondering if you could)\b/gi, 'could you'],
+  // Roundabout requests, where they open a clause (see opensClause). "Would it be possible to
+  // get a copy?" doesn't say who would get it, so only "…for you to" becomes "could you".
+  [/\b(?:we would need you to|we need you to|i need you to|we would like you to)\b/gi, request('please')],
+  [/\b(?:would you be able to|would it be possible for you to|i was wondering if you could)\b/gi, request('could you')],
 ];
 
 // Spaces and commas left behind by a removal.
@@ -236,16 +250,40 @@ function shorten(text, max = MAX_GIST_WORDS) {
 // A direct request to the reader, as opposed to a sentence that only mentions "due" or "send".
 const DIRECT_ASK = /\b(?:please|could you|can you|would you|will you|need you to|you need to|you must|make sure|remember to|don't forget|do you|are you|did you|have you|let me know)\b/i;
 
-// The first thing the sender asks: a direct request first, in email order.
-function firstAsk(body, actions, questions) {
+// The asks in email order.
+function inOrder(body, actions, questions) {
   const where = (s) => {
     const i = body.indexOf(s);
     return i < 0 ? Infinity : i;
   };
-  const asks = [...actions, ...questions].map((s, n) => ({ s, at: where(s), n })).sort((a, b) => a.at - b.at || a.n - b.n);
-  const direct = asks.find((a) => DIRECT_ASK.test(a.s.replace(/’/g, "'")));
-  return direct ? direct.s : actions[0] || questions[0] || '';
+  return [...actions, ...questions].map((s, n) => ({ s, at: where(s), n })).sort((a, b) => a.at - b.at || a.n - b.n).map((a) => a.s);
 }
+
+// The first thing the sender asks: a direct request first, in email order.
+function firstAsk(body, actions, questions) {
+  const direct = inOrder(body, actions, questions).find((s) => DIRECT_ASK.test(s.replace(/’/g, "'")));
+  return direct || actions[0] || questions[0] || '';
+}
+
+// The user's first names, lower case ("will"), as the app passes them.
+const namesOf = (v) => list(v).filter((n) => typeof n === 'string').map((n) => n.toLowerCase()).filter((n) => /^\p{L}{2,30}$/u.test(n)).slice(0, MAX_ITEMS);
+
+/**
+ * Whether an ask speaks to the user by name: "Will, could you…", "Could you, Will, …",
+ * "…, Will?". The name needs its capital and a comma (or a colon or dash after it at the
+ * start), so "Will you send it?" and "the will of the client" don't count.
+ */
+function addressesUser(sentence, names) {
+  const s = String(sentence).trim();
+  return names.some((n) => {
+    const name = n[0].toUpperCase() + n.slice(1);
+    return new RegExp(`^(?:(?:[Hh]i|[Hh]ey|[Oo]k(?:ay)?|[Ss]o|[Aa]nd|[Aa]lso|[Oo]h)[ \\t,]+)?${name}(?:[ \\t]*[,:]|[ \\t]+[—–-])|,[ \\t]*${name}[ \\t]*(?:[,?!.…]|$)`).test(s);
+  });
+}
+
+// The first ask that names the user: in an email to several people, theirs ("Will, could you
+// send me the invoice?"), not someone else's.
+const namedAsk = (body, actions, questions, names) => (names.length ? inOrder(body, actions, questions).find((s) => addressesUser(s, names)) || '' : '');
 
 const MARKETING = /\d\s?%\s?off\b|\b(?:sale|offers?|deals?|vouchers?|cashback|discounts?|promo(?:tion)?s?|coupons?|shop now|free delivery|today only|last chance|limited[- ]time)\b/i;
 const OBLIGATION = /\b(?:due|owe|overdue|must|deadline|pay by|required|renew|submit(?:ted)?)\b/i;
@@ -314,8 +352,20 @@ function deadlinePurpose(d) {
   }
   const words = what.replace(/[\s,;:.!?]+$/, '').split(/\s+/).filter(Boolean);
   if (words.length < 2) return '';
-  // A long one keeps its start (what) and its end (the verb): "Your online Self Assessment … must be submitted".
-  return capitalise(words.length > 10 ? `${words.slice(0, 5).join(' ')} … ${words.slice(-3).join(' ')}` : words.join(' '));
+  return capitalise(abbreviate(words));
+}
+
+// About 10 words at most. A long one keeps its start (what) and its end (the verb): "Your
+// online Self Assessment … must be submitted". A "not" or "unless" is never cut out of the
+// middle, which would reverse the meaning: from the first one on is kept instead ("£480 will
+// be taken from … unless you cancel it", "… not send the original documents or your passport to us").
+function abbreviate(words) {
+  if (words.length <= 10) return words.join(' ');
+  const neg = words.findIndex((w, i) => i >= 5 && i < words.length - 3 && NEGATION_WORD.test(w.replace(/[^\p{L}'’]/gu, '')));
+  if (neg < 0) return `${words.slice(0, 5).join(' ')} … ${words.slice(-3).join(' ')}`;
+  const tail = words.slice(neg);
+  const head = words.slice(0, Math.min(5, Math.max(0, 10 - tail.length)));
+  return `${head.length ? `${head.join(' ')} ` : ''}… ${abbreviate(tail)}`;
 }
 
 // The date as written, with its time: "Wednesday at 10am".
@@ -333,8 +383,10 @@ function deadlineWhen(d) {
  * @param {string} subject
  * @param {string} [original]  the full original text (originalText), for the word count and
  *   for when the cleaner kept nothing
- * @param {{ deadlines?: object[] }} [opts]  dates.findDeadlines() for this email; these become
- *   `dates`. Without them, the cleaner's dates are listed as written (day: null).
+ * @param {{ deadlines?: object[], names?: string[] }} [opts]  deadlines: dates.findDeadlines()
+ *   for this email; these become `dates`. Without them, the cleaner's dates are listed as
+ *   written (day: null). names: the user's first names, lower case ('will'): an ask that
+ *   speaks to them by name ("Will, could you…") leads the gist.
  * @returns {EmailSummary}
  */
 function heuristicSummary(cleaned, subject, original = '', opts = {}) {
@@ -345,9 +397,13 @@ function heuristicSummary(cleaned, subject, original = '', opts = {}) {
   const keyPoints = texts(c.keyPoints);
   const deadlines = Array.isArray(opts?.deadlines) ? opts.deadlines.filter((d) => d && typeof d === 'object') : null;
   const deadlineSentences = (deadlines || []).map((d) => text(d.sentence)).filter(Boolean);
+  const names = namesOf(opts?.names);
 
-  // Person mail leads with what they ask; anything else with its most informative fact.
-  const lead = (c.category === 'person' || !CATEGORIES.includes(c.category) ? firstAsk(body, actions, questions) : '')
+  // Person mail leads with what they ask, an ask that names the user first ("Will, could
+  // you…", in a group's mail too); anything else with its most informative fact.
+  const personal = c.category === 'person' || !CATEGORIES.includes(c.category);
+  const lead = (personal || c.category === 'newsletter' ? namedAsk(body, actions, questions, names) : '')
+    || (personal ? firstAsk(body, actions, questions) : '')
     || bestFact(keyPoints, deadlineSentences);
   const gist = lead ? shorten(tighten(lead)) : text(subject) || '(no text)';
   const gistPlain = plain(gist);

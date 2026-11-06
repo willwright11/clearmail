@@ -253,6 +253,189 @@ test('Days away count calendar days, even across the clocks going back', () => {
   assert.strictEqual(one(email({ deadlines: [deadline('2027-03-29')] }), spring).deadline.daysAway, 1);
 });
 
+// ---------- fixes from the adversarial review (v0.3) ----------
+
+const noreply = { name: 'Council', address: 'noreply@council.example' };
+
+test('Bulk or automated mail that asks for something by a date: the deadline counts', () => {
+  const school = one(fx.schoolTrip());
+  expect(school, 'needs-you', ['deadline-soon']);
+  assert.strictEqual(school.reasons[0], 'Due Fri 6 Nov');
+  // Only an ask with a cue word: a date that merely sits in an ask isn't a deadline.
+  const plain = fx.schoolTrip();
+  plain.deadlines = [deadline(3, { text: 'Friday', cue: null, source: 'ask', sentence: 'On the day, please wear school uniform on Friday.' })];
+  expect(one(plain), 'noise', ['newsletter']);
+  // Marketing asks still don't count.
+  const sale = fx.schoolTrip();
+  sale.deadlines = [deadline(3, { cue: 'by', source: 'ask', sentence: 'Book by Friday to get 20% off the uniform shop.' })];
+  expect(one(sale), 'noise', ['newsletter']);
+  // "expires", "expiry", "deadline", "no later than" and "your … must" are obligation wording.
+  for (const sentence of [
+    'The MOT for your vehicle AB12 CDE expires on 14 November 2026.',
+    'Expiry date of your parking permit: 14 November 2026.',
+    'The deadline for applications is 14 November.',
+    'Forms must reach our office no later than 14 November.',
+    'Your parcel must be collected by 14 November.',
+  ]) {
+    const m = email({ from: noreply, listUnsubscribe: true, category: 'notification', deadlines: [deadline('2026-11-14', { cue: null, sentence })] });
+    expect(one(m), 'needs-you', ['deadline-soon']);
+  }
+});
+
+test("A delivery notice is news, not a task: \"your order will be delivered by Friday\" doesn't need you; an import fee does", () => {
+  expect(one(fx.delivery()), 'noise', ['outlook-other']);
+  const inFocused = one(fx.delivery({ focused: true }));
+  expect(inFocused, 'worth-knowing', ['automated']);
+  assert.strictEqual(inFocused.deadline, null);
+  // "Your order" alone isn't obligation wording any more, and other ways of saying it.
+  for (const sentence of [
+    'Your order will be delivered by Friday 6 November.',
+    'We will deliver your order by Friday 6 November.',
+    'Your card will arrive by Friday 6 November.',
+    'Your new card has been dispatched and is due to arrive by 6 November.',
+    'Your order will be ready to collect from Friday 6 November.',
+    'Your order is scheduled for delivery by Friday 6 November.',
+  ]) {
+    for (const source of ['body', 'ask']) {
+      const m = fx.delivery({ focused: true, deadlines: [deadline(3, { cue: 'by', source, sentence })] });
+      assert.notStrictEqual(one(m).bucket, 'needs-you', `${source}: ${sentence}`);
+    }
+  }
+  const change = 'Your order can be changed or cancelled until Friday 6 November.';
+  expect(one(fx.delivery({ focused: true, deadlines: [deadline(3, { cue: 'until', sentence: change })] })), 'worth-knowing', ['automated']);
+  // From a shop address that looks like a person, it is still not an ask or a deadline.
+  const shop = one(fx.delivery({ from: { name: 'Parcel Shop', address: 'orders@parcelshop.example' }, category: 'person', focused: true }));
+  expect(shop, 'worth-knowing', ['fyi']);
+  assert.strictEqual(shop.deadline, null);
+  // Paying the import fee is a task.
+  const fee = one(fx.importFee());
+  expect(fee, 'needs-you', ['deadline-soon']);
+  assert.strictEqual(fee.reasons[0], 'Due Fri 6 Nov');
+  // So is a sentence about an arrival that also asks for something.
+  for (const sentence of [
+    'Your parcel will be delivered once you pay the £18.40 import fee by Friday 6 November.',
+    'Payment must be made before the engineer arrives on Friday 6 November.',
+    'Please make sure someone is in when your parcel arrives on Friday 6 November.',
+  ]) {
+    expect(one(fx.delivery({ deadlines: [deadline(3, { cue: 'by', source: 'ask', sentence })] })), 'needs-you');
+  }
+  // And a person telling you when something arrives isn't asking you to do anything.
+  const builder = email({ from: { name: 'Sarah', address: 'sarah.collins@brightbuild.co.uk' }, actions: ['The steel will be delivered by Friday.'],
+    deadlines: [deadline(3, { cue: 'by', source: 'ask', sentence: 'The steel will be delivered by Friday.' })] });
+  expect(one(builder), 'worth-knowing', ['known-contact']);
+});
+
+test('Notices that say you must act but give no date are worth knowing, not noise', () => {
+  const notice = (subject, body, o = {}) => email({ from: { name: 'DVLA', address: 'noreply@dvla.example' }, subject, body, category: 'notification', focused: false, ...o });
+  for (const [subject, body] of [
+    ['Action needed: your vehicle tax', 'We could not take your vehicle tax Direct Debit payment. You need to set up a new payment to keep your vehicle taxed.'],
+    ['Response needed', 'Please reply to our letter about your 2025 return. If you do not respond we may charge you a penalty.'],
+    ['Your vehicle tax', "We couldn't collect your payment this month."],
+    ['Reply required', 'Please get in touch about your licence.'],
+    ['Your licence', 'You have to renew your licence before you drive again.'],
+  ]) {
+    expect(one(notice(subject, body)), 'worth-knowing', ['obligation']);
+    expect(one(notice(subject, body, { listUnsubscribe: true })), 'worth-knowing', ['obligation']);
+  }
+  // "You do not need to do anything" is not one.
+  expect(one(notice('Your tax code has changed', 'Your tax code has changed to 1257L. You do not need to do anything.')), 'noise', ['outlook-other']);
+});
+
+test('A bank fraud check is a security alert, found in the subject or the start of the body', () => {
+  expect(one(fx.fraudCheck()), 'worth-knowing', ['security']);
+  assert.strictEqual(one(fx.fraudCheck()).reasons[0], 'Security alert about your account');
+  expect(one(fx.fraudCheck({ subject: 'Your card ending 4421' })), 'worth-knowing', ['security']);
+  for (const subject of ['Fraud alert', 'Did you authorise this transaction?', 'Suspicious payment on your account']) {
+    expect(one(fx.fraudCheck({ subject, body: 'Please call us on the number on the back of your card.' })), 'worth-knowing', ['security']);
+  }
+  // Only the start of the body is read: a mention far down a long notice doesn't count.
+  const long = fx.fraudCheck({ subject: 'Your statement is ready', body: `${'Your statement for October is ready to view in the app. '.repeat(8)}Read our tips on avoiding fraud.` });
+  expect(one(long), 'noise', ['outlook-other']);
+  // Older alerts from a sender whose emails go unread are not hidden as "ignored".
+  const alerts = [1, 2, 3, 4].map((d) => fx.fraudCheck({ focused: null, hoursAgo: d * 24 + 5 }));
+  const results = triageAll(alerts, ctx());
+  for (const m of alerts) assert.notStrictEqual(results.get(m.id).bucket, 'noise', results.get(m.id).reasons.join(' | '));
+  assert.ok(results.get(alerts[3].id).codes.includes('ignored'), 'still says they go unread');
+  // Other automated mail from an ignored sender still is.
+  const other = [1, 2, 3, 4].map((d) => fx.automated({ focused: null, hoursAgo: d * 24 + 5 }));
+  expect(triageAll(other, ctx()).get(other[3].id), 'noise', ['ignored']);
+});
+
+test('A holiday key-safe code is not an old sign-in code; a real old sign-in code still is', () => {
+  const cottage = one(fx.cottageCode());
+  expect(cottage, 'worth-knowing', ['automated']);
+  // Even with sign-in wording, an email about a stay still to come isn't a sign-in code…
+  const withLogin = fx.cottageCode({ body: 'Your stay starts on Friday 6 November. Log in to the guest app for directions. Your key safe access code is 4821.' });
+  expect(one(withLogin), 'worth-knowing', ['automated']);
+  // …nor one with a deadline still to come.
+  const balance = fx.cottageCode({ cleaned: { dates: [] }, body: 'Log in with your access code 4821 and pay the balance by Friday.',
+    deadlines: [deadline(3, { cue: 'by', sentence: 'Log in with your access code 4821 and pay the balance by Friday.' })] });
+  assert.notStrictEqual(one(balance).codes[0], 'old-code');
+  // Access codes with sign-in wording and no date: old codes.
+  const code = (subject, body) => email({ from: { name: 'Shop', address: 'noreply@shop.example' }, subject, body, hoursAgo: 30, seen: true, category: 'notification' });
+  expect(one(code('Your code', 'Your access code is 4821. Use it to log in.')), 'noise', ['old-code']);
+  expect(one(code('Your code', '482913 is your code. It expires in 10 minutes.')), 'noise', ['old-code']);
+  expect(one(code('Your code', 'Your verification code is 482913. Use it today.')), 'noise', ['old-code']);
+  // A confirmation code with no sign-in wording is not one.
+  expect(one(code('Booking confirmed', 'Your confirmation code is 4821.')), 'worth-knowing', ['automated']);
+  expect(one(fx.oldCode()), 'noise', ['old-code']);
+});
+
+test("CC'd, but asked by name: needs you, with that ask's deadline", () => {
+  const r = one(fx.ccNamed());
+  expect(r, 'needs-you', ['asks-question', 'deadline-soon']);
+  assert.strictEqual(r.deadline.day, fx.dayPlus(fx.TODAY, 3), "the user's Friday, not Tom's Thursday");
+  assert.strictEqual(r.reasons[1], 'Due Fri 6 Nov');
+  assert.ok(!r.codes.includes('cc-only'));
+  // Without the user's names (or with someone else's), it reads as before.
+  expect(one(fx.ccNamed(), ctx({ names: [] })), 'worth-knowing', ['cc-only', 'deadline-soon']);
+  assert.strictEqual(one(fx.ccNamed(), ctx({ names: [] })).deadline.day, fx.dayPlus(fx.TODAY, 2));
+  expect(one(fx.ccNamed(), ctx({ names: ['sam'] })), 'worth-knowing', ['cc-only']);
+  // The ways people address someone by name.
+  for (const ask of [
+    'Could you bring the new valves on Friday, Will?',
+    'Hi Will, can you send me the invoice?',
+    'Tom can drain it, and Will, could you bring the valves?',
+    'Will: please send the invoice.',
+    'WILL, could you send the invoice?',
+  ]) {
+    const m = fx.ccNamed({ deadlines: [] });
+    m.cleaned[ask.endsWith('?') ? 'questions' : 'actions'] = [m.cleaned.questions[0], ask];
+    expect(one(m), 'needs-you');
+  }
+  // Not addressed by name: "Will you…?", "ask Will, our electrician", "we will, if needed,".
+  for (const ask of ['Will you be on site on Thursday, Tom?', 'Can you ask Will, our electrician, to call me?', 'We will, if needed, call you?', 'Can you check it, will?']) {
+    expect(one(fx.ccNamed({ questions: [ask], deadlines: [] })), 'worth-knowing', ['cc-only']);
+  }
+  // The CC'd FYI that mentions the user ("Will, I've copied you in") asks nothing of them.
+  expect(one(fx.ccFyi()), 'worth-knowing', ['cc-only']);
+  // Names that aren't plain words are ignored rather than breaking the pattern.
+  expect(one(fx.ccNamed(), ctx({ names: ['w', '.*', 'will)', 42, null] })), 'worth-knowing', ['cc-only']);
+});
+
+test("A Gmail post to a discussion group is a person's email, not bulk", () => {
+  const r = one(fx.groupPost());
+  expect(r, 'worth-knowing', ['group']);
+  assert.strictEqual(r.reasons[0], 'Sent to a mailing list');
+  // Asked by name, or with a deadline within a week: needs you.
+  expect(one(fx.groupPost({ questions: ['Will, could you bring the corner flags?'] })), 'needs-you', ['asks-question']);
+  const confirm = 'Please confirm your child can play by Thursday.';
+  expect(one(fx.groupPost({ actions: [confirm], deadlines: [deadline(2, { text: 'Thursday', cue: 'by', source: 'ask', sentence: confirm })] })), 'needs-you', ['asks-action']);
+  // Never noise, even unread, ignored or filed under Other.
+  const posts = [1, 2, 3, 4].map((d) => fx.groupPost({ hoursAgo: d * 24 + 5, focused: false, questions: [] }));
+  for (const res of triageAll(posts, ctx()).values()) assert.notStrictEqual(res.bucket, 'noise', res.reasons.join(' | '));
+  // The same post from a company's own domain is still bulk.
+  expect(one(fx.groupPost({ from: { name: 'Club', address: 'news@harrowjuniors.example' } })), 'noise', ['newsletter']);
+  // Words in a webmail person's email ("unsubscribe", "sale", "payment received") don't make it bulk or automated.
+  for (const category of ['newsletter', 'promo', 'receipt', 'notification']) {
+    const m = email({ from: { name: 'Tom Hughes', address: 'tomhughes88@gmail.com' }, category, focused: false, questions: ['Can you give me a call tonight?'] });
+    expect(one(m, ctx({ wrote: {} })), 'needs-you', ['asks-question']);
+  }
+  // Precedence: junk, Auto-Submitted and no-reply addresses still count.
+  expect(one(email({ from: { name: 'X', address: 'someone@gmail.com' }, headers: { precedence: 'junk' } })), 'noise', ['newsletter']);
+  expect(one(email({ from: { name: 'X', address: 'someone@gmail.com' }, headers: { autoSubmitted: 'auto-replied' }, focused: false })), 'noise', ['outlook-other']);
+});
+
 // ---------- the never-noise property ----------
 
 const PROMO_SENTENCE = 'Today only: 30% off everything, shop now while stocks last.';
@@ -297,6 +480,12 @@ const PROTECTED = [
   }],
   ['group coursework deadline', () => [fx.strangerGroupCoursework(), ctx()]],
   ['fresh sign-in alert', () => [fx.freshSignIn(), ctx()]],
+  ['school asks for a form back by Friday', () => [fx.schoolTrip(), ctx()]],
+  ['import fee to pay within 3 days', () => [fx.importFee(), ctx()]],
+  ['bank fraud check', () => [fx.fraudCheck(), ctx()]],
+  ["CC'd but asked by name", () => [fx.ccNamed(), ctx()]],
+  ['Gmail post to a discussion group', () => [fx.groupPost(), ctx()]],
+  ['Gmail post to a discussion group, asking by name', () => [fx.groupPost({ questions: ['Will, could you bring the corner flags?'] }), ctx()]],
 ];
 
 // Protected only by being from a person. A List-Unsubscribe header is the positive bulk
@@ -365,6 +554,71 @@ test('Property: an email from a person is never noise unless the user chose Alwa
   }
 });
 
+// ---------- real emails through the real pipeline (cleaner → dates → triage) ----------
+
+const real = require('./fixtures/real-emails');
+
+const realCtx = (f, o = {}) => ctx({ now: real.NOW, names: real.NAMES, wrote: f.wrote || {}, ...o });
+const realTriage = (f, rawEmail = f.raw()) => triage(real.prepare(rawEmail), realCtx(f));
+const describeResult = (r) => `${r.bucket} ${r.codes.join(',')} ${r.deadline ? r.deadline.day : 'no deadline'} (${r.reasons.join(' | ')})`;
+
+function checkReal(f) {
+  const r = realTriage(f);
+  const { bucket, code, day } = f.expect;
+  assert.ok([].concat(bucket).includes(r.bucket), `${f.name}: ${describeResult(r)}`);
+  if (code) assert.strictEqual(r.codes[0], code, `${f.name}: ${describeResult(r)}`);
+  if (day) assert.strictEqual(r.deadline && r.deadline.day, day, `${f.name}: ${describeResult(r)}`);
+}
+
+// Which noise signals each fixture must survive (see real-emails.js).
+function realCombos(f) {
+  if (f.guard === 'all') return COMBOS;
+  if (f.guard === 'person') return COMBOS.filter((x) => !x.listUnsubscribe);
+  return [COMBOS[0]];
+}
+
+function checkRealNeverNoise(f) {
+  for (const combo of realCombos(f)) {
+    const r = realTriage(f, real.mutateRaw(f.raw(), combo));
+    assert.notStrictEqual(r.bucket, 'noise', `${f.name} with ${JSON.stringify(combo)}: ${describeResult(r)}`);
+  }
+}
+
+test('Real pipeline: the emails the review found sorted wrongly now land where they should', () => {
+  for (const f of real.REAL.filter((x) => !x.needs)) checkReal(f);
+});
+
+// Depends on the text agent's parallel fixes in cleaner.js and dates.js ("no later than
+// 5pm on…", "by the 15th", and forwarded emails' dates, cleaner.forwarded): each fixture's
+// `needs` names which.
+test("Real pipeline, with the text agent's cleaner and dates fixes: the deadlines are found too", () => {
+  for (const f of real.REAL.filter((x) => x.needs)) checkReal(f);
+});
+
+test('Property (real pipeline): none of those emails becomes noise, whatever noise signals are added', () => {
+  for (const f of real.REAL.filter((x) => !x.noiseNeeds)) checkRealNeverNoise(f);
+});
+
+// Depends on the text agent's dates.js fix ("no later than midnight on 20 November"): until
+// then no deadline is found and nothing else protects that council notice.
+test("Property (real pipeline, with the text agent's dates fix): nor do the ones that need it", () => {
+  for (const f of real.REAL.filter((x) => x.noiseNeeds)) checkRealNeverNoise(f);
+});
+
+test('Real pipeline: emails that really are noise still are', () => {
+  for (const f of real.CONTROLS) {
+    const r = realTriage(f);
+    expect(r, 'noise', [f.code]);
+  }
+  const issues = real.ignoredNewsletter().map(real.prepare);
+  const current = triageAll(issues, realCtx({})).get(issues[0].id);
+  expect(current, 'noise', ['newsletter']);
+  assert.strictEqual(current.reasons[0], "Newsletter you haven't opened in 4 emails");
+  // The delivery notice in Outlook's Focused tab: worth knowing, never needs you.
+  const delivery = real.CONTROLS.find((f) => f.code === 'outlook-other');
+  expect(realTriage(delivery, { ...delivery.raw(), focused: true }), 'worth-knowing', ['automated']);
+});
+
 // ---------- reasons ----------
 
 test('Reasons: at most 3, one code each, every code has plain-English text', () => {
@@ -380,6 +634,7 @@ test('Reasons: at most 3, one code each, every code has plain-English text', () 
     fx.sarah(), fx.dad(), fx.hmrc(), fx.screwfix(), fx.promo(), fx.ccFyi(), fx.bank(), fx.stranger(), fx.strangerBankDetails(),
     fx.strangerGroup(), fx.strangerGroupCoursework(), fx.demo1(), fx.oldCode(), fx.freshSignIn(), fx.automated(),
     fx.personOther(), fx.flaggedNewsletter(), many, ...fx.weeklyBuilderIssues(0),
+    fx.schoolTrip(), fx.importFee(), fx.delivery(), fx.fraudCheck(), fx.cottageCode(), fx.ccNamed(), fx.groupPost(),
   ];
   const results = triageAll(all, ctx());
   assert.strictEqual(results.size, all.length);
@@ -590,6 +845,7 @@ test('demo: the inbox sorts as designed (real cleaner, no deadlines needed)', ()
   const results = triageAll(inputs, {
     now: Date.now(),
     me: new Set([ME.address]),
+    names: ['will'], // from demo.ME's name, as main.js derives it
     wroteTo: (a) => wrote[a] || 0,
     historyKnown: true,
     repliedAt: (m) => replies[m.conversationId] || null,

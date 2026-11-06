@@ -36,7 +36,8 @@ const scopeName = (s) => (s.toLowerCase().startsWith(GRAPH_PREFIX.toLowerCase())
 const scopeWords = (text) => String(text || '').split(/\s+/).filter(Boolean);
 
 /**
- * A Graph inbox message. from/replyTo are [name, address]; to/cc are lists of them;
+ * A Graph inbox message. from is [name, address]; replyTo is one [name, address] or a list
+ * of them (as Graph lists every Reply-To address); to/cc are lists of them;
  * minutesAgo sets the dates; attachments are { name, size, isInline, contentType };
  * headers are extra internet headers ({ 'List-Unsubscribe': '<https://...>' }), only
  * served by a single-message GET as Graph does. focused: true (Focused), false (Other)
@@ -60,7 +61,7 @@ function graphMessage({
     subject,
     from: address(from),
     sender: address(from),
-    replyTo: replyTo ? [address(replyTo)] : [],
+    replyTo: !replyTo ? [] : Array.isArray(replyTo[0]) ? replyTo.map(address) : [address(replyTo)],
     toRecipients: to.map(address),
     ccRecipients: cc.map(address),
     sentDateTime: when,
@@ -94,6 +95,14 @@ function sentMessage({ id, from, to = [], cc = [], bcc = [], minutesAgo = 60, co
   };
 }
 
+// Who Graph delivers a reply to: the message's toRecipients when the request gives them,
+// otherwise every Reply-To address the original lists (RFC 2822), or else its sender.
+function deliveredTo(original, body) {
+  const given = body?.message?.toRecipients;
+  const list = Array.isArray(given) && given.length ? given : original.replyTo?.length ? original.replyTo : [original.from];
+  return list.map((r) => String(r?.emailAddress?.address || '').toLowerCase());
+}
+
 // Only the $select-ed fields (and id), like Graph; attachments only with $expand.
 function project(message, query) {
   const fields = new Set(['id', ...String(query.get('$select') || '').split(',').filter(Boolean)]);
@@ -106,7 +115,7 @@ function project(message, query) {
 async function startMicrosoft({ clientId }) {
   const ms = {
     requests: [], // { method, path, mailbox } for every request
-    replies: [], // { mailbox, id, body }
+    replies: [], // { mailbox, id, body, to }: to is who the reply was delivered to
     batches: [], // { mailbox, ids }: the messages each $batch read
     batchRequests: [], // { mailbox, method, url } for every request inside a $batch
     refused: [], // { mailbox, method, path }: calls that would have changed a mailbox (405)
@@ -274,8 +283,10 @@ async function startMicrosoft({ clientId }) {
     const reply = /^\/v1\.0\/me\/messages\/([^/]+)\/reply$/.exec(path);
     if (method === 'POST' && reply && !inBatch) {
       const id = decodeURIComponent(reply[1]);
-      if (!box.messages.some((x) => x.id === id)) return notFound();
-      ms.replies.push({ mailbox: email, id, body: JSON.parse(request.text) });
+      const original = box.messages.find((x) => x.id === id);
+      if (!original) return notFound();
+      const body = JSON.parse(request.text);
+      ms.replies.push({ mailbox: email, id, body, to: deliveredTo(original, body) });
       return { status: 202 };
     }
     if (method !== 'GET') return refuse(email, method, path);

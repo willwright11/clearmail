@@ -11,6 +11,7 @@ const brief = require('./src/brief');
 const view = require('./src/view');
 const { orderForLocale } = require('./src/dates');
 const { isValidRuleKey } = require('./src/triage');
+const { replyTarget } = require('./src/reply-target');
 
 // ClearMail reads email and sends the replies the user writes. Nothing here can delete,
 // move, flag or mark anything as read: the backends only read, and a reply is held for
@@ -27,6 +28,7 @@ const MAX_IDS = 5000;
 const NO_CLIENT_ID = 'ClearMail needs a Microsoft app ID (the "Application (client) ID") before it can use Outlook. Add it in Settings. See "Using Outlook" in the README for the 5-minute setup.';
 const ACCOUNT_GONE = 'That account has been removed from ClearMail. Refresh to update your inbox.';
 const EMAIL_GONE = 'This email is no longer in your inbox. Refresh and try again.';
+const NO_REPLY_ADDRESS = 'This email has no address to reply to.';
 const passLocked = (user) => `ClearMail couldn't unlock the saved app password for ${user} from the macOS Keychain. Quit and reopen ClearMail and choose Always Allow when asked, or enter the password again in Settings.`;
 const signInLocked = (email) => `ClearMail couldn't unlock your saved Microsoft sign-in for ${email} from the macOS Keychain. Quit and reopen ClearMail and choose Always Allow when asked, or click "Sign in again".`;
 const signInAgain = (email) => `Microsoft needs you to sign in to ${email} again. Use "Sign in again" to reconnect it.`;
@@ -69,6 +71,8 @@ const demoReplies = []; // { email, at } for replies sent to sample emails this 
 const historySyncing = new Map(); // account id -> its Sent folder read in progress
 const needsSignIn = new Set(); // Microsoft account ids whose last call said to sign in again
 const pending = new Map(); // email id -> a reply waiting to be sent: { timer, body, entry, sendAt }
+const sending = new Set(); // email ids whose reply is on its way now (its 5 seconds are up)
+let shuttingDown = false; // macOS is shutting down, restarting or logging out
 let signInRun = null; // AbortController of the Microsoft sign-in waiting in the browser
 let scheduler = null; // the morning brief (src/brief.js)
 let notification = null; // the last one shown, kept so it isn't garbage-collected before a click
@@ -103,8 +107,17 @@ function createWindow() {
     },
   });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  // A reply still in its 5 seconds lives in this window (its text, its Undo), so closing the
+  // window asks first, as quitting does. "Don't close" keeps everything as it was.
+  win.on('close', (e) => {
+    if (!pending.size) return;
+    if (shuttingDown || confirmDropReplies('close')) dropPendingReplies();
+    else e.preventDefault();
+  });
   // A closed window must not be used again (on macOS the app keeps running for the brief).
   win.on('closed', () => { win = null; });
+  // The page crashed: its replies can no longer be seen or undone, so they are not sent.
+  win.webContents.on('render-process-gone', () => dropPendingReplies());
 
   // Never navigate the app window away; send links to the default browser.
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
@@ -142,6 +155,13 @@ const addressOf = (account) => (account.kind === 'microsoft' ? account.email : a
 const accountExists = (accountId) => accountId === DEMO_ACCOUNT || settings.accounts.some((a) => a.id === accountId);
 const isPersonal = (account) => (typeof account.personal === 'boolean' ? account.personal : store.MICROSOFT_MAIL_RE.test(account.email || ''));
 
+// The accounts whose emails, marks and history may be kept (the sample emails' too).
+const knownAccountIds = () => new Set([DEMO_ACCOUNT, ...settings.accounts.map((a) => a.id)]);
+
+// The user's first names ("will"), so an ask like "Will, could you…" reads as meant for
+// them: from each account's display name, or the sample user's in demo mode.
+const userNames = (demoActive) => view.firstNames(demoActive ? [demo.ME.name] : settings.accounts.map((a) => a.name));
+
 // state.json. Marks older than 60 days are only dropped for emails ClearMail knows have gone
 // (their account loaded this session without them), so a Done email still in the inbox stays
 // done however old, and nothing is lost before the first load or while an account fails.
@@ -152,12 +172,16 @@ function saveMarks(next = marks) {
   for (const list of [next.done, next.notNoise]) {
     for (const id of Object.keys(list || {})) if (!loaded.has(id.slice(0, id.indexOf(':')))) keep.add(id);
   }
-  marks = store.saveState(next, { keep });
+  marks = store.saveState(next, { keep, accountIds: knownAccountIds() });
 }
 
+// history.json. An account that is no longer in Settings is dropped, so nothing written for it
+// late (a reply that finished after it was removed) outlives it.
 function saveHistories() {
+  const known = knownAccountIds();
+  for (const id of Object.keys(histories)) if (!known.has(id)) delete histories[id];
   try {
-    store.saveHistory(histories);
+    store.saveHistory(histories, { accountIds: known });
   } catch (err) {
     console.error('Could not save the sent-email history:', err.message);
   }
@@ -424,8 +448,9 @@ async function fetchInbox(gen) {
     }
   }
   const order = localeOrder();
+  const names = userNames(d.active);
   const next = new Map();
-  for (const entry of entries.values()) next.set(entry.id, view.prepareEmail(entry.raw, { order, previous: prepared.get(entry.id) }));
+  for (const entry of entries.values()) next.set(entry.id, view.prepareEmail(entry.raw, { order, names, previous: prepared.get(entry.id) }));
   prepared = next;
   inbox = {
     demo: d.active,
@@ -502,18 +527,32 @@ function currentView() {
     items,
     history: historyContext(),
     marks,
+    names: userNames(d.active),
   });
 }
 
 // ---------- replying (held for 5 seconds so it can be undone) ----------
 
 // Sends a reply whose 5 seconds are up, from the account that received the email, to the
-// email's Reply-To or From address (the backends decide; the window can't choose).
+// one address src/reply-target.js picks (the reply box showed it; the window can't choose).
+// While it is on its way, the email takes no other reply and Undo says it's too late.
 async function sendQueued(id) {
   const job = pending.get(id);
   if (!job) return;
   pending.delete(id);
-  const { entry, body } = job;
+  sending.add(id);
+  try {
+    await sendNow(id, job);
+  } finally {
+    sending.delete(id);
+  }
+}
+
+// Still the same mailbox as the one the reply went from (not removed or edited meanwhile).
+const stillHas = (accountId, account) => settings.accounts.some((a) => a.id === accountId && store.accountIdentity(a) === store.accountIdentity(account));
+
+async function sendNow(id, { entry, body }) {
+  let keep = true; // false when the account went while the reply was on its way
   try {
     if (entry.accountId === DEMO_ACCOUNT) {
       demoReplies.push({ email: { conversationId: entry.raw.conversationId, messageId: entry.raw.messageId }, at: Date.now() });
@@ -530,9 +569,14 @@ async function sendQueued(id) {
       } catch (err) {
         throw accountError(account, err, "Couldn't send your reply. Please try again.");
       }
-      // "You've already replied" until the next Sent sync says the same.
-      histories[account.id] = history.noteReply(histories[account.id] || null, { conversationId: entry.raw.conversationId, messageId: entry.raw.messageId }, Date.now());
-      saveHistories();
+      // Removed (or pointed at another mailbox) while the reply was on its way: it has gone,
+      // but nothing is written back for an account ClearMail no longer has.
+      keep = stillHas(entry.accountId, account);
+      if (keep) {
+        // "You've already replied" until the next Sent sync says the same.
+        histories[account.id] = history.noteReply(histories[account.id] || null, { conversationId: entry.raw.conversationId, messageId: entry.raw.messageId }, Date.now());
+        saveHistories();
+      }
     }
   } catch (err) {
     if (err?.name !== '') console.error('A reply failed:', err);
@@ -540,19 +584,38 @@ async function sendQueued(id) {
     return;
   }
   // Replied to, so it's done (only in ClearMail: nothing changes in the mailbox).
-  try {
-    saveMarks({ ...marks, done: { ...marks.done, [id]: Date.now() } });
-  } catch (err) {
-    console.error('Could not mark a replied email done:', err.message);
+  if (keep) {
+    try {
+      saveMarks({ ...marks, done: { ...marks.done, [id]: Date.now() } });
+    } catch (err) {
+      console.error('Could not mark a replied email done:', err.message);
+    }
   }
   send('reply:result', { id, ok: true, ...(entry.accountId === DEMO_ACCOUNT ? { demo: true } : {}) });
   send('inbox:updated', currentView());
 }
 
-// Quitting, or anything else that drops the waiting replies, never sends them.
+// Quitting, closing the window, or anything else that drops the waiting replies, never sends them.
 function dropPendingReplies() {
   for (const job of pending.values()) clearTimeout(job.timer);
   pending.clear();
+}
+
+// Asks before closing the window or quitting drops the replies still in their 5 seconds.
+// True means go ahead (they won't be sent); false means stay, with the replies and their Undo.
+function confirmDropReplies(kind) {
+  const many = pending.size > 1;
+  const quit = kind === 'quit';
+  const options = {
+    type: 'warning',
+    buttons: quit ? ["Don't quit", 'Quit without sending'] : ["Don't close", 'Close without sending'],
+    defaultId: 0,
+    cancelId: 0,
+    message: many ? `${pending.size} replies are still waiting to be sent.` : 'A reply is still waiting to be sent.',
+    detail: `If you ${quit ? 'quit' : 'close the window'} now, ${many ? "they won't" : "it won't"} be sent.`,
+  };
+  const parent = win && !win.isDestroyed() ? win : null;
+  return (parent ? dialog.showMessageBoxSync(parent, options) : dialog.showMessageBoxSync(options)) === 1;
 }
 
 // ---------- the morning brief ----------
@@ -843,6 +906,8 @@ handle('email:reply', "Couldn't send your reply. Please try again.", (_e, payloa
   const entry = loadedEntry(id);
   if (!entry) throw ipcError(EMAIL_GONE);
   if (pending.has(id)) throw ipcError('A reply to this email is already waiting to be sent. Undo it first, or wait a moment.');
+  if (sending.has(id)) throw ipcError('Your reply to this email is still being sent. Wait a moment.');
+  if (!replyTarget(entry.raw)) throw ipcError(NO_REPLY_ADDRESS);
   // Problems that are known now are said now, not in 5 seconds.
   if (entry.accountId !== DEMO_ACCOUNT) {
     const account = accountFor(entry);
@@ -865,7 +930,7 @@ handle('email:reply', "Couldn't send your reply. Please try again.", (_e, payloa
 handle('email:undoReply', "Couldn't undo. The reply may already be on its way.", (_e, payload) => {
   const id = payload?.id;
   const job = typeof id === 'string' ? pending.get(id) : null;
-  if (!job) return { undone: false }; // already sent (or sending), or never queued
+  if (!job) return sending.has(id) ? { undone: false, sending: true } : { undone: false }; // on its way, already sent, or never queued
   clearTimeout(job.timer);
   pending.delete(id);
   return { undone: true };
@@ -989,19 +1054,33 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(() => {
     store.migrate();
     settings = store.loadSettings();
-    marks = store.loadState();
-    histories = store.loadHistory();
+    // Anything kept for an account that is no longer in Settings is dropped.
+    marks = store.loadState({ accountIds: knownAccountIds() });
+    histories = store.loadHistory({ accountIds: knownAccountIds() });
     setMenu();
     // Opened at login for the brief: no window until the user asks for one.
     if (!(settings.brief.enabled && settings.brief.openAtLogin && openedAtLogin())) createWindow();
     startScheduler();
+    // macOS is shutting down, restarting or logging out: the waiting replies are dropped
+    // unsent, without a question that would hold that up.
+    powerMonitor.on('shutdown', () => {
+      shuttingDown = true;
+      dropPendingReplies();
+    });
     app.on('activate', () => BrowserWindow.getAllWindows().length === 0 && createWindow());
   });
 
-  // A reply still in its 5 seconds is never sent once the user quits.
-  app.on('before-quit', dropPendingReplies);
-  app.on('will-quit', () => {
+  // A reply still in its 5 seconds is never sent once the user quits, so quitting asks first.
+  // "Don't quit" keeps the app, the reply and its Undo.
+  app.on('before-quit', (e) => {
+    if (pending.size && !shuttingDown && !confirmDropReplies('quit')) {
+      e.preventDefault();
+      return;
+    }
     dropPendingReplies();
+  });
+  app.on('will-quit', () => {
+    dropPendingReplies(); // in case anything was queued after before-quit
     scheduler?.stop();
     if (signInRun) signInRun.abort(); // closes the sign-in's local web server
   });

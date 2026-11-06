@@ -11,6 +11,7 @@
 const crypto = require('crypto');
 const http = require('http');
 const { htmlToText } = require('./cleaner');
+const { isEmail, replyTarget } = require('./reply-target');
 
 /**
  * An email as both backends return it (src/mail.js builds the same shape).
@@ -118,6 +119,7 @@ const MSG = {
   noEmail: "Microsoft didn't say which email address you signed in with. Please try again.",
   noMailbox: "ClearMail can't reach the mailbox of this Microsoft account. The account may not have an Outlook mailbox, or your organisation may keep its email on its own servers.",
   gone: 'This email is no longer in your Outlook inbox (it may have been moved or deleted). Refresh and try again.',
+  noReplyAddress: 'This email has no address to reply to.',
   truncated: 'This email is very long, so ClearMail only shows the start of it. Open it in Outlook to read the rest.',
   blocked: 'ClearMail stopped a request that would have changed your mailbox. ClearMail only reads your email and sends the replies you write, so nothing was changed.',
 };
@@ -761,7 +763,8 @@ function toRawEmail(msg) {
     messageId: idOrNull(msg.internetMessageId),
     uid: null,
     from: toAddress(msg.from) || toAddress(msg.sender) || { name: 'Unknown sender', address: '' },
-    replyTo: [].concat(msg.replyTo || []).map(toAddress).find(Boolean) || null,
+    // The first Reply-To a reply can go to; sendReply sends to that one address only.
+    replyTo: [].concat(msg.replyTo || []).map(toAddress).find((a) => a && isEmail(a.address)) || null,
     to: addressList(msg.toRecipients),
     cc: addressList(msg.ccRecipients),
     subject: String(msg.subject ?? ''),
@@ -984,9 +987,11 @@ async function fetchSentHistory(account, cursor, options = {}) {
 // ---------- replying ----------
 
 /**
- * Replies to the sender (or Reply-To) of rawEmail. Outlook threads the reply and files
- * it in Sent Items itself. The body is sent as plain text, like mail.js replies: Graph's
- * `comment` would run the lines together when the original is HTML.
+ * Replies to rawEmail's Reply-To (or else From) address, the one src/reply-target.js picks
+ * and the reply box shows. Outlook threads the reply and files it in Sent Items itself.
+ * The address is always given: left to itself, Graph would send to every Reply-To address,
+ * including any the user was never shown. The body is sent as plain text, like mail.js
+ * replies: Graph's `comment` would run the lines together when the original is HTML.
  * @param {{ id: string, refreshToken: string }} account
  * @param {RawEmail} rawEmail
  * @param {string} body
@@ -996,8 +1001,11 @@ async function sendReply(account, rawEmail, body, options = {}) {
   try {
     const id = rawEmail && typeof rawEmail.id === 'string' ? rawEmail.id : '';
     if (!id) throw fail('server', MSG.gone);
+    const target = replyTarget(rawEmail);
+    if (!target) throw fail('server', MSG.noReplyAddress);
+    const to = { emailAddress: { address: target.address, ...(target.name !== target.address ? { name: target.name } : {}) } };
     const res = await graph(account, mailOptions(options), 'POST', `/me/messages/${encodeURIComponent(id)}/reply`, {
-      body: { message: { body: { contentType: 'text', content: String(body ?? '') } } },
+      body: { message: { toRecipients: [to], body: { contentType: 'text', content: String(body ?? '') } } },
     });
     if (res.status < 200 || res.status >= 300) throw graphError(res, ACTION.reply);
     return { sent: true };

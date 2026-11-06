@@ -337,7 +337,10 @@ test('a reply waits 5 seconds, can be undone, and goes out from the account that
 
   assert.deepStrictEqual(pushesOf('reply:result').map((r) => r.ok), [true, true, true]);
   assert.deepStrictEqual(microsoft.replies.map((r) => [r.mailbox, r.id]).sort(), [[UNI, 'AAMkADU1-u1'], [OUTLOOK, 'AAMkAGI2-o1/Zx+Q==']]);
-  assert.deepStrictEqual(microsoft.replies.find((r) => r.id === 'AAMkADU1-u1').body, { message: { body: { contentType: 'text', content: 'Thursday at 3pm works for me.' } } });
+  assert.deepStrictEqual(microsoft.replies.find((r) => r.id === 'AAMkADU1-u1').body, {
+    message: { toRecipients: [{ emailAddress: { address: SARAH[1], name: SARAH[0] } }], body: { contentType: 'text', content: 'Thursday at 3pm works for me.' } },
+  });
+  for (const r of microsoft.replies) assert.deepStrictEqual(r.to, [SARAH[1]], 'to the one address the reply box named');
   assert.deepStrictEqual(imap.calls.filter((c) => c[0] === 'sendReply'), [['sendReply', GMAIL, 'fp-1-41', 'Yes!']]);
   assert.ok(!microsoft.replies.some((r) => r.id === 'AAMkAGI2-o3'), 'the undone reply was never sent');
 
@@ -348,6 +351,35 @@ test('a reply waits 5 seconds, can be undone, and goes out from the account that
     assert.strictEqual(bySubject(after, subject).triage.codes[0], 'replied', subject);
   }
   assert.strictEqual(bySubject(after, 'Sunday lunch?').done, false);
+});
+
+test('a reply goes to exactly the address the reply box names, even when an email lists several Reply-To addresses', async () => {
+  // A crafted email: Graph, left to itself, would reply to both Reply-To addresses.
+  const box = microsoft.mailbox(OUTLOOK);
+  box.messages.push(graphMessage({
+    id: 'AAMkAGI2-o5', from: ['Kestrel Bank', 'alerts@kestrelbank.example'], subject: 'Verify your payee', minutesAgo: 6000,
+    replyTo: [['Kestrel Bank Support', 'support@kestrel-help.example'], ['Collections', 'collector@attacker.example']],
+    text: 'Please reply with your sort code to verify your payee.',
+  }));
+  try {
+    const res = await api.loadInbox({ force: true });
+    const bank = bySubject(res, 'Verify your payee');
+    const library = bySubject(res, 'Library loan overdue');
+    assert.deepStrictEqual(bank.replyTarget, { name: 'Kestrel Bank Support', address: 'support@kestrel-help.example' });
+    assert.strictEqual(bank.replyNote, 'Replies go to support@kestrel-help.example, not the address it came from.');
+    assert.deepStrictEqual([library.replyTarget, library.replyNote], [{ name: 'Library', address: 'library@lboro.ac.uk' }, null]);
+    const before = microsoft.replies.length;
+    await api.reply(bank.id, 'My sort code is 12-34-56');
+    await api.reply(library.id, 'Returned it today.');
+    userReplies.push(['AAMkAGI2-o5', OUTLOOK], ['AAMkADU1-u2', UNI]);
+    for (let i = 0; i < 400 && microsoft.replies.length < before + 2; i++) await delay(20);
+    const sent = microsoft.replies.slice(before);
+    assert.deepStrictEqual(sent.map((r) => r.id).sort(), ['AAMkADU1-u2', 'AAMkAGI2-o5']);
+    assert.deepStrictEqual(sent.find((r) => r.id === 'AAMkAGI2-o5').to, [bank.replyTarget.address], 'never the attacker\'s address');
+    assert.deepStrictEqual(sent.find((r) => r.id === 'AAMkADU1-u2').to, [library.replyTarget.address]);
+  } finally {
+    box.messages = box.messages.filter((m) => m.id !== 'AAMkAGI2-o5');
+  }
 });
 
 test('every Graph call was a read, a batch of reads, or a reply the user sent', () => {

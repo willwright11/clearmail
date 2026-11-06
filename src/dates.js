@@ -19,11 +19,13 @@ const { DATE_SOURCE, realDate, splitSentences } = require('./cleaner');
  * @property {string|null} cue  the deadline word, e.g. 'by', 'due', 'deadline', or null
  *   when the date only counts because it sits inside an ask
  * @property {string} day  'YYYY-MM-DD' (local)
- * @property {string|null} time  e.g. '10am', when one is written next to the date
+ * @property {string|null} time  e.g. '10am' or '12 noon', when one is written next to the date
+ *   ("Wednesday at 10am", "no later than 5pm on 10 November")
  * @property {'day'|'week'|'month'} precision  'week': "next week" (day is the Monday);
  *   'month': "in December", "next month" (day is the 1st, 15th or last day)
  * @property {boolean} uncertain  a guess: "next Friday", a weekday that doesn't match the
- *   date, or a weekday that is the same as the day the email was sent
+ *   date, a weekday that is the same as the day the email was sent, "by the 15th" (which
+ *   month?), or "within 28 days" in a forwarded message whose date isn't known
  * @property {boolean} relative  worked out from the sent date ("within 28 days")
  *
  * @typedef {object} FoundDate  what findDates() returns: a Deadline's date fields plus
@@ -53,9 +55,11 @@ const RELATIVE_RE = new RegExp(
   `\\b(in|within)[ \\t]+(?:the[ \\t]+next[ \\t]+)?(\\d{1,3}|${Object.keys(NUMBER_WORDS).join('|')})[ \\t]+((?:working|business)[ \\t]+days?|days?|weeks?|fortnights?|months?)\\b`,
   'gi',
 );
-const TIME = String.raw`(\d{1,2}(?:[:.]\d{2})?[ \t]?(?:[ap]\.?m\b\.?)|\d{1,2}:\d{2}\b|noon\b|midday\b|midnight\b)`;
+const TIME = String.raw`(\d{1,2}(?:[:.]\d{2})?[ \t]?(?:[ap]\.?m\b\.?)|\d{1,2}:\d{2}\b|(?:12[ \t]+)?(?:noon|midday|midnight)\b)`;
 const TIME_AFTER = new RegExp(String.raw`^,?[ \t]+(?:(?:at|by|before|after|from|around|for|until|till)[ \t]+)?${TIME}`, 'i');
-const TIME_BEFORE = new RegExp(String.raw`(?:^|[ \t(])${TIME}[ \t]+$`, 'i');
+// A time just before the date ("5pm on 10 November", "at 12 noon on Friday"). It is the
+// deadline's time, and the cue word is looked for before it ("no later than 5pm on…").
+const TIME_BEFORE = new RegExp(String.raw`(?<![^ \t(])(?:at[ \t]+)?${TIME}(?:[ \t]+on)?,?[ \t]+$`, 'i');
 const YEAR_AFTER = /^,?[ \t]+(\d{4})\b/;
 
 // Words that make a date a deadline when they come in the 4 words before it.
@@ -191,9 +195,13 @@ const SLASH_FORM = /^(\d{1,2})\/(\d{1,2})(?:\/(\d{4}|\d{2}))?$/;
 const DOT_DASH_FORM = /^(\d{1,2})([.-])(\d{1,2})\2(\d{4}|\d{2})$/;
 const ISO_FORM = /^(\d{4})-(\d{2})-(\d{2})$/;
 const WEEKDAY_NUMBER = /^(?:(?:on|by|before|until|till|from)[ \t]+)?([a-z]+)\.?,?[ \t]+(\d{1,2})$/i;
+const THE_DAY_FORM = /^(?:(?:by|before|on|until|till)[ \t]+)?the[ \t]+(\d{1,2})(?:st|nd|rd|th)(?:[ \t]+of[ \t]+(this|next)[ \t]+month)?$/i;
 const NUMERIC_TAIL = /^([/.-])\d{1,2}(?:\1(?:\d{4}|\d{2}))?(?![\d/])/;
 
 const result = (day, extra = {}) => (day ? { day, precision: 'day', uncertain: false, ...extra } : null);
+// A date worked out from the sent date ("tomorrow", "Friday", "by the 15th"), so it is only as
+// good as that date. See findDeadlines(): a forwarded message with no date of its own.
+const anchored = (r) => (r ? { ...r, anchored: true } : null);
 
 // "Friday", "this Friday", "next Friday", "last Friday" and (in a past-tense clause) a
 // bare "on Friday", which then means the one just gone.
@@ -227,6 +235,22 @@ function weekdayAndDayNumber(ref, dow, d) {
   if (match) return result(match);
   const next = options.find((dt) => dt >= ref);
   return next ? result(next, { uncertain: true }) : null;
+}
+
+// "by the 15th": the next 15th on or after the sent date, marked uncertain as the month is
+// only implied; "the 15th of this month" or "of next month" says which.
+function dayOfMonthDate(ref, d, which) {
+  const monthStart = (k) => new Date(ref.getFullYear(), ref.getMonth() + k, 1);
+  if (which) {
+    const first = monthStart(which.toLowerCase() === 'next' ? 1 : 0);
+    return result(makeDay(first.getFullYear(), first.getMonth(), d));
+  }
+  for (let k = 0; k < 3; k++) {
+    const first = monthStart(k);
+    const dt = makeDay(first.getFullYear(), first.getMonth(), d);
+    if (dt && dt >= ref) return result(dt, { uncertain: true });
+  }
+  return null;
 }
 
 function relativeWordDate(ref, word) {
@@ -279,15 +303,17 @@ function numericDate(ref, a, b, yearText, order) {
 
 /**
  * Reads one date the cleaner's DATE_RE found. `before`/`after` are the sentence text around
- * it; `past` says the clause reads as the past. Returns { day: Date, precision, uncertain } or null.
+ * it; `past` says the clause reads as the past. Returns { day: Date, precision, uncertain,
+ * anchored? } or null.
  */
 function readDate(text, ref, order, { before, after, past }) {
   const t = text.replace(/\s+/g, ' ').trim();
   let m = RELATIVE_WORD.exec(t);
   if (m) {
-    if (/tomorrow/i.test(t) && /\bthe day after[ \t]+$/i.test(before)) return result(addDays(ref, 2));
-    return relativeWordDate(ref, t);
+    if (/tomorrow/i.test(t) && /\bthe day after[ \t]+$/i.test(before)) return anchored(result(addDays(ref, 2)));
+    return anchored(relativeWordDate(ref, t));
   }
+  if ((m = THE_DAY_FORM.exec(t))) return anchored(dayOfMonthDate(ref, Number(m[1]), m[2]));
   if ((m = ISO_FORM.exec(t))) {
     const y = Number(m[1]);
     return plausibleYear(y, ref) ? result(makeDay(y, Number(m[2]) - 1, Number(m[3]))) : null;
@@ -301,8 +327,8 @@ function readDate(text, ref, order, { before, after, past }) {
   }
   if ((m = WEEKDAY_FORM.exec(t)) && weekdayOf(m[2]) >= 0) {
     const dow = weekdayOf(m[2]);
-    if (!m[3]) return weekdayDate(ref, dow, m[1], { past, last: /\blast[ \t]+$/i.test(before) });
-    if (!m[4]) return weekdayAndDayNumber(ref, dow, Number(m[3]));
+    if (!m[3]) return anchored(weekdayDate(ref, dow, m[1], { past, last: /\blast[ \t]+$/i.test(before) }));
+    if (!m[4]) return anchored(weekdayAndDayNumber(ref, dow, Number(m[3])));
     return calendarDate(ref, monthOf(m[4]), Number(m[3]), m[5] ? Number(m[5]) : null, dow);
   }
   if ((m = DAY_MONTH_FORM.exec(t))) return calendarDate(ref, monthOf(m[2]), Number(m[1]), m[3] ? Number(m[3]) : null);
@@ -327,7 +353,8 @@ function relativeDate(ref, count, unit) {
 // ---------- context: cue words, past tense, times ----------
 
 // The deadline word in the 4 words before the date (or the date's own 'by'/'until'), or a
-// "deadline"/"at the latest" right after it.
+// "deadline"/"at the latest" right after it. `before` stops short of any time written just
+// before the date, so "no later than 5pm on 10 November" is read as "no later than 10 November".
 function cueFor(text, before, after) {
   const own = /^(by|before|until|till|within)\b/i.exec(text);
   if (own && !(/^(?:until|till)$/i.test(own[1]) && STATE_BEFORE_UNTIL.test(before))) return own[1].toLowerCase();
@@ -340,6 +367,8 @@ function cueFor(text, before, after) {
     return w;
   }
   if (/\b(?:last day|closing date|cut-?off)\b[^.!?]{0,40}$/i.test(before)) return 'deadline';
+  // "The deadline for all new applications is (12 noon on) Friday"
+  if (/\bdeadline\b(?:[ \t]+(?:for|to|of)\b[^.!?;:]{0,60})?[ \t]+(?:is|was|will be)[ \t]*$/i.test(before)) return 'deadline';
   if (/^[ \t,]*(?:(?:is|was|will be)[ \t]+(?:the[ \t]+)?)?(?:deadline|last day|cut-?off|at the latest)\b/i.test(after)) return 'deadline';
   return null;
 }
@@ -354,11 +383,14 @@ function isPast(before) {
   return PAST_RE.test(clause) && !FUTURE_RE.test(clause);
 }
 
+// "5 pm" is written "5pm"; "12 noon" keeps its space.
+const timeText = (t) => t.replace(/\s+/g, ' ').replace(/(\d) (?=[ap]\.?m)/i, '$1');
+
 function timeNear(before, after) {
   const a = TIME_AFTER.exec(after);
-  if (a) return { time: a[1].replace(/\s+/g, ''), length: a[0].length };
+  if (a) return { time: timeText(a[1]), length: a[0].length };
   const b = TIME_BEFORE.exec(before);
-  return b ? { time: b[1].replace(/\s+/g, ''), length: 0 } : null;
+  return b ? { time: timeText(b[1]), length: 0 } : null;
 }
 
 // The date as written, without a leading 'on'/'by'/'in' ("by Friday" is "Friday").
@@ -366,10 +398,19 @@ const bareText = (text, relative) => (relative ? text : text.replace(/^(?:on|by|
 
 // ---------- finding ----------
 
-function refDay(ref) {
-  const d = toDate(ref) || new Date();
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+// A sent date as a local day: a 'YYYY-MM-DD' is that day here (new Date() would read it as
+// UTC midnight, which is the day before west of London). null when it isn't a date.
+function dayRef(value) {
+  if (typeof value === 'string' && DAY_KEY_RE.test(value)) {
+    if (Number.isNaN(utcOf(value))) return null;
+    const [y, m, d] = value.split('-').map(Number);
+    return new Date(y, m - 1, d);
+  }
+  const d = typeof value === 'string' || value instanceof Date || typeof value === 'number' ? toDate(value) : null;
+  return d ? new Date(d.getFullYear(), d.getMonth(), d.getDate()) : null;
 }
+
+const refDay = (ref) => dayRef(ref) || dayRef(new Date());
 
 /**
  * Every date in one sentence, in order.
@@ -379,6 +420,11 @@ function refDay(ref) {
  * @returns {FoundDate[]}
  */
 function findDates(sentence, ref, opts = {}) {
+  return scan(sentence, ref, opts).map(({ anchored: _, ...d }) => d);
+}
+
+// findDates(), plus `anchored`: the date was worked out from `ref` ("within 28 days", "Friday").
+function scan(sentence, ref, opts = {}) {
   const s = (typeof sentence === 'string' ? sentence : '').slice(0, MAX_SENTENCE);
   if (!s.trim()) return [];
   const base = refDay(ref);
@@ -431,7 +477,7 @@ function findDates(sentence, ref, opts = {}) {
     let found;
     let text = raw;
     if (sp.kind === 'relative') {
-      found = relativeDate(base, sp.count, sp.unit);
+      found = anchored(relativeDate(base, sp.count, sp.unit));
     } else {
       const own = sp.tailIndex != null ? s.slice(sp.tailIndex, sp.end) : raw;
       found = readDate(own, base, order, { before, after, past });
@@ -446,6 +492,7 @@ function findDates(sentence, ref, opts = {}) {
     }
     if (!found || !found.day) continue;
     const time = timeNear(before, after);
+    const lead = TIME_BEFORE.exec(before); // "no later than [5pm on] 10 November"
     out.push({
       text: bareText(text, sp.kind === 'relative'),
       index: sp.index,
@@ -454,8 +501,9 @@ function findDates(sentence, ref, opts = {}) {
       precision: found.precision,
       uncertain: Boolean(found.uncertain),
       relative: sp.kind === 'relative',
-      cue: cueFor(raw, before, after.slice(time ? time.length : 0)),
+      cue: cueFor(raw, lead ? before.slice(0, lead.index) : before, after.slice(time ? time.length : 0)),
       past: past || found.day < base,
+      anchored: Boolean(found.anchored),
     });
   }
   return out;
@@ -470,13 +518,28 @@ function overlaps(a, b) {
   return x === y || (y.length >= 12 && x.includes(y)) || (x.length >= 12 && y.includes(x));
 }
 
+// Where the forwarded messages start in the body (cleaner.clean()'s `forwarded`), in order:
+// [{ at, ref }], ref the local day it was sent, or null when that isn't known.
+function forwardedParts(list, length) {
+  return (Array.isArray(list) ? list : [])
+    .filter((p) => p && typeof p === 'object' && Number.isInteger(p.at) && p.at >= 0 && p.at < length)
+    .slice(0, MAX_ASKS)
+    .map((p) => ({ at: p.at, ref: dayRef(p.date) }))
+    .sort((a, b) => a.at - b.at);
+}
+
 /**
  * The deadlines in an email: dates with a cue word ("by", "due", "deadline"…) in the 4 words
  * before them, or inside one of the sender's questions or actions (unless that part reads as
  * the past, like "the parcel I sent on Monday"). In the order they appear.
  *
- * @param {{ subject?: string, body?: string, questions?: string[], actions?: string[] }} email
- *   body, questions and actions as cleaner.clean() returned them
+ * A forwarded message counts its dates from the day it was sent, not the day it was forwarded:
+ * a council's "appeal within 28 days of this notice", forwarded three weeks later, is due in a
+ * week. When that day isn't known, its "within 28 days", "Friday" and the like are uncertain.
+ *
+ * @param {{ subject?: string, body?: string, questions?: string[], actions?: string[],
+ *   forwarded?: { at: number, date: string|null }[] }} email  body, questions, actions and
+ *   forwarded as cleaner.clean() returned them
  * @param {Date|number|string} ref  when the email was sent (now if missing or invalid)
  * @param {{ order?: 'dmy'|'mdy' }} [opts]  see orderForLocale()
  * @returns {Deadline[]}
@@ -484,23 +547,33 @@ function overlaps(a, b) {
 function findDeadlines(email, ref, opts = {}) {
   const e = email && typeof email === 'object' ? email : {};
   const asks = [...strings(e.actions, MAX_ASKS), ...strings(e.questions, MAX_ASKS)].map((a) => a.slice(0, MAX_SENTENCE));
+  const body = (typeof e.body === 'string' ? e.body : '').slice(0, MAX_BODY);
+  // The email itself, then each forwarded message, with the date its dates count from.
+  const parts = [
+    { at: 0, ref, known: true },
+    ...forwardedParts(e.forwarded, body.length).map((p) => ({ at: p.at, ref: p.ref || ref, known: Boolean(p.ref) })),
+  ];
+  const partAt = (i) => parts.reduce((found, p) => (p.at <= i ? p : found), parts[0]);
+
   const units = [];
   const subject = (typeof e.subject === 'string' ? e.subject : '').slice(0, 500).replace(/^\s*(?:(?:re|fwd?|aw|wg|sv|tr|rv)\s*:\s*)+/i, '');
-  if (subject.trim()) units.push({ sentence: subject.trim(), source: 'subject' });
+  if (subject.trim()) units.push({ sentence: subject.trim(), source: 'subject', part: parts[0] });
   const covered = new Set();
-  for (const s of splitSentences((typeof e.body === 'string' ? e.body : '').slice(0, MAX_BODY))) {
-    const i = asks.findIndex((a) => overlaps(s, a));
-    if (i >= 0) covered.add(i);
-    units.push({ sentence: s, source: i >= 0 ? 'ask' : 'body' });
-  }
+  parts.forEach((p, k) => {
+    for (const s of splitSentences(body.slice(p.at, k + 1 < parts.length ? parts[k + 1].at : body.length))) {
+      const i = asks.findIndex((a) => overlaps(s, a));
+      if (i >= 0) covered.add(i);
+      units.push({ sentence: s, source: i >= 0 ? 'ask' : 'body', part: p });
+    }
+  });
   asks.forEach((a, i) => {
-    if (!covered.has(i)) units.push({ sentence: a, source: 'ask' });
+    if (!covered.has(i)) units.push({ sentence: a, source: 'ask', part: partAt(body.indexOf(a)) });
   });
 
   const out = [];
   const seen = new Set();
   for (const u of units) {
-    for (const d of findDates(u.sentence, ref, opts)) {
+    for (const d of scan(u.sentence, u.part.ref, opts)) {
       if (!d.cue && (u.source !== 'ask' || d.past)) continue;
       const key = `${d.day}|${d.text.toLowerCase()}`;
       if (seen.has(key)) continue;
@@ -513,7 +586,7 @@ function findDeadlines(email, ref, opts = {}) {
         day: d.day,
         time: d.time,
         precision: d.precision,
-        uncertain: d.uncertain,
+        uncertain: d.uncertain || (d.anchored && !u.part.known),
         relative: d.relative,
       });
     }

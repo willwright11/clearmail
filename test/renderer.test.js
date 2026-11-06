@@ -118,8 +118,8 @@ test('the reply box: a plain Enter types a new line; ⌘↩ queues the reply onc
   const { ctx, calls } = page();
   const m = ctx.tidyEmail({
     id: 'acc1:msg1', accountId: 'acc1', accountEmail: 'will@outlook.com',
-    from: { name: 'Sarah Collins', address: 'sarah@example.com' }, subject: 'Quote', date: '2026-11-03T09:00:00Z',
-    triage: { bucket: 'needs-you', reasons: ['Asks you to do something'], codes: ['asks-action'] },
+    from: { name: 'Sarah Collins', address: 'sarah@example.com' }, replyTarget: { name: 'Sarah Collins', address: 'sarah@example.com' },
+    subject: 'Quote', date: '2026-11-03T09:00:00Z', triage: { bucket: 'needs-you', reasons: ['Asks you to do something'], codes: ['asks-action'] },
   });
   const form = ctx.composer(m, { onClose: () => {} });
   const textarea = find(form, (n) => n.tagName === 'TEXTAREA');
@@ -149,7 +149,7 @@ test('the reply box: a plain Enter types a new line; ⌘↩ queues the reply onc
 
 test('Undo returns the reply to the box; a result for it later is ignored', async () => {
   const { ctx, calls } = page();
-  const m = ctx.tidyEmail({ id: 'a:1', accountEmail: 'me@example.com', from: { name: 'Dad', address: 'dad@example.com' }, date: '2026-11-03T09:00:00Z' });
+  const m = ctx.tidyEmail({ id: 'a:1', accountEmail: 'me@example.com', from: { name: 'Dad', address: 'dad@example.com' }, replyTarget: { name: 'Dad', address: 'dad@example.com' }, date: '2026-11-03T09:00:00Z' });
   ctx.queueReply(m, 'See you Sunday');
   await new Promise((r) => setImmediate(r));
   await ctx.undoReply(m);
@@ -162,7 +162,7 @@ test('Undo returns the reply to the box; a result for it later is ignored', asyn
 
 test('a failed reply keeps its text for Retry', async () => {
   const { ctx } = page();
-  const m = ctx.tidyEmail({ id: 'a:2', from: { name: 'Jo', address: 'jo@example.com' }, date: '2026-11-03T09:00:00Z' });
+  const m = ctx.tidyEmail({ id: 'a:2', from: { name: 'Jo', address: 'jo@example.com' }, replyTarget: { name: 'Jo', address: 'jo@example.com' }, date: '2026-11-03T09:00:00Z' });
   ctx.queueReply(m, 'On it');
   await new Promise((r) => setImmediate(r));
   ctx.handleReplyResult({ id: 'a:2', ok: false, error: "Couldn't reach Outlook." });
@@ -171,6 +171,102 @@ test('a failed reply keeps its text for Retry', async () => {
   assert.strictEqual(list[0].status, 'failed');
   assert.strictEqual(list[0].body, 'On it');
   assert.strictEqual(list[0].error, "Couldn't reach Outlook.");
+});
+
+test('the reply box names the one address main sends to; with none, Reply is off and nothing can be sent', async () => {
+  const { ctx, calls } = page({ scripts: ['common.js', 'brief.js'] });
+  // Reply-To on another domain: the box says where it really goes.
+  const bank = ctx.tidyEmail({
+    id: 'a:3', accountEmail: 'me@example.com', from: { name: 'Kestrel Bank', address: 'alerts@kestrelbank.example' },
+    replyTarget: { name: 'Support', address: 'support@kestrel-help.example' }, replyNote: 'Replies go to support@kestrel-help.example, not the address it came from.',
+    date: '2026-11-03T09:00:00Z', triage: { bucket: 'needs-you' },
+  });
+  const form = ctx.composer(bank);
+  assert.strictEqual(text(find(form, (n) => n.className === 'reply-from')), 'From me@example.com to Support (support@kestrel-help.example)');
+  const note = find(form, (n) => /\breply-note\b/.test(n.className));
+  assert.strictEqual(text(note), 'Replies go to support@kestrel-help.example, not the address it came from.');
+  assert.strictEqual(note.attrs.role, 'note');
+  assert.strictEqual(find(ctx.composer(ctx.tidyEmail({ ...bank, id: 'a:4', replyNote: null })), (n) => /\breply-note\b/.test(n.className)), null);
+
+  // No address to reply to (main sends replyTarget: null): the buttons are off and say why.
+  const none = ctx.tidyEmail({ id: 'a:5', from: { name: 'Mail Delivery System', address: 'mailer-daemon' }, replyTarget: null, date: '2026-11-03T09:00:00Z', triage: { bucket: 'needs-you' } });
+  const box = ctx.composer(none, { onClose: () => {} });
+  assert.strictEqual(find(box, (n) => n.tagName === 'TEXTAREA'), null, 'nothing to type into');
+  assert.match(text(box), /This email has no address to reply to\./);
+  assert.strictEqual(find(box, (n) => n.attrs?.['data-act'] === 'send').disabled, true);
+  const card = ctx.card(none, false);
+  const reply = find(card, (n) => n.attrs?.['data-act'] === 'reply');
+  assert.deepStrictEqual([reply.disabled, reply.attrs.title], [true, 'This email has no address to reply to.']);
+  ctx.queueReply(none, 'Hello?');
+  await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(calls, [], 'never handed to main');
+  // A tidied email without the field can't be replied to either (never a guess from From).
+  assert.strictEqual(ctx.tidyEmail({ id: 'a:6', from: { name: 'Ann', address: 'ann@example.com' } }).replyTarget, null);
+});
+
+test('Undo while the reply is already being sent says so', async () => {
+  const { ctx, notices } = page({ undo: { undone: false, sending: true } });
+  const m = ctx.tidyEmail({ id: 'a:7', from: { name: 'Dad', address: 'dad@example.com' }, replyTarget: { name: 'Dad', address: 'dad@example.com' }, date: '2026-11-03T09:00:00Z' });
+  ctx.queueReply(m, 'See you Sunday');
+  await new Promise((r) => setImmediate(r));
+  await ctx.undoReply(m);
+  assert.strictEqual(notices.at(-1), "Too late to undo — it's being sent.");
+  const entry = vm.runInContext('pendingReply("a:7")', ctx);
+  assert.deepStrictEqual([entry.status, entry.tooLate], ['pending', true], 'Undo is gone; the result arrives later');
+});
+
+test('a refresh that drops an email keeps it on screen while its reply waits or has failed, so Undo, Retry and Edit stay', async () => {
+  const { ctx, calls } = page({ scripts: ['common.js', 'brief.js', 'people.js'] });
+  const email = (id, minutesAgo) => ({
+    id, accountId: 'acc', accountEmail: 'me@outlook.com', from: { name: 'Sarah', address: 'sarah@example.com' },
+    replyTarget: { name: 'Sarah', address: 'sarah@example.com' }, subject: `Quote ${id}`, date: new Date(Date.now() - minutesAgo * 60000).toISOString(),
+    summary: { gist: 'Can you confirm?' }, triage: { bucket: 'needs-you', reasons: ['Asks you a question'], codes: ['asks-question'] },
+  });
+  const view = (...emails) => ({ emails, accounts: [{ id: 'acc', email: 'me@outlook.com', kind: 'microsoft' }], counts: {} });
+  const ids = () => vm.runInContext('state.emails.map((m) => m.id)', ctx);
+  const brief = () => ({ children: ctx.briefSections() });
+  const button = (root, id, act) => find(root, (n) => n.attrs?.['data-act'] === act && Boolean(findUp(root, n, id)));
+
+  ctx.applyView(view(email('acc:old', 600), email('acc:new', 1)));
+  ctx.queueReply(vm.runInContext('state.byId.get("acc:old")', ctx), 'Yes, confirmed');
+  await new Promise((r) => setImmediate(r));
+  assert.ok(button(brief(), 'acc:old', 'undo-reply'), 'Undo after Send');
+
+  // ⌘R: the email fell out of the newest emails loaded (or was moved in Outlook).
+  ctx.applyView(view(email('acc:new', 1)));
+  assert.deepStrictEqual(ids(), ['acc:new', 'acc:old'], 'still listed, after what main sent');
+  const undo = button(brief(), 'acc:old', 'undo-reply');
+  assert.ok(undo, 'Undo is still in the Brief');
+  assert.ok(ctx.conversations().some((c) => c.emails.some((m) => m.id === 'acc:old')), 'and in By person');
+  undo.dispatch('click');
+  await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(calls.at(-1), ['undoReply', 'acc:old']);
+  assert.strictEqual(vm.runInContext('state.drafts.get("acc:old")', ctx), 'Yes, confirmed', 'back in the reply box');
+
+  // Undone: the next refresh lets it go (the draft stays, in case it comes back).
+  ctx.applyView(view(email('acc:new', 1)));
+  assert.deepStrictEqual(ids(), ['acc:new']);
+
+  // A reply that failed also keeps its email, with Retry and Edit, until the user acts on it.
+  ctx.applyView(view(email('acc:old', 600), email('acc:new', 1)));
+  ctx.queueReply(vm.runInContext('state.byId.get("acc:old")', ctx), 'Second try');
+  await new Promise((r) => setImmediate(r));
+  ctx.handleReplyResult({ id: 'acc:old', ok: false, error: 'This email is no longer in your inbox. Refresh and try again.' });
+  ctx.applyView(view(email('acc:new', 1)));
+  assert.ok(button(brief(), 'acc:old', 'retry-reply') && button(brief(), 'acc:old', 'edit-reply'));
+  button(brief(), 'acc:old', 'edit-reply').dispatch('click');
+  ctx.applyView(view(email('acc:new', 1)));
+  assert.deepStrictEqual(ids(), ['acc:new']);
+
+  // Sent: it goes with the next refresh, like any email main no longer has.
+  ctx.applyView(view(email('acc:old', 600), email('acc:new', 1)));
+  vm.runInContext('state.drafts.clear()', ctx);
+  ctx.queueReply(vm.runInContext('state.byId.get("acc:old")', ctx), 'Third');
+  await new Promise((r) => setImmediate(r));
+  ctx.applyView(view(email('acc:new', 1)));
+  ctx.handleReplyResult({ id: 'acc:old', ok: true });
+  ctx.applyView(view(email('acc:new', 1)));
+  assert.deepStrictEqual(ids(), ['acc:new']);
 });
 
 test('broken sorting data never hides an email as noise', () => {
@@ -197,7 +293,19 @@ function find(node, pred) {
 
 const text = (node) => (node.children.length ? node.children.map(text).join('') : node.textContent);
 
-function page() {
+// The element on the way from root down to node that is for email id (data-id, data-for or data-reply-for).
+function findUp(root, node, id, path = []) {
+  const here = [...path, root];
+  if (root === node) return here.find((n) => n.attrs && [n.attrs['data-id'], n.attrs['data-for'], n.attrs['data-reply-for']].includes(id)) || null;
+  for (const c of root.children || []) {
+    const hit = findUp(c, node, id, here);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// scripts: the renderer files to load, in order. undo: what clearmail.undoReply answers.
+function page({ scripts = ['common.js'], undo = { undone: true } } = {}) {
   class FakeNode {
     constructor(tag) {
       this.tagName = String(tag).toUpperCase();
@@ -220,6 +328,7 @@ function page() {
     getAttribute(k) { return this.attrs[k] ?? null; }
     addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
     append(...nodes) { this.children.push(...nodes); }
+    replaceChildren(...nodes) { this.children = nodes; }
     focus() {}
     setSelectionRange() {}
     dispatch(type, init = {}) {
@@ -237,13 +346,20 @@ function page() {
     },
     undoReply: (id) => {
       calls.push(['undoReply', id]);
-      return Promise.resolve({ undone: true });
+      return Promise.resolve(undo);
     },
+  };
+  // The notice line under the top bar: every text shown in it.
+  const notices = [];
+  const noticeNode = new FakeNode('div');
+  noticeNode.replaceChildren = (...nodes) => {
+    noticeNode.children = nodes;
+    if (nodes.length) notices.push(text(nodes[0]));
   };
   const document = {
     createElement: (tag) => new FakeNode(tag),
     createTextNode: (t) => Object.assign(new FakeNode('#text'), { textContent: t }),
-    getElementById: () => null,
+    getElementById: (id) => (id === 'notice' ? noticeNode : null),
     querySelector: () => null,
     querySelectorAll: () => [],
     activeElement: null,
@@ -262,6 +378,6 @@ function page() {
     clearInterval: () => {},
     renderAll: () => {}, // from app.js
   });
-  vm.runInContext(sources['common.js'], ctx, { filename: 'renderer/common.js' });
-  return { ctx, calls };
+  for (const name of scripts) vm.runInContext(sources[name], ctx, { filename: `renderer/${name}` });
+  return { ctx, calls, notices };
 }

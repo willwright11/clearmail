@@ -18,7 +18,8 @@
  * @property {number|string|null} lastSince  the start of the window that brief covered
  *
  * @typedef {object} BriefCounts
- * @property {number} needsYou  not done, received within the last 30 days
+ * @property {number} needsYou  not done, received within the last 30 days (or older, when
+ *   it is due within 14 days, flagged or from a sender marked always important)
  * @property {number} needsYouNew  the same, received since the window started
  * @property {number} worthKnowing  received since the window started, not done
  * @property {number} noise  received since the window started, not done
@@ -190,9 +191,21 @@ function briefWindow(now, state) {
   return { since, label: sinceLabel(since, t) };
 }
 
+// A Needs-you email older than 30 days still counts when it matters now: its deadline is
+// within 14 days (or has passed), it is flagged, or the user marked its sender important.
+// (An HMRC reminder from November is what needs you in late January.)
+function stillCounts(it) {
+  const t = it.triage && typeof it.triage === 'object' ? it.triage : {};
+  const codes = Array.isArray(t.codes) ? t.codes : [];
+  const due = t.deadline && Number.isFinite(t.deadline.daysAway) && t.deadline.daysAway <= 14;
+  return Boolean(due) || it.flagged === true || it.senderRule === 'important'
+    || codes.includes('flagged') || codes.includes('rule-important');
+}
+
 /**
  * Counts for the brief. Items are EmailViews: `triage.bucket` (or `bucket`), `receivedAt`
- * (or `date`) and `done`.
+ * (or `date`) and `done`; `triage.deadline`, `triage.codes`, `flagged` and `senderRule` keep
+ * an older Needs-you email in the count.
  * @returns {BriefCounts}
  */
 function briefCounts(items, { since, now } = {}) {
@@ -212,7 +225,7 @@ function briefCounts(items, { since, now } = {}) {
     if (Number.isNaN(received)) received = t;
     const isNew = received > from;
     if (bucket === 'needs-you') {
-      if (t - received > 30 * DAY) continue;
+      if (t - received > 30 * DAY && !stillCounts(it)) continue;
       counts.needsYou++;
       if (isNew) counts.needsYouNew++;
     } else if (bucket === 'worth-knowing' && isNew) counts.worthKnowing++;
@@ -335,7 +348,10 @@ function createBriefScheduler({
     const last = lastSlot(state);
 
     let slot;
-    if (failure && dayKey(failure.slot) === dayKey(t) && dayKey(last) !== dayKey(failure.slot)
+    // Whether a retry is still allowed comes from the time window, not the calendar day, so
+    // a late brief that fails at 23:55 still gets its last tries (and the final notice) just
+    // after midnight.
+    if (failure && dayKey(last) !== dayKey(failure.slot)
       && t <= catchUpDeadline(failure.slot) + (attempts - 1) * retryMs) {
       // A brief that failed earlier is tried again, at most every retryMs.
       if (t < failure.retryAt) return 'not-due';

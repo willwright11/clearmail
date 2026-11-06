@@ -69,8 +69,11 @@ test('main.js and preload.js: no mark-as-read, and a reply only goes through the
   const handler = main.slice(main.indexOf("handle('email:reply'"), main.indexOf("handle('email:undoReply'"));
   assert.match(handler, /const \{ id, body \} = payload \|\| \{\};/);
   assert.ok(!/payload\.(?:to|cc|bcc|address|account)/.test(handler));
-  // Quitting drops waiting replies without sending them.
-  assert.match(main, /app\.on\('before-quit', dropPendingReplies\)/);
+  // Quitting or closing the window asks first, and then drops waiting replies without sending them.
+  assert.match(main, /app\.on\('before-quit', \(e\) => \{\s*if \(pending\.size && !shuttingDown && !confirmDropReplies\('quit'\)\) \{\s*e\.preventDefault\(\);\s*return;\s*\}\s*dropPendingReplies\(\);\s*\}\);/);
+  assert.match(main, /app\.on\('will-quit', \(\) => \{\s*dropPendingReplies\(\);/);
+  assert.match(main, /win\.on\('close', \(e\) => \{\s*if \(!pending\.size\) return;\s*if \(shuttingDown \|\| confirmDropReplies\('close'\)\) dropPendingReplies\(\);\s*else e\.preventDefault\(\);\s*\}\);/);
+  assert.match(main, /webContents\.on\('render-process-gone', \(\) => dropPendingReplies\(\)\)/);
   assert.match(main, /function dropPendingReplies\(\) \{\s*for \(const job of pending\.values\(\)\) clearTimeout\(job\.timer\);\s*pending\.clear\(\);\s*\}/);
   // System Settings and Microsoft pages are fixed addresses, never one from the window.
   assert.match(main, /notifications: 'x-apple\.systempreferences:com\.apple\.Notifications-Settings\.extension'/);

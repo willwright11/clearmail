@@ -223,6 +223,78 @@ test('cue rules: a date is a deadline only with a cue word in the 4 words before
   assert.deepStrictEqual(Object.keys(twice[0]).sort(), ['cue', 'day', 'precision', 'relative', 'sentence', 'source', 'text', 'time', 'uncertain']);
 });
 
+test('a time between the cue word and the date: "no later than 5pm on 10 November"', () => {
+  const check = (body, text, cue, time, day) => {
+    const found = deadlines(body);
+    assert.strictEqual(found.length, 1, `${body}: ${JSON.stringify(found)}`);
+    assert.deepStrictEqual([found[0].text, found[0].cue, found[0].time, found[0].day], [text, cue, time, day], body);
+  };
+  check('Your tax return must be filed no later than 5pm on 10 November 2026.', '10 November 2026', 'no later than', '5pm', '2026-11-10');
+  check('Forms must reach our office no later than midnight on 20 November.', '20 November', 'no later than', 'midnight', '2026-11-20');
+  check('The deadline for applications is 12 noon on Friday 13 November.', 'Friday 13 November', 'deadline', '12 noon', '2026-11-13');
+  check('The deadline for all new planning applications to the council is 5.30pm on Friday 13 November.', 'Friday 13 November', 'deadline', '5.30pm', '2026-11-13');
+  check('Payment must be received by our office before 5.30 pm on Friday 6 November.', 'Friday 6 November', 'before', '5.30pm', '2026-11-06');
+  check('Please reply no later than 17:00, 10 November.', '10 November', 'no later than', '17:00', '2026-11-10');
+  // The cue before the time still counts as before, and a time alone makes nothing a deadline.
+  check('Send it by 5pm on Friday.', 'Friday', 'by', '5pm', '2026-11-06');
+  assert.deepStrictEqual(deadlines('The meeting is at 5pm on Friday.'), []);
+  assert.deepStrictEqual(deadlines("We missed the deadline last week, and the party is at 8pm on Friday."), []);
+  assert.deepStrictEqual(deadlines("I'm away until 5pm on Friday."), []);
+});
+
+test('"by the 15th": the next 15th on or after the sent date, uncertain unless the month is said', () => {
+  const check = (s, day, uncertain, ref = TUE_3_NOV) => {
+    const d = one(s, ref);
+    assert.deepStrictEqual([d.day, d.uncertain], [day, uncertain], s);
+    return d;
+  };
+  const d = check('Please pay before the 15th.', '2026-11-15', true);
+  assert.deepStrictEqual([d.text, d.cue], ['the 15th', 'before']);
+  check('Please pay by the 3rd.', '2026-11-03', true); // today is the 3rd
+  check('Please pay by the 1st.', '2026-12-01', true); // the 1st has gone: next month's
+  check('Please pay by the 31st.', '2026-12-31', true); // November has no 31st
+  check('Please pay by the 15th of this month.', '2026-11-15', false);
+  check('Please pay by the 15th of next month.', '2026-12-15', false);
+  check('Please pay by the 2nd of next month.', '2027-01-02', false, at(2026, 12, 20));
+  check('Rent is due on the 5th.', '2027-01-05', true, at(2026, 12, 20));
+  const [rent] = deadlines('The new amount needs to be in my account before the 15th.');
+  assert.deepStrictEqual([rent.day, rent.cue, rent.uncertain], ['2026-11-15', 'before', true]);
+  assert.deepStrictEqual(findDates('The office is on the 3rd floor.', TUE_3_NOV), []);
+});
+
+test('a forwarded message counts its dates from the day it was sent, not the day it was forwarded', () => {
+  // Jo forwards a council refusal of Tue 13 October on Tue 3 November: the appeal is due 10 November.
+  const text = 'Hi Will,\n\nFYI - see below. Can you get the appeal in by Friday?\n\nThanks,\nJo\n\n---------- Forwarded message ---------\nFrom: Northfield Borough Council Planning <planning@northfield-council.example>\nDate: Tue, 13 Oct 2026 at 16:05\nSubject: Planning decision - 12 Elm Road\nTo: Jo Patel <jo.patel@example.com>\n\nDear Ms Patel,\n\nWe have refused this application.\n\nThe decision notice says an appeal must be made within 28 days of this notice. The appeal fee of £462 is non-refundable.\n\nPlanning Services';
+  const c = clean({ text, subject: 'Fwd: Planning decision', from: 'jo.patel@example.com' });
+  const input = { subject: 'Fwd: Planning decision', body: c.body, questions: c.questions, actions: c.actions };
+  const pick = (found) => found.map((d) => [d.text, d.day, d.uncertain]);
+  const sent = at(2026, 11, 3, 11);
+  assert.deepStrictEqual(pick(findDeadlines({ ...input, forwarded: c.forwarded }, sent)), [['Friday', '2026-11-06', false], ['within 28 days', '2026-11-10', false]]);
+  // The note above the forward still counts from when it was sent, and so does the subject.
+  assert.strictEqual(findDeadlines({ ...input, subject: 'Fwd: reply by Monday', forwarded: c.forwarded }, sent)[0].day, '2026-11-09');
+  // A full timestamp works as the date too.
+  const [{ at: start }] = c.forwarded;
+  assert.strictEqual(findDeadlines({ ...input, forwarded: [{ at: start, date: '2026-10-13T15:05:00.000Z' }] }, sent)[1].day, '2026-11-10');
+  // Its date unknown: counted from the forward, but marked uncertain.
+  assert.deepStrictEqual(pick(findDeadlines({ ...input, forwarded: [{ at: start, date: null }] }, sent)), [['Friday', '2026-11-06', false], ['within 28 days', '2026-12-01', true]]);
+  // A date with its month and year written in full doesn't depend on when it was sent.
+  const fixed = findDeadlines({ body: 'See below.\n\nForwarded message:\n\nPlease pay by 20 November 2026.', forwarded: [{ at: 12, date: null }] }, sent);
+  assert.deepStrictEqual(pick(fixed), [['20 November 2026', '2026-11-20', false]]);
+  // An ask that isn't one of the body's sentences as such still counts from its own part.
+  const loose = findDeadlines({ body: 'See below.\n\nForwarded message:\n\nPay it. In 7 days, OK', questions: ['In 7 days'], forwarded: [{ at: 12, date: '2026-10-13' }] }, sent);
+  assert.deepStrictEqual(pick(loose), [['In 7 days', '2026-10-20', false]]);
+  // Odd forwarded parts are ignored.
+  for (const forwarded of [null, 'x', [null, 5, { at: -1, date: '2026-10-13' }, { at: 1e9, date: '2026-10-13' }, { at: 1.5, date: '2026-10-13' }]]) {
+    assert.strictEqual(findDeadlines({ ...input, forwarded }, sent)[1].day, '2026-12-01', JSON.stringify(forwarded));
+  }
+});
+
+test("a 'YYYY-MM-DD' sent date is that day wherever the computer is (here: New York)", () => {
+  const script = "const { findDeadlines } = require('./src/dates'); process.stdout.write(JSON.stringify(findDeadlines({ body: 'Please reply tomorrow. See below.\\n\\nForwarded message:\\n\\nAppeal within 28 days.', forwarded: [{ at: 35, date: '2026-10-13' }] }, '2026-11-03').map((d) => d.day)));";
+  const out = require('node:child_process').execFileSync(process.execPath, ['-e', script], { cwd: require('node:path').join(__dirname, '..'), env: { ...process.env, TZ: 'America/New_York' } });
+  assert.deepStrictEqual(JSON.parse(out), ['2026-11-04', '2026-11-10']);
+});
+
 test('past tense: a date for something that already happened is not a deadline', () => {
   // demo-1's "on Friday" is about a meeting that already happened.
   const demo1 = `Hi Will,

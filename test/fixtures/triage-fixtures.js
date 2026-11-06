@@ -87,7 +87,8 @@ function deadline(day, o = {}) {
 
 /**
  * A TriageContext. `wrote` maps address → times written (default HISTORY), `replied` maps
- * email id → when the user replied.
+ * email id → when the user replied, `names` are the user's first names (default ['will'],
+ * as main.js derives them from the account name 'Will Wright').
  */
 function ctx(o = {}) {
   const now = o.now ?? NOW;
@@ -97,6 +98,7 @@ function ctx(o = {}) {
     now,
     today: o.today || localDayKey(now),
     me: new Set([ME.address, ...(o.me || [])]),
+    names: o.names || ['will'],
     rules: o.rules || {},
     notNoise: new Set(o.notNoise || []),
     wroteTo: (addr) => wrote[addr] || 0,
@@ -280,10 +282,103 @@ const personOther = () => email({
 
 const flaggedNewsletter = () => ({ ...weeklyBuilder(30), flagged: true });
 
+// ---------- from the adversarial review (v0.3) ----------
+
+// A school asks parents to return a form by Friday: bulk mail, and the deadline is an ask.
+const SCHOOL_ASK = 'Please return the signed consent form by Friday 6 November.';
+const schoolTrip = () => email({
+  from: { name: "St Mary's Primary", address: 'office@stmarys.sch.uk' },
+  subject: 'Year 5 trip to the Science Museum',
+  listUnsubscribe: true,
+  category: 'newsletter',
+  body: `Year 5 are visiting the Science Museum on Wednesday 18 November. ${SCHOOL_ASK} The cost is £12.50, payable on ParentPay.`,
+  actions: [SCHOOL_ASK],
+  deadlines: [deadline(3, { text: 'Friday 6 November', cue: 'by', source: 'ask', sentence: SCHOOL_ASK })],
+});
+
+// DPD holds a parcel until an import fee is paid.
+const FEE_ASK = 'Pay the import fee of £18.40 within 3 days to release it, or it will be returned.';
+const importFee = () => email({
+  from: { name: 'DPD', address: 'notifications@dpd.co.uk' },
+  subject: 'Action needed: pay import fee for your parcel',
+  focused: false,
+  category: 'notification',
+  body: `Your parcel from Germany is being held. ${FEE_ASK}`,
+  actions: [FEE_ASK],
+  amounts: ['£18.40'],
+  deadlines: [deadline(3, { text: 'within 3 days', cue: 'within', source: 'ask', relative: true, sentence: FEE_ASK })],
+});
+
+// A delivery notice: the cleaner calls "…delivered by Friday" an action, but it isn't a task.
+const DELIVERY = 'Your order will be delivered by Friday 6 November.';
+const delivery = (o = {}) => email({
+  from: { name: 'Parcel Shop', address: 'notifications@parcelshop.example' },
+  subject: 'Your order is on its way',
+  focused: false,
+  category: 'notification',
+  body: `Good news! ${DELIVERY}`,
+  actions: [DELIVERY],
+  deadlines: [deadline(3, { text: 'Friday 6 November', cue: 'by', source: 'ask', sentence: DELIVERY })],
+  ...o,
+});
+
+// A bank asks whether a card payment was really the user's.
+const fraudCheck = (o = {}) => email({
+  from: { name: 'Kestrel Bank', address: 'alerts@kestrelbank.example' },
+  subject: 'Did you make this payment?',
+  focused: false,
+  category: 'notification',
+  body: "We've noticed an unusual payment on your card ending 4421: £499.00 at CURRYS ONLINE. If this wasn't you, call us now.",
+  amounts: ['£499.00'],
+  ...o,
+});
+
+// A holiday cottage's arrival details, with a key-safe code.
+const cottageCode = (o = {}) => email({
+  from: { name: 'Lakeside Cottages', address: 'noreply@lakesidecottages.example' },
+  subject: 'Your arrival details for Friday',
+  hoursAgo: 40,
+  category: 'notification',
+  body: 'Your stay at Heron Cottage starts on Friday 6 November. Check-in is from 4pm. Your key safe access code is 4821.',
+  cleaned: { dates: ['on Friday 6 November'], times: ['4pm'] },
+  ...o,
+});
+
+// To Tom, CC'd to the user, with one ask for Tom and one for the user by name.
+const TOM_ASK = 'Can you drain the system on Thursday?';
+const WILL_ASK = 'Will, could you send me the invoice by Friday?';
+const ccNamed = (o = {}) => email({
+  from: { name: 'Mark Ellis', address: 'mark@ellisheating.example' },
+  to: [{ name: 'Tom Baker', address: 'tom@bakerplumbing.example' }],
+  cc: [{ ...ME }],
+  subject: 'Elm Road',
+  body: `${TOM_ASK} ${WILL_ASK} I need it for the client.`,
+  questions: [TOM_ASK, WILL_ASK],
+  deadlines: [
+    deadline(2, { text: 'Thursday', cue: null, source: 'ask', sentence: TOM_ASK }),
+    deadline(3, { text: 'Friday', cue: 'by', source: 'ask', sentence: WILL_ASK }),
+  ],
+  ...o,
+});
+
+// A Google Groups post from Gmail (List-Id, List-Unsubscribe, Precedence: list).
+const GROUP_HEADERS = { listUnsubscribe: '<mailto:googlegroups-manage+1@googlegroups.com>', listId: '<harrow-juniors.googlegroups.com>', precedence: 'list' };
+const groupPost = (o = {}) => email({
+  from: { name: 'Jane Doe', address: 'jane.doe@gmail.com' },
+  to: [{ name: 'Harrow Juniors', address: 'harrow-juniors@googlegroups.com' }],
+  subject: '[Harrow Juniors] Kit for the season',
+  headers: GROUP_HEADERS,
+  category: 'newsletter',
+  body: 'Could someone bring spare shin pads to training? To unsubscribe from this group, send an email to harrow-juniors+unsubscribe@googlegroups.com.',
+  questions: ['Could someone bring spare shin pads to training?'],
+  ...o,
+});
+
 module.exports = {
   HOUR, DAY, NOW, TODAY, ME, HISTORY, HMRC_DUE, DEMO1_REPLIED, LIST_UNSUBSCRIBE,
   email, deadline, ctx, localDayKey, dayPlus,
   sarah, dad, hmrc, screwfix, promo, weeklyBuilder, weeklyBuilderIssues, ccFyi, bank, stranger,
   strangerBankDetails, strangerGroup, strangerGroupCoursework, demo1, oldCode, freshSignIn,
   automated, personOther, flaggedNewsletter,
+  schoolTrip, importFee, delivery, fraudCheck, cottageCode, ccNamed, groupPost, GROUP_HEADERS,
 };

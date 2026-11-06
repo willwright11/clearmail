@@ -8,6 +8,7 @@ const { heuristicSummary, originalText } = require('./summarize');
 const { findDeadlines } = require('./dates');
 const { triageAll, sortBucket, BUCKETS } = require('./triage');
 const { briefCounts } = require('./brief');
+const { replyTarget, replyNote } = require('./reply-target');
 
 /**
  * What prepareEmail() keeps for each email. An email never changes for its id, so it is
@@ -34,7 +35,11 @@ const { briefCounts } = require('./brief');
  * @property {string} accountId
  * @property {string} accountEmail
  * @property {{ name: string, address: string }} from
- * @property {{ name: string, address: string }|null} replyTo  where a reply goes, if not From
+ * @property {{ name: string, address: string }|null} replyTo  the Reply-To address a reply goes to, if any
+ * @property {{ name: string, address: string }|null} replyTarget  where a reply goes (the one
+ *   address the backends send to); null when the email has no address to reply to
+ * @property {string|null} replyNote  "Replies go to …, not the address it came from." when the
+ *   reply goes to another domain than the sender's
  * @property {string} subject
  * @property {string} date  ISO
  * @property {string} receivedAt  ISO
@@ -58,24 +63,44 @@ const str = (v) => (typeof v === 'string' ? v : '');
 function emptyCleaned(original) {
   const n = original.split(/\s+/).filter(Boolean).length;
   return {
-    body: original, keyPoints: [], questions: [], actions: [], dates: [], times: [], amounts: [], links: [],
+    body: original, keyPoints: [], questions: [], actions: [], dates: [], times: [], amounts: [], links: [], forwarded: [],
     category: 'person', urgency: 'normal', stats: { rawWords: n, keptWords: n, saved: 0 },
   };
 }
 
-function prepareKey(raw, order) {
-  return [String(raw.text || '').length, String(raw.html || '').length, str(raw.subject).length, str(raw.date), order].join(':');
+function prepareKey(raw, order, names) {
+  return [String(raw.text || '').length, String(raw.html || '').length, str(raw.subject).length, str(raw.date), order, names.join(',')].join(':');
 }
+
+/**
+ * The user's first names, for asks like "Will, could you…": the first word of each
+ * account's display name, lower-cased, letters only, at least 2 letters. Each once.
+ * @param {string[]} displayNames  e.g. ['Will Wright', '']
+ * @returns {string[]}  e.g. ['will']
+ */
+function firstNames(displayNames) {
+  const out = new Set();
+  for (const name of [].concat(displayNames || [])) {
+    const first = typeof name === 'string' ? name.trim().split(/\s+/)[0] : '';
+    const letters = first.toLowerCase().replace(/[^\p{L}]/gu, '');
+    if (letters.length >= 2) out.add(letters);
+  }
+  return [...out];
+}
+
+const namesOf = (names) => (Array.isArray(names) ? names.filter((n) => typeof n === 'string' && n) : []);
 
 /**
  * Cleans one email, finds its deadlines and writes its short version. Reuses `previous`
  * when it was made from the same email. Never throws.
  * @param {object} raw  RawEmail
- * @param {{ order?: 'dmy'|'mdy', previous?: Prepared|null }} [options]
+ * @param {{ order?: 'dmy'|'mdy', previous?: Prepared|null, names?: string[] }} [options]  names: the
+ *   user's first names (firstNames()), so an ask that names them leads the short version
  * @returns {Prepared}
  */
-function prepareEmail(raw, { order = 'dmy', previous = null } = {}) {
-  const key = prepareKey(raw, order);
+function prepareEmail(raw, { order = 'dmy', previous = null, names = [] } = {}) {
+  const userNames = namesOf(names);
+  const key = prepareKey(raw, order, userNames);
   if (previous && previous.key === key) return previous;
   const original = originalText(raw);
   let cleaned;
@@ -89,13 +114,15 @@ function prepareEmail(raw, { order = 'dmy', previous = null } = {}) {
   }
   let deadlines = [];
   try {
-    deadlines = findDeadlines({ subject: raw.subject, body: cleaned.body, questions: cleaned.questions, actions: cleaned.actions }, raw.date, { order });
+    // A forwarded or quoted email's relative dates ("tomorrow") count from that email's own date.
+    const forwarded = Array.isArray(cleaned.forwarded) ? cleaned.forwarded : [];
+    deadlines = findDeadlines({ subject: raw.subject, body: cleaned.body, questions: cleaned.questions, actions: cleaned.actions, forwarded }, raw.date, { order });
   } catch (err) {
     console.error('Could not read the dates in an email:', err?.message);
   }
   let summary;
   try {
-    summary = heuristicSummary(cleaned, raw.subject, original, { deadlines });
+    summary = heuristicSummary(cleaned, raw.subject, original, { deadlines, names: userNames });
   } catch (err) {
     console.error('Could not shorten an email:', err?.message);
     summary = heuristicSummary(emptyCleaned(original), raw.subject, original);
@@ -134,12 +161,17 @@ function ruleFor(address, rules) {
 function buildEmailView(item, { triage, done = false, notNoise = false, senderRule = null, isNew = false, now = Date.now() }) {
   const { raw, prep } = item;
   const date = isoOr(raw.date, new Date(now).toISOString());
+  // One rule for where a reply goes, shared with both backends (src/reply-target.js).
+  const target = replyTarget(raw);
+  const fromAddress = String(raw.from?.address || '').trim().toLowerCase();
   return {
     id: item.id,
     accountId: item.accountId,
     accountEmail: item.accountEmail || '',
     from: { name: String(raw.from?.name || raw.from?.address || 'Unknown sender'), address: String(raw.from?.address || '') },
-    replyTo: raw.replyTo?.address ? { name: String(raw.replyTo.name || raw.replyTo.address), address: String(raw.replyTo.address) } : null,
+    replyTo: target && target.address !== fromAddress ? target : null,
+    replyTarget: target,
+    replyNote: replyNote(raw),
     subject: String(raw.subject || ''),
     date,
     receivedAt: isoOr(raw.receivedAt, date),
@@ -175,8 +207,9 @@ const FALLBACK_TRIAGE = Object.freeze({ bucket: 'worth-knowing', reasons: [], co
  * @param {Item[]} options.items
  * @param {{ me: Set<string>, wroteTo: Function, historyKnown: boolean, repliedAt: Function }} options.history
  * @param {{ rules: object, done: object, notNoise: object }} options.marks  from state.json
+ * @param {string[]} [options.names]  the user's first names (firstNames())
  */
-function buildBriefView({ now, demo, demoReason, since, sinceLabel, accounts, items, history, marks }) {
+function buildBriefView({ now, demo, demoReason, since, sinceLabel, accounts, items, history, marks, names = [] }) {
   const rules = marks?.rules || {};
   const done = marks?.done || {};
   const notNoise = marks?.notNoise || {};
@@ -188,6 +221,7 @@ function buildBriefView({ now, demo, demoReason, since, sinceLabel, accounts, it
     wroteTo: history?.wroteTo,
     historyKnown: history?.historyKnown === true,
     repliedAt: history?.repliedAt,
+    names: namesOf(names),
   });
   const views = items.map((item) => {
     const triage = results.get(item.id) || FALLBACK_TRIAGE;
@@ -222,4 +256,4 @@ function buildBriefView({ now, demo, demoReason, since, sinceLabel, accounts, it
   };
 }
 
-module.exports = { prepareEmail, toTriageInput, buildEmailView, buildBriefView, emptyCleaned };
+module.exports = { prepareEmail, toTriageInput, buildEmailView, buildBriefView, emptyCleaned, firstNames };

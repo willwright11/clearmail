@@ -1062,10 +1062,12 @@ test('write guard: nothing that could change the mailbox is ever sent to Microso
 
 // ---------- reply ----------
 
-test('sendReply: replies through Outlook with the text as typed', async () => {
+const ANN = { name: 'Ann', address: 'ann@example.com' };
+
+test('sendReply: replies through Outlook with the text as typed, to the one address the reply box shows', async () => {
   fresh();
   graph.handler = graphWith({ reply: () => ({ status: 202 }) });
-  const original = { id: 'AAMk=+', from: { name: 'Exams Office', address: 'exams@lboro.ac.uk' }, subject: 'Exam timetable' };
+  const original = { id: 'AAMk=+', from: { name: 'Exams Office', address: 'exams@lboro.ac.uk' }, replyTo: null, subject: 'Exam timetable' };
   assert.deepStrictEqual(await ms.sendReply(account(), original, 'Thanks!\nSee you Monday.', opts()), { sent: true });
   assert.strictEqual(graph.requests.length, 1);
   const r = graph.requests[0];
@@ -1073,23 +1075,65 @@ test('sendReply: replies through Outlook with the text as typed', async () => {
   assert.strictEqual(r.path, '/v1.0/me/messages/AAMk%3D%2B/reply');
   assert.match(r.headers['content-type'], /^application\/json/);
   assert.strictEqual(r.headers.authorization, 'Bearer SECRET-at-1');
-  assert.deepStrictEqual(JSON.parse(r.text), { message: { body: { contentType: 'text', content: 'Thanks!\nSee you Monday.' } } });
+  assert.deepStrictEqual(JSON.parse(r.text), {
+    message: {
+      toRecipients: [{ emailAddress: { address: 'exams@lboro.ac.uk', name: 'Exams Office' } }],
+      body: { contentType: 'text', content: 'Thanks!\nSee you Monday.' },
+    },
+  });
+});
+
+test('sendReply: always names its one recipient, so Graph never adds a Reply-To address the user wasn\'t shown', async () => {
+  // Left to itself, Graph replies to every Reply-To address. ClearMail shows one, so it sends to that one.
+  const bank = { id: 'b1', from: { name: 'Kestrel Bank', address: 'alerts@kestrelbank.example' }, replyTo: { name: 'Kestrel Bank Support', address: 'support@kestrelbank.example' }, subject: 'Payee' };
+  const cases = [
+    [bank, [{ emailAddress: { address: 'support@kestrelbank.example', name: 'Kestrel Bank Support' } }]],
+    // A Reply-To that is no address is skipped, as the reply box skips it: From it is.
+    [{ ...bank, replyTo: { name: 'Fraud Team', address: 'fraud-team' } }, [{ emailAddress: { address: 'alerts@kestrelbank.example', name: 'Kestrel Bank' } }]],
+    [{ ...bank, replyTo: null, from: { name: 'help@x.example', address: 'Help@X.example' } }, [{ emailAddress: { address: 'help@x.example' } }]],
+  ];
+  for (const [original, to] of cases) {
+    fresh();
+    graph.handler = graphWith({ reply: () => ({ status: 202 }) });
+    await ms.sendReply(account(), original, 'My sort code is 12-34-56', opts());
+    assert.deepStrictEqual(JSON.parse(graph.requests[0].text).message.toRecipients, to);
+  }
+  // No address to reply to: nothing is sent at all.
+  fresh();
+  await rejectsWith(ms.sendReply(account(), { id: 'n1', from: { name: 'Mail Delivery System', address: '' }, replyTo: { name: 'x', address: 'nobody' } }, 'Hi', opts()),
+    'server', /^This email has no address to reply to\.$/);
+  assert.strictEqual(graph.requests.length, 0);
+});
+
+test('fetchInbox: the Reply-To kept is the first real address Graph lists', async () => {
+  fresh();
+  const message = {
+    ...MESSAGES[2], id: 'AAMk-rt', from: { emailAddress: { name: 'Kestrel Bank', address: 'alerts@kestrelbank.example' } },
+    replyTo: [
+      { emailAddress: { name: 'Fraud Team', address: 'fraud-team' } },
+      { emailAddress: { name: 'Support', address: 'Support@KestrelBank.example' } },
+      { emailAddress: { name: 'x', address: 'collector@attacker.example' } },
+    ],
+  };
+  graph.handler = graphWith({ messages: [message], headers: { 'AAMk-rt': [] } });
+  const [email] = await ms.fetchInbox(account(), opts());
+  assert.deepStrictEqual(email.replyTo, { name: 'Support', address: 'support@kestrelbank.example' });
 });
 
 test('sendReply: failures are sentences, and a reply that may have gone is not sent twice', async () => {
   fresh();
   graph.handler = graphWith({ reply: () => ({ status: 404, json: { error: { code: 'ErrorItemNotFound', message: 'The specified object was not found in the store.' } } }) });
-  await rejectsWith(ms.sendReply(account(), { id: 'moved' }, 'Hi', opts()), 'server', /no longer in your Outlook inbox/);
+  await rejectsWith(ms.sendReply(account(), { id: 'moved', from: ANN }, 'Hi', opts()), 'server', /no longer in your Outlook inbox/);
 
   fresh();
   graph.handler = graphWith({ reply: () => ({ status: 500, json: { error: { code: 'InternalServerError', message: 'Oops' } } }) });
-  await rejectsWith(ms.sendReply(account(), { id: 'x' }, 'Hi', opts()), 'server', /mail service is having problems/);
+  await rejectsWith(ms.sendReply(account(), { id: 'x', from: ANN }, 'Hi', opts()), 'server', /mail service is having problems/);
   assert.strictEqual(graph.requests.length, 1);
 
   fresh();
   ms._setTiming({ ...TIMING, requestTimeoutMs: 100 });
   graph.handler = () => ({ hang: true });
-  await rejectsWith(ms.sendReply(account(), { id: 'x' }, 'Hi', opts()), 'timeout', /took too long/);
+  await rejectsWith(ms.sendReply(account(), { id: 'x', from: ANN }, 'Hi', opts()), 'timeout', /took too long/);
   assert.strictEqual(graph.requests.length, 1);
 
   fresh();
@@ -1107,7 +1151,7 @@ test('errors: an expired or revoked refresh token means signing in again', async
   }));
   await rejectsWith(ms.fetchInbox(account(), opts()), 'needs-sign-in', /sign in to this account again/);
   await rejectsWith(ms.fetchSentHistory(account(), null, opts()), 'needs-sign-in');
-  await rejectsWith(ms.sendReply(account(), { id: 'a' }, 'Hi', opts()), 'needs-sign-in');
+  await rejectsWith(ms.sendReply(account(), { id: 'a', from: ANN }, 'Hi', opts()), 'needs-sign-in');
   assert.strictEqual(graph.requests.length, 0);
 
   // MFA newly required by the organisation: a fresh sign-in sorts it out.
@@ -1158,7 +1202,7 @@ test('errors: client ID, network, timeout and Graph refusals', async () => {
   fresh();
   await rejectsWith(ms.fetchInbox(account(), {}), 'no-client-id', /Settings/);
   await rejectsWith(ms.fetchSentHistory(account(), null, { clientId: '  ' }), 'no-client-id');
-  await rejectsWith(ms.sendReply(account(), { id: 'a' }, 'Hi', { clientId: 'nope' }), 'no-client-id');
+  await rejectsWith(ms.sendReply(account(), { id: 'a', from: ANN }, 'Hi', { clientId: 'nope' }), 'no-client-id');
   assert.strictEqual(tokenCalls().length, 0);
 
   // Nothing listening.
@@ -1243,7 +1287,10 @@ test('against the Microsoft stand-in: sign in, read, read Sent and reply, and no
     const sent = await ms.fetchSentHistory(acct, null, o);
     assert.deepStrictEqual(sent.entries, [{ from: me, to: ['sarah@example.com', 'tom@example.com'], date: sent.entries[0].date, conversationId: 'conv-o1', inReplyTo: null }]);
     assert.deepStrictEqual(await ms.sendReply(acct, emails[1], 'Signed, thanks.', o), { sent: true });
-    assert.deepStrictEqual(stand.replies, [{ mailbox: me, id: 'o1', body: { message: { body: { contentType: 'text', content: 'Signed, thanks.' } } } }]);
+    assert.deepStrictEqual(stand.replies, [{
+      mailbox: me, id: 'o1', to: ['sarah@example.com'],
+      body: { message: { toRecipients: [{ emailAddress: { address: 'sarah@example.com', name: 'Sarah' } }], body: { contentType: 'text', content: 'Signed, thanks.' } } },
+    }]);
     assert.deepStrictEqual(scopes, [['Mail.Read', 'Mail.Send', 'User.Read', 'email', 'openid', 'profile']]);
 
     // Every call was a read, a $batch of reads, or the one reply.

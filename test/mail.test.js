@@ -29,12 +29,12 @@ const q = (s) => (s == null ? 'NIL' : `"${String(s).replace(/["\\]/g, '')}"`);
 // ClearMail never changed a mailbox.
 const allCommands = [];
 
-// "Name <a@b>, c@d" as an IMAP envelope address list.
+// "Name <a@b>, c@d" as an IMAP envelope address list ("Team <team>" has no host).
 function addressList(value) {
   if (!value) return 'NIL';
   const one = (part) => {
-    const m = /^(?:(.*?)\s*<)?([^<>@\s]+)@([^<>\s]+?)>?$/.exec(part.trim());
-    return `(${q(m[1] || null)} NIL ${q(m[2])} ${q(m[3])})`;
+    const m = /^(?:(.*?)\s*<)?([^<>@\s]+)(?:@([^<>\s]+?))?>?$/.exec(part.trim());
+    return `(${q(m[1] || null)} NIL ${q(m[2])} ${q(m[3] || null)})`;
   };
   return `(${value.split(/,\s*/).map(one).join('')})`;
 }
@@ -735,6 +735,46 @@ test('fetchSentHistory: no Sent folder is an empty history, not an error', { tim
     await assert.rejects(mail.fetchSentHistory(account(refusing.port, { pass: 'wrong' }), null), /rejected the login/);
   } finally {
     await refusing.close();
+  }
+});
+
+test('a Reply-To that is no address is skipped: the first real one is kept, and the reply goes there', { timeout: 10000 }, async () => {
+  const imap = await imapServer({
+    messages: [
+      message({
+        uid: 1,
+        headers: {
+          From: 'Kestrel Bank <alerts@kestrel-secure.example>', To: 'me@example.com', Subject: 'Confirm payee', Date: 'Thu, 01 Oct 2026 10:00:00 +0000',
+          'Message-ID': '<k1@kestrel-secure.example>', 'Reply-To': 'Kestrel Bank Fraud Team <fraud-team>, Payments <Payments@Kestrel-Secure.example>',
+        },
+        body: 'Please reply to confirm your payee.\r\n',
+      }),
+      message({
+        uid: 2,
+        headers: {
+          From: 'Kestrel Bank <alerts@kestrel-secure.example>', To: 'me@example.com', Subject: 'Confirm payee again', Date: 'Thu, 01 Oct 2026 11:00:00 +0000',
+          'Message-ID': '<k2@kestrel-secure.example>', 'Reply-To': 'Kestrel Bank Fraud Team <fraud-team>',
+        },
+        body: 'Please reply with your sort code.\r\n',
+      }),
+    ],
+  });
+  const smtp = await smtpServer();
+  const noSent = await imapServer({ sentFolder: false }); // where the reply's Sent copy would go: none here
+  try {
+    const [first, second] = await mail.fetchInbox(account(imap.port));
+    assert.deepStrictEqual(first.replyTo, { name: 'Payments', address: 'payments@kestrel-secure.example' });
+    assert.strictEqual(second.replyTo, null);
+    // Sent to From: the address the reply box names for it (src/reply-target.js).
+    const result = await mail.sendReply(account(noSent.port, { smtpPort: smtp.port }), { ...second, replyTo: { name: 'Kestrel Bank Fraud Team', address: 'fraud-team' } }, 'Which payee?');
+    assert.strictEqual(await result.filedInSent, false);
+    const rcpt = smtp.state.commands.filter((c) => /^RCPT TO:/i.test(c));
+    assert.strictEqual(rcpt.length, 1);
+    assert.match(rcpt[0], /^RCPT TO:<alerts@kestrel-secure\.example>/i);
+  } finally {
+    await imap.close();
+    await smtp.close();
+    await noSent.close();
   }
 });
 

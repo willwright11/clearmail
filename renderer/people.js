@@ -207,8 +207,10 @@ function renderConversation(scroll = 'keep') {
     const holder = $('people-composer');
     const cur = holder.querySelector('.composer-box');
     const id = convo.latest.id;
+    // (An email with no address to reply to gets a box with no text field.)
     const stale = !cur || cur.dataset.for !== id || cur.dataset.pending !== String(Boolean(pendingReply(id)))
-      || cur.querySelector('textarea').value !== (state.drafts.get(id) || '');
+      || (cur.dataset.noReply === 'true') !== !replyTarget(convo.latest)
+      || (cur.querySelector('textarea')?.value ?? '') !== (state.drafts.get(id) || '');
     if (stale) holder.replaceChildren(composer(convo.latest));
   });
   if (scroll === 'bottom' || (scroll === 'follow' && atBottom)) msgs.scrollTop = msgs.scrollHeight;

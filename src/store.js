@@ -572,12 +572,17 @@ function emptyState() {
 
 const timeOf = (v) => (Number.isFinite(v) && v > 0 ? v : null);
 
+// The accounts whose entries may be kept, or null for any (options.accountIds: ids or a Set).
+const ownersOf = (accountIds) => (accountIds == null ? null : new Set([].concat(accountIds instanceof Set ? [...accountIds] : accountIds)));
+const ownedBy = (owners, accountId) => !owners || owners.has(accountId);
+
 // { id: ms } with valid ids, at most `limit` (the newest), none older than markDays unless
-// the email is still loaded (`keep`), so a Done email still in the inbox stays done.
-function marksOf(raw, { now, keep }) {
+// the email is still loaded (`keep`), so a Done email still in the inbox stays done. With
+// `owners`, only marks for those accounts are kept (a removed account's go).
+function marksOf(raw, { now, keep, owners }) {
   const oldest = now - STATE_LIMITS.markDays * DAY_MS;
   const entries = Object.entries(raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {})
-    .filter(([id, at]) => isEmailId(id) && Number.isFinite(at))
+    .filter(([id, at]) => isEmailId(id) && Number.isFinite(at) && ownedBy(owners, id.slice(0, id.indexOf(':'))))
     .map(([id, at]) => [id, Math.min(at, now)])
     .filter(([id, at]) => at >= oldest || keep.has(id))
     .sort((a, b) => b[1] - a[1])
@@ -588,9 +593,10 @@ function marksOf(raw, { now, keep }) {
 /**
  * state.json with anything malformed dropped and the caps applied: at most 2000 rules, and
  * at most 5000 Done and 5000 Not noise marks, none older than 60 days unless its email is in
- * `keep`. Never throws.
+ * `keep`. With `accountIds`, marks for any other account are dropped. Never throws.
  */
-function normalizeState(raw, { now = Date.now(), keep = new Set() } = {}) {
+function normalizeState(raw, { now = Date.now(), keep = new Set(), accountIds = null } = {}) {
+  const owners = ownersOf(accountIds);
   const r = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   const rules = {};
   for (const [key, rule] of Object.entries(r.rules && typeof r.rules === 'object' ? r.rules : {})) {
@@ -601,15 +607,16 @@ function normalizeState(raw, { now = Date.now(), keep = new Set() } = {}) {
   const m = r.migrated && typeof r.migrated === 'object' ? r.migrated : {};
   return {
     rules,
-    done: marksOf(r.done, { now, keep }),
-    notNoise: marksOf(r.notNoise, { now, keep }),
+    done: marksOf(r.done, { now, keep, owners }),
+    notNoise: marksOf(r.notNoise, { now, keep, owners }),
     brief: { lastSlot: timeOf(b.lastSlot), lastAt: timeOf(b.lastAt), lastSince: timeOf(b.lastSince) },
     migrated: timeOf(m.localDone) ? { localDone: m.localDone } : {},
   };
 }
 
-function loadState() {
-  return normalizeState(readJson(STATE_FILE, {}));
+/** state.json; options as normalizeState's (e.g. { accountIds }). */
+function loadState(options) {
+  return normalizeState(readJson(STATE_FILE, {}), options);
 }
 
 /** Saves state.json (normalised); returns what was saved. Throws a user-friendly Error. */
@@ -627,17 +634,25 @@ function saveState(state, options) {
 
 const HISTORY_FILE = 'history.json';
 
-/** { accountId: History } as saved, each normalised and capped by src/history.js. */
-function loadHistory() {
+/**
+ * { accountId: History } as saved, each normalised and capped by src/history.js. With
+ * `accountIds`, only those accounts' histories are kept.
+ */
+function loadHistory({ accountIds = null } = {}) {
+  const owners = ownersOf(accountIds);
   const out = {};
-  for (const [id, h] of Object.entries(readJson(HISTORY_FILE, {}))) if (ID_RE.test(id)) out[id] = normalizeHistory(h);
+  for (const [id, h] of Object.entries(readJson(HISTORY_FILE, {}))) if (ID_RE.test(id) && ownedBy(owners, id)) out[id] = normalizeHistory(h);
   return out;
 }
 
-/** Saves history.json; returns what was saved. Throws a user-friendly Error. */
-function saveHistory(histories) {
+/**
+ * Saves history.json; returns what was saved. With `accountIds`, any other account's history
+ * is left out (a removed account's never comes back). Throws a user-friendly Error.
+ */
+function saveHistory(histories, { accountIds = null } = {}) {
+  const owners = ownersOf(accountIds);
   const out = {};
-  for (const [id, h] of Object.entries(histories || {})) if (ID_RE.test(id)) out[id] = normalizeHistory(h);
+  for (const [id, h] of Object.entries(histories || {})) if (ID_RE.test(id) && ownedBy(owners, id)) out[id] = normalizeHistory(h);
   try {
     writeJson(HISTORY_FILE, out);
   } catch (err) {

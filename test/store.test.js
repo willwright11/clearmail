@@ -443,6 +443,28 @@ test('history.json: each account\'s Sent history is checked and capped, and only
   assert.deepStrictEqual(h.aaaaaaaaaaaaaaaa.cursor, { kind: 'graph', since: '2026-11-01T10:00:00.000Z', fullAt: 1 });
 });
 
+test('history.json and state.json: what was kept for an account no longer in Settings is dropped', () => {
+  const kept = 'aaaaaaaaaaaaaaaa';
+  const gone = 'bbbbbbbbbbbbbbbb';
+  const h = { cursor: null, syncedAt: '2026-11-03T10:00:00Z', me: ['me@example.com'], people: {}, replies: { 'c:conv-1': '2026-11-02T10:00:00Z' } };
+  store.saveHistory({ [kept]: h, [gone]: h }, { accountIds: new Set([kept, 'demo']) });
+  assert.deepStrictEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(dir, 'history.json'), 'utf8'))), [kept]);
+  store.saveHistory({ [kept]: h, [gone]: h }); // without the list (older callers), both stay
+  assert.deepStrictEqual(Object.keys(store.loadHistory()).sort(), [gone, kept].sort());
+  assert.deepStrictEqual(Object.keys(store.loadHistory({ accountIds: [kept] })), [kept], 'an orphan is not loaded');
+
+  const now = Date.now();
+  const raw = { done: { [`${kept}:1`]: now, [`${gone}:1`]: now, 'demo:demo-3': now }, notNoise: { [`${gone}:2`]: now } };
+  const s = store.normalizeState(raw, { now, keep: new Set([`${gone}:1`]), accountIds: new Set([kept, 'demo']) });
+  assert.deepStrictEqual(Object.keys(s.done).sort(), [`${kept}:1`, 'demo:demo-3'], 'even an email still loaded');
+  assert.deepStrictEqual(s.notNoise, {});
+  store.saveState(raw, { now, accountIds: [kept] });
+  assert.deepStrictEqual(Object.keys(store.loadState().done), [`${kept}:1`]);
+  fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify(raw));
+  assert.deepStrictEqual(Object.keys(store.loadState({ accountIds: [kept] }).done), [`${kept}:1`]);
+  assert.deepStrictEqual(Object.keys(store.loadState().done).length, 3, 'without the list nothing is dropped');
+});
+
 test('the app password is saved exactly as typed', () => {
   reset();
   store.saveAccount({ ...gmail, pass: ' pass word ' });

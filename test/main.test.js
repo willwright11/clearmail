@@ -22,26 +22,38 @@ let exposed = null;
 let readyResolve;
 const ready = new Promise((resolve) => { readyResolve = resolve; });
 
-class FakeWindow {
+class FakeWindow extends EventEmitter {
   constructor(options) {
+    super();
     this.options = options;
-    this.webContents = {
-      isDestroyed: () => false,
+    this.destroyed = false;
+    this.webContents = Object.assign(new EventEmitter(), {
+      isDestroyed: () => this.destroyed,
       send: (channel, data) => (listeners.get(channel) || []).forEach((fn) => fn({}, structuredClone(data))),
       setWindowOpenHandler() {},
-      on() {},
-    };
+    });
     FakeWindow.all.push(this);
   }
   loadFile(file) { this.file = file; }
-  on() {}
   show() { this.shown = (this.shown || 0) + 1; }
   isMinimized() { return false; }
-  isDestroyed() { return false; }
+  isDestroyed() { return this.destroyed; }
+  // What the red button (or ⌘W) does: 'close' may be cancelled; otherwise the window goes.
+  close() {
+    const e = { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } };
+    this.emit('close', e);
+    if (e.defaultPrevented) return false;
+    this.destroyed = true;
+    FakeWindow.all = FakeWindow.all.filter((w) => w !== this);
+    this.emit('closed');
+    return true;
+  }
   static getAllWindows() { return FakeWindow.all; }
   static fromWebContents() { return null; }
 }
 FakeWindow.all = [];
+// The native "a reply is still waiting" question: each one asked, and the button to press.
+const dialogs = { asked: [], answer: 0 };
 
 class FakeNotification extends EventEmitter {
   constructor(options) {
@@ -71,7 +83,13 @@ const fakeElectron = {
   Menu: { buildFromTemplate: (template) => ({ template }), setApplicationMenu: (menu) => menus.push(menu) },
   ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) },
   shell: { openExternal: async (url) => { opened.push(url); } },
-  dialog: { showMessageBox: async () => ({ response: 1 }) },
+  dialog: {
+    showMessageBox: async () => ({ response: 1 }),
+    showMessageBoxSync: (...args) => {
+      dialogs.asked.push({ parent: args.length > 1 ? args[0] : null, options: args.at(-1) });
+      return dialogs.answer;
+    },
+  },
   Notification: FakeNotification,
   powerMonitor,
   net: { isOnline: () => true },
@@ -143,6 +161,8 @@ const pushes = []; // [channel, data] for every push the window got
 for (const channel of ['reply:result', 'inbox:updated', 'brief:show']) listeners.set(channel, [(_e, data) => pushes.push([channel, data])]);
 const pushesOf = (channel) => pushes.filter((p) => p[0] === channel).map((p) => p[1]);
 
+// What main.js hands src/view.js (the real one does the work): the options of every call.
+const viewCalls = { prepareEmail: [], buildBriefView: [] };
 const realLoad = Module._load;
 Module._load = function (request, ...rest) {
   if (request === 'electron') return fakeElectron;
@@ -150,6 +170,14 @@ Module._load = function (request, ...rest) {
   if (request === './src/mail') return fakeMail;
   if (request === './src/microsoft') return fakeMicrosoft;
   if (request === './src/config') return fakeConfig;
+  if (request === './src/view') {
+    const real = realLoad.call(this, request, ...rest);
+    return {
+      ...real,
+      prepareEmail: (raw, options) => { viewCalls.prepareEmail.push(options); return real.prepareEmail(raw, options); },
+      buildBriefView: (options) => { viewCalls.buildBriefView.push(options); return real.buildBriefView(options); },
+    };
+  }
   return realLoad.call(this, request, ...rest);
 };
 console.error = () => {}; // main logs every failed IPC call
@@ -184,7 +212,7 @@ function rawEmail(id, extra = {}) {
 }
 
 const EMAIL_VIEW = ['accountEmail', 'accountId', 'attachments', 'canOpen', 'cleanedBody', 'date', 'done', 'from', 'id', 'isNew', 'links', 'notNoise',
-  'original', 'receivedAt', 'replyTo', 'seen', 'senderRule', 'subject', 'summary', 'triage'];
+  'original', 'receivedAt', 'replyNote', 'replyTarget', 'replyTo', 'seen', 'senderRule', 'subject', 'summary', 'triage'];
 const ids = (res) => res.emails.map((m) => m.id);
 const find = (res, id) => res.emails.find((m) => m.id === id);
 
@@ -263,6 +291,11 @@ test('demo inbox: a BriefView sorted into Needs you, Worth knowing and Noise, wi
   assert.match(find(res, 'demo:demo-2').triage.reasons.join(' '), /written to them 6 times/);
   assert.strictEqual(res.counts.needsYou, 6);
   assert.strictEqual(calls.length, 0, 'demo mode never reaches a server');
+  // "Will, could you…" is meant for the sample user: their first name goes to the short
+  // versions and the sorting.
+  assert.ok(viewCalls.prepareEmail.length >= demo.length);
+  for (const options of viewCalls.prepareEmail) assert.deepStrictEqual(options.names, ['will']);
+  assert.deepStrictEqual(viewCalls.buildBriefView.at(-1).names, ['will']);
 });
 
 test('demo: a reply is held for 5 seconds, then "sent" without reaching a server, and the email moves to Done', async (t) => {
@@ -528,24 +561,163 @@ test('Undo within 5 seconds means the reply is never sent; one reply at a time p
   imap.sendReply = async () => ({ sent: true, filedInSent: Promise.resolve(true) });
   await api().reply(id, 'This one goes');
   t.mock.timers.tick(5000);
-  assert.deepStrictEqual(await api().undoReply(id), { undone: false });
+  assert.deepStrictEqual(await api().undoReply(id), { undone: false, sending: true }, 'it is on its way');
   await settle();
   assert.strictEqual(callsOf('imap.sendReply').length, before + 1);
+  assert.deepStrictEqual(await api().undoReply(id), { undone: false }, 'it has gone');
   pushes.length = 0;
 });
 
-test('quitting while a reply waits sends nothing', async (t) => {
+const quitEvent = () => ({ prevented: false, preventDefault() { this.prevented = true; } });
+
+test('quitting while a reply waits asks first: "Don\'t quit" keeps it and its Undo, "Quit without sending" sends nothing', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   imap.fetchInbox = async () => [rawEmail('fp-1-31', { uid: 31 })];
   await api().loadInbox({ force: true });
+  const id = `${gmailId}:fp-1-31`;
   const before = callsOf('imap.sendReply').length;
-  await api().reply(`${gmailId}:fp-1-31`, 'Never sent');
-  appEvents.emit('before-quit', { preventDefault() {} });
+  dialogs.asked.length = 0;
+  const idle = quitEvent();
+  appEvents.emit('before-quit', idle);
+  assert.deepStrictEqual([dialogs.asked.length, idle.prevented], [0, false], 'nothing waiting: no question');
+
+  await api().reply(id, 'Never sent');
+  dialogs.answer = 0; // Don't quit
+  const stay = quitEvent();
+  appEvents.emit('before-quit', stay);
+  assert.strictEqual(stay.prevented, true, 'ClearMail keeps running');
+  assert.strictEqual(dialogs.asked.length, 1);
+  const { parent, options } = dialogs.asked[0];
+  assert.strictEqual(parent, FakeWindow.all.at(-1), 'asked over the window');
+  assert.deepStrictEqual([options.type, options.message, options.detail, options.buttons, options.defaultId, options.cancelId],
+    ['warning', 'A reply is still waiting to be sent.', "If you quit now, it won't be sent.", ["Don't quit", 'Quit without sending'], 0, 0]);
+  assert.deepStrictEqual(await api().undoReply(id), { undone: true }, 'the reply and its Undo are still there');
+
+  await api().reply(id, 'Never sent');
+  dialogs.answer = 1; // Quit without sending
+  const go = quitEvent();
+  appEvents.emit('before-quit', go);
+  assert.strictEqual(go.prevented, false);
   t.mock.timers.tick(60000);
   await settle();
   assert.strictEqual(callsOf('imap.sendReply').length, before);
   assert.deepStrictEqual(pushesOf('reply:result'), []);
-  assert.deepStrictEqual(await api().undoReply(`${gmailId}:fp-1-31`), { undone: false });
+  assert.deepStrictEqual(await api().undoReply(id), { undone: false });
+  dialogs.answer = 0;
+  dialogs.asked.length = 0;
+});
+
+test('closing the window while a reply waits asks first; "Don\'t close" keeps the reply and its Undo', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  imap.fetchInbox = async () => [rawEmail('fp-1-33', { uid: 33 })];
+  imap.sendReply = async () => ({ sent: true, filedInSent: Promise.resolve(true) });
+  await api().loadInbox({ force: true });
+  const id = `${gmailId}:fp-1-33`;
+  const before = callsOf('imap.sendReply').length;
+  const window = FakeWindow.all.at(-1);
+  dialogs.asked.length = 0;
+
+  await api().reply(id, 'Wait for me');
+  dialogs.answer = 0; // Don't close
+  assert.strictEqual(window.close(), false, 'the window stays open');
+  assert.deepStrictEqual(dialogs.asked.map((d) => [d.parent === window, d.options.message, d.options.detail, d.options.buttons, d.options.cancelId]),
+    [[true, 'A reply is still waiting to be sent.', "If you close the window now, it won't be sent.", ["Don't close", 'Close without sending'], 0]]);
+  assert.deepStrictEqual(await api().undoReply(id), { undone: true }, 'Undo still works');
+  // Not undone: its 5 seconds run on as before and it goes.
+  await api().reply(id, 'Wait for me');
+  assert.strictEqual(window.close(), false);
+  t.mock.timers.tick(5000);
+  await settle();
+  assert.strictEqual(callsOf('imap.sendReply').length, before + 1);
+  assert.deepStrictEqual(pushesOf('reply:result').at(-1), { id, ok: true });
+
+  // "Close without sending": it never goes (the window that held its text and Undo is gone).
+  await api().reply(id, 'Gone with the window');
+  dialogs.answer = 1;
+  assert.strictEqual(window.close(), true);
+  t.mock.timers.tick(60000);
+  await settle();
+  assert.strictEqual(callsOf('imap.sendReply').length, before + 1, 'not sent');
+  assert.deepStrictEqual(await api().undoReply(id), { undone: false });
+  assert.strictEqual(dialogs.asked.length, 3);
+
+  // Clicking the Dock icon opens a new window; closing it with nothing waiting asks nothing.
+  appEvents.emit('activate');
+  assert.strictEqual(FakeWindow.all.length, 1);
+  assert.notStrictEqual(FakeWindow.all[0], window);
+  dialogs.answer = 0;
+  assert.strictEqual(FakeWindow.all[0].close(), true);
+  assert.strictEqual(dialogs.asked.length, 3);
+  appEvents.emit('activate');
+
+  // The page crashing drops the waiting reply too: nobody can see or undo it any more.
+  await api().reply(id, 'Lost in a crash');
+  FakeWindow.all[0].webContents.emit('render-process-gone', {}, { reason: 'crashed' });
+  t.mock.timers.tick(60000);
+  await settle();
+  assert.strictEqual(callsOf('imap.sendReply').length, before + 1, 'not sent');
+  assert.strictEqual(dialogs.asked.length, 3);
+  dialogs.asked.length = 0;
+  pushes.length = 0;
+});
+
+test('while a reply is on its way, the email takes no second reply, and Undo says it is being sent', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  imap.fetchInbox = async () => [rawEmail('fp-1-35', { uid: 35 })];
+  await api().loadInbox({ force: true });
+  const id = `${gmailId}:fp-1-35`;
+  const before = callsOf('imap.sendReply').length;
+  let finish;
+  imap.sendReply = () => new Promise((resolve) => { finish = () => resolve({ sent: true, filedInSent: Promise.resolve(true) }); }); // a slow mail server
+  await api().reply(id, 'First reply');
+  t.mock.timers.tick(5000);
+  await settle();
+  assert.strictEqual(callsOf('imap.sendReply').length, before + 1, 'on its way');
+  assert.deepStrictEqual(await api().undoReply(id), { undone: false, sending: true });
+  // e.g. from a window opened again, which doesn't know about the first one
+  await assert.rejects(api().reply(id, 'First reply'), (err) => message(err) === 'Your reply to this email is still being sent. Wait a moment.');
+  t.mock.timers.tick(60000);
+  await settle();
+  assert.strictEqual(callsOf('imap.sendReply').length, before + 1, 'never sent twice');
+  finish();
+  await settle();
+  assert.deepStrictEqual(pushesOf('reply:result'), [{ id, ok: true }]);
+  assert.deepStrictEqual(await api().undoReply(id), { undone: false });
+
+  // Once it has gone (or failed), the email can be answered again.
+  imap.sendReply = async () => { throw new Error("Couldn't send your reply: your mail server took too long to respond."); };
+  await api().reply(id, 'Second');
+  t.mock.timers.tick(5000);
+  await settle();
+  assert.strictEqual(pushesOf('reply:result').at(-1).ok, false);
+  imap.sendReply = async () => ({ sent: true, filedInSent: Promise.resolve(true) });
+  assert.strictEqual((await api().reply(id, 'Third')).queued, true);
+  t.mock.timers.tick(5000);
+  await settle();
+  assert.deepStrictEqual(callsOf('imap.sendReply').slice(before).map((c) => c[2]), ['First reply', 'Second', 'Third']);
+  pushes.length = 0;
+});
+
+test('an email with no address to reply to can\'t be answered, and the reply box names where a reply goes', async () => {
+  imap.fetchInbox = async () => [
+    rawEmail('fp-1-36', { uid: 36, from: { name: 'Mail Delivery System', address: 'mailer-daemon' }, replyTo: null }),
+    rawEmail('fp-1-37', { uid: 37, from: { name: 'Kestrel Bank', address: 'alerts@kestrel-secure.example' }, replyTo: { name: 'Kestrel Bank Fraud Team', address: 'fraud-team' } }),
+    rawEmail('fp-1-38', { uid: 38, from: { name: 'Kestrel Bank', address: 'alerts@kestrel-secure.example' }, replyTo: { name: 'Payments', address: 'payments@kestrel-help.example' } }),
+  ];
+  const res = await api().loadInbox({ force: true });
+  const none = find(res, `${gmailId}:fp-1-36`);
+  assert.deepStrictEqual([none.replyTarget, none.replyTo, none.replyNote], [null, null, null]);
+  await assert.rejects(api().reply(none.id, 'Hello?'), (err) => message(err) === 'This email has no address to reply to.');
+  assert.deepStrictEqual(await api().undoReply(none.id), { undone: false }, 'nothing was queued');
+  // A Reply-To that isn't an address is skipped: the reply goes to From, and the box says so.
+  const fake = find(res, `${gmailId}:fp-1-37`);
+  assert.deepStrictEqual([fake.replyTarget, fake.replyTo, fake.replyNote], [{ name: 'Kestrel Bank', address: 'alerts@kestrel-secure.example' }, null, null]);
+  const other = find(res, `${gmailId}:fp-1-38`);
+  assert.deepStrictEqual(other.replyTarget, { name: 'Payments', address: 'payments@kestrel-help.example' });
+  assert.strictEqual(other.replyNote, 'Replies go to payments@kestrel-help.example, not the address it came from.');
+  // The user's first name (from the Outlook account's "Will") goes to the short versions and the sorting.
+  assert.deepStrictEqual(viewCalls.prepareEmail.at(-1).names, ['will']);
+  assert.deepStrictEqual(viewCalls.buildBriefView.at(-1).names, ['will']);
 });
 
 test('a failed send comes back as a plain sentence, and the email is not marked done', async (t) => {
@@ -829,6 +1001,67 @@ test('removing an account forgets it, even while its inbox is loading', async ()
   assert.ok(!fs.readFileSync(path.join(dir, 'settings.json'), 'utf8').includes(Buffer.from('enc:rt-uni').toString('base64')));
   assert.ok(!Object.keys(readJson('state.json').done).some((id) => id.startsWith(`${uniId}:`)), 'its Done marks went too');
   assert.ok(!Object.hasOwn(readJson('history.json'), uniId), 'and its Sent history');
+});
+
+test('a reply that finishes after its account was removed (or pointed elsewhere) writes nothing back for it', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const added = await api().saveAccount({ provider: 'gmail', user: 'temp@gmail.com', pass: 'temp-pw' });
+  const tempId = added.accounts.find((a) => a.email === 'temp@gmail.com').id;
+  imap.fetchInbox = async (account) => (account.user === 'temp@gmail.com' ? [rawEmail('fp-9-1', { uid: 91 }), rawEmail('fp-9-2', { uid: 92 })] : []);
+  ms.fetchInbox = async () => [];
+  await api().loadInbox({ force: true });
+  assert.ok(Object.hasOwn(readJson('history.json'), tempId), 'its Sent folder was read');
+  let finish;
+  imap.sendReply = () => new Promise((resolve) => { finish = () => resolve({ sent: true, filedInSent: Promise.resolve(true) }); });
+  const doneFor = (accountId) => Object.keys(readJson('state.json').done).filter((k) => k.startsWith(`${accountId}:`));
+
+  // Edited to read another mailbox while the reply was on its way.
+  await api().reply(`${tempId}:fp-9-1`, 'From the old mailbox');
+  t.mock.timers.tick(5000);
+  await settle();
+  await api().saveAccount({ id: tempId, user: 'temp2@gmail.com' });
+  finish();
+  await settle();
+  assert.deepStrictEqual(pushesOf('reply:result').at(-1), { id: `${tempId}:fp-9-1`, ok: true }, 'it was sent, and the window is told');
+  assert.ok(!Object.hasOwn(readJson('history.json'), tempId), 'no history for the old mailbox');
+  assert.deepStrictEqual(doneFor(tempId), []);
+  await api().saveAccount({ id: tempId, user: 'temp@gmail.com', pass: 'temp-pw' });
+  await api().loadInbox({ force: true });
+
+  // Removed while the reply was on its way.
+  await api().reply(`${tempId}:fp-9-2`, 'Late reply');
+  t.mock.timers.tick(5000);
+  await settle();
+  await api().removeAccount(tempId);
+  assert.ok(!Object.hasOwn(readJson('history.json'), tempId));
+  finish();
+  await settle();
+  assert.deepStrictEqual(pushesOf('reply:result').at(-1), { id: `${tempId}:fp-9-2`, ok: true });
+  assert.ok(!Object.hasOwn(readJson('history.json'), tempId), 'the removed account is not written back');
+  assert.deepStrictEqual(doneFor(tempId), []);
+  assert.ok(!(await api().getSettings()).accounts.some((a) => a.id === tempId));
+  pushes.length = 0;
+});
+
+test('when macOS shuts down, restarts or logs out, waiting replies are dropped unsent without a question', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  imap.fetchInbox = async () => [rawEmail('fp-1-40', { uid: 40 })];
+  imap.sendReply = async () => ({ sent: true, filedInSent: Promise.resolve(true) });
+  await api().loadInbox({ force: true });
+  const before = callsOf('imap.sendReply').length;
+  dialogs.asked.length = 0;
+  await api().reply(`${gmailId}:fp-1-40`, 'Shutting down');
+  powerMonitor.emit('shutdown', { preventDefault() {} });
+  await api().reply(`${gmailId}:fp-1-40`, 'Queued during the shutdown');
+  const quit = quitEvent();
+  appEvents.emit('before-quit', quit);
+  assert.strictEqual(FakeWindow.all.at(-1).close(), true);
+  appEvents.emit('will-quit');
+  t.mock.timers.tick(60000);
+  await settle();
+  assert.deepStrictEqual([quit.prevented, dialogs.asked.length], [false, 0], 'nothing held the shutdown up');
+  assert.strictEqual(callsOf('imap.sendReply').length, before, 'nothing was sent');
+  assert.deepStrictEqual(pushesOf('reply:result'), []);
 });
 
 test('nothing secret or from an email is written to disk in plain text', () => {

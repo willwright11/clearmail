@@ -32,6 +32,8 @@ const DATE_RE = new RegExp(
     '(?<![\\d.,/£$€-])\\d{1,2}([.-])\\d{1,2}\\1(?:\\d{4}|\\d{2})(?!\\d)',
     '\\b\\d{4}-\\d{2}-\\d{2}\\b',
     `\\b${anyOf(['today', 'tonight', 'tomorrow', 'this weekend', 'this week', 'this morning', 'this afternoon', 'this evening', 'next week', 'next month', 'end of the day', 'end of day', 'end of the week', 'end of week', 'end of the month', 'end of month', 'eod', 'eow', 'cob'])}\\b`,
+    // by the 15th, before the 1st of next month (not "on the 3rd floor" or "by the 15th of May")
+    `\\b${anyOf(['by', 'before', 'on', 'until', 'till'])}[ \\t]+${ci('the')}[ \\t]+\\d{1,2}(?:st|nd|rd|th)\\b(?:[ \\t]+${ci('of')}[ \\t]+${anyOf(['this', 'next'])}[ \\t]+${ci('month')}\\b|(?=[ \\t]*(?:[.,;:!?)\\n]|$)|[ \\t]+${anyOf(['at', 'to', 'so', 'and', 'or', 'but', 'please', 'if', 'otherwise', 'when', 'because', 'as', 'in', 'with', 'then', 'unless', 'latest'])}\\b))`,
   ].join('|'),
   'g',
 );
@@ -61,6 +63,18 @@ const hasFacts = (s) => /[\d£$€?]/.test(s) || DATE_TEST.test(s) || TIME_TEST.
 
 const ACTION_CUES = /\b(?:please|could you|can you|would you|need you to|you need to|you must|required|action required|make sure|remember to|don't forget|deadline|due|by (?:eod|end of day|cob|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|asap|urgent|sign|approve|confirm|reply|respond|submit|pay|book|send)\b/i;
 
+// The sender promising to ask later, which asks for nothing now: "If we need you to sign
+// anything else, we will let you know." / "We'll write to you if we need anything more."
+const ASK_LATER = String.raw`(?:we|I)(?:'ll|’ll|[ \t]+will|[ \t]+shall)[ \t]+(?:let you know|write to you|contact you|be in touch|get in touch|tell you|ask you|email you|call you)\b`;
+const MAY_NEED = String.raw`\b(?:need|require|would like|want)\b`;
+const PROMISE_TO_ASK = new RegExp(String.raw`^(?:if|should|in case|when|whenever)\b[^,;.!?]*${MAY_NEED}[^,;.!?]*,[ \t]*${ASK_LATER}|${ASK_LATER}[ \t]+(?:if|when|should|in case)\b[^.!?]*${MAY_NEED}`, 'i');
+const DIRECT_REQUEST = /\b(?:please|could you|can you|would you|you need to|you must|make sure|remember to|don't forget|do not forget)\b/i;
+// True for such a promise, unless the sentence also asks for something ("…, so please keep the originals").
+function promisesToAsk(s) {
+  const m = PROMISE_TO_ASK.exec(s);
+  return Boolean(m) && !DIRECT_REQUEST.test(s.slice(0, m.index) + s.slice(m.index + m[0].length));
+}
+
 // Deadline phrasing, not just any mention of "today" or "important".
 const URGENT_CUES = /\b(?:urgent(?:ly)?|asap|immediately|overdue|final (?:notice|reminder|demand)|last chance|action required|response required|deadline|suspended|time[- ]sensitive|today only|(?:by|before|due|until|end of) (?:today|tonight|eod|cob|end of (?:the )?day)|expir(?:es|ing|y)? (?:today|tomorrow|tonight|in \d+ (?:hours?|days?))|this is (?:urgent|important))\b|\bimportant\s*[:!]/i;
 const NOT_URGENT = /\b(?:not|isn't|is not|nothing|no)\s+(?:urgent|important|rush)\b|\bno (?:rush|hurry)\b/gi;
@@ -76,15 +90,15 @@ const REPLY_SUBJECT = /^\s*(?:re|aw|sv|antw|odp|vs)\s*:/i;
 const FORWARD_SUBJECT = /^\s*(?:fwd?|wg|tr|rv|enc)\s*:/i;
 // "On Mon, 13 Oct 2026 at 09:12, Will <will@x.com> wrote:" and the same in other languages.
 const ATTRIBUTION = /^.{0,300}?(?:\bwrote|\bschrieb|\bescribió|\ba écrit|\bha scritto|\bschreef|\bskrev)[^\n]{0,200}:\s*$/i;
-const LABEL_RE = /^(?:Forwarded|Earlier) message(?: from .{1,200})?:$/;
 
 // "From: …" followed by Sent/Date (with a time) and To/Subject lines, as mail clients
-// write above a quoted or forwarded message. Returns { from, end } or null.
+// write above a quoted or forwarded message. Returns { from, end, date } or null.
 function headerBlock(lines, i, afterSeparator) {
   const first = HEADER.exec(lines[i] || '');
   if (!first || first[1].toLowerCase() !== 'from') return null;
   const seen = new Set();
   let timed = false;
+  let date = null;
   let end = i + 1;
   let last = 'from';
   for (; end < lines.length && end < i + 12; end++) {
@@ -94,6 +108,7 @@ function headerBlock(lines, i, afterSeparator) {
       last = h[1].toLowerCase();
       seen.add(last);
       if ((last === 'sent' || last === 'date') && /\d{1,2}[:.]\d{2}/.test(h[2])) timed = true;
+      if ((last === 'sent' || last === 'date') && date === null) date = headerDay(h[2]);
     } else if (!(lines[end].includes('@') && /^(?:to|cc|bcc)$/.test(last))) {
       break; // anything but a wrapped To:/Cc: list ends the block
     }
@@ -101,7 +116,39 @@ function headerBlock(lines, i, afterSeparator) {
   const addressed = /@|<[^>]*>/.test(first[2]);
   if (!timed || !(seen.has('to') || seen.has('cc') || seen.has('subject'))) return null;
   if (!addressed && !afterSeparator && !seen.has('sent')) return null;
-  return { from: senderName(first[2]), end };
+  return { from: senderName(first[2]), end, date };
+}
+
+const MONTH_WORD = '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
+const HEADER_DMY = new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)? (?:of )?${MONTH_WORD}\\.? (\\d{4})\\b`, 'i');
+const HEADER_MDY = new RegExp(`\\b${MONTH_WORD}\\.? (\\d{1,2})(?:st|nd|rd|th)? (\\d{4})\\b`, 'i');
+const monthNumber = (word) => ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].indexOf(word.slice(0, 3).toLowerCase()) + 1;
+
+/**
+ * The day a quoted or forwarded message was sent, from its Date:/Sent: header ("Mon, 13 Oct
+ * 2026 at 09:12", "Monday, October 13, 2026 9:12 AM", "2026-10-13 09:12"), as 'YYYY-MM-DD'.
+ * null when it can't be read for certain: "10/11/2026" could be day first or month first.
+ */
+function headerDay(value) {
+  const v = String(value || '').replace(/[*,]/g, ' ').replace(/\s+/g, ' ');
+  let y = 0;
+  let m = 0;
+  let d = 0;
+  let x;
+  if ((x = /\b(\d{4})-(\d{1,2})-(\d{1,2})\b/.exec(v))) [y, m, d] = [x[1], x[2], x[3]].map(Number);
+  else if ((x = HEADER_DMY.exec(v))) [d, m, y] = [Number(x[1]), monthNumber(x[2]), Number(x[3])];
+  else if ((x = HEADER_MDY.exec(v))) [m, d, y] = [monthNumber(x[1]), Number(x[2]), Number(x[3])];
+  else if ((x = /(?<![\d/.-])(\d{1,2})[/.-](\d{1,2})[/.-](\d{4}|\d{2})(?![\d/.-])/.exec(v))) {
+    const [a, b] = [Number(x[1]), Number(x[2])];
+    y = x[3].length === 2 ? 2000 + Number(x[3]) : Number(x[3]);
+    if (a > 12) [d, m] = [a, b];
+    else if (b > 12 || a === b) [m, d] = [a, b];
+    else return null; // which comes first is a guess
+  }
+  if (!m || y < 1990 || y > 2100) return null;
+  const t = new Date(Date.UTC(y, m - 1, d));
+  if (t.getUTCFullYear() !== y || t.getUTCMonth() !== m - 1 || t.getUTCDate() !== d) return null;
+  return t.toISOString().slice(0, 10);
 }
 
 function senderName(value) {
@@ -136,7 +183,8 @@ function unquote(lines, i) {
 
 // Drops '>' quoted lines and their attributions (inline answers between them stay),
 // cuts the quoted history under an Outlook-style header in a reply, and keeps
-// forwarded messages as labelled segments. Returns [{ label, text }].
+// forwarded messages as labelled segments. Returns [{ label, text, date }]: date is the
+// day a forwarded segment was sent ('YYYY-MM-DD', from its header), or null.
 function splitQuoted(text, subject = '') {
   const lines = text.split('\n');
   const isReply = REPLY_SUBJECT.test(subject);
@@ -144,7 +192,7 @@ function splitQuoted(text, subject = '') {
   // '>' lines are old history only in a reply or under a "… wrote:" attribution. Elsewhere
   // (a booking site quoting a guest, an HTML <blockquote>) they are the content itself.
   const dropQuotes = isReply || lines.some((_, k) => attributionLength(lines, k) > 0);
-  const segments = [{ label: null, lines: [] }];
+  const segments = [{ label: null, date: null, lines: [] }];
   let hasContent = false; // any text kept yet
   for (let i = 0; i < lines.length; i++) {
     // Apple Mail's HTML puts a forwarded message, marker and all, in a blockquote. Unquote
@@ -169,7 +217,7 @@ function splitQuoted(text, subject = '') {
       if (isReply && !forwarded && hasContent) break; // the rest is the thread being replied to
       const from = block ? ` from ${block.from}` : '';
       const first = forwarded && segments.length === 1;
-      segments.push({ label: `${first ? 'Forwarded' : 'Earlier'} message${from}:`, lines: [] });
+      segments.push({ label: `${first ? 'Forwarded' : 'Earlier'} message${from}:`, date: block ? block.date : null, lines: [] });
       i = (block ? block.end : j) - 1;
       continue;
     }
@@ -181,7 +229,7 @@ function splitQuoted(text, subject = '') {
     segments[segments.length - 1].lines.push(line);
     if (line.trim()) hasContent = true;
   }
-  return segments.map((s) => ({ label: s.label, text: s.lines.join('\n') }));
+  return segments.map((s) => ({ label: s.label, date: s.date, text: s.lines.join('\n') }));
 }
 
 // ---------- Signatures ----------
@@ -486,7 +534,28 @@ const RECEIPT_RE = /\b(?:your receipt|receipt (?:for|from|no\.?|number|#)|invoic
 const BULK_CUES = /\bunsubscribe\b|\bview (?:this (?:email|message) |it )?(?:in|on) (?:your |a |the )?(?:browser|web)\b|\byou(?:'re| are) receiving this\b|\b(?:manage|update) (?:your )?(?:email |subscription |mailing )?preferences\b/i;
 const BULK_SENDER = /^(?:newsletters?|news|marketing|offers|deals|promos?|promotions)[-._+@]/i;
 const PROMO_RE = /\d+% off\b|\b(?:sale|deals?|offers?|discounts?|promo(?:tion)?s?|vouchers?|coupons?|clearance)\b/i;
+// "offer you the role", "an offer of £250,000", "a job offer", "the sale of the house", "for
+// sale", "completion of the sale": an offer or a sale, but not marketing.
+const NOT_PROMO = /\boffer(?:s|ed|ing)? (?:you|of)\b|\b(?:job|employment|formal|written|verbal|conditional|unconditional) offers?\b|\bcompletion of the sale\b|\bsale of(?! the (?:year|century|season|summer|winter|spring|autumn)\b)|\bfor sale\b/gi;
 const NOTIFY_SENDER = /(?:^|[-._+])(?:no[-_]?reply|do[-_]?not[-_]?reply)(?:[-._+@]|$)|^(?:notifications?|alerts?|mailer(?:-daemon)?|bounces?)[-._+@]|@(?:mailer|notifications?|alerts?|bounces?)\./i;
+// A question or request put to the reader ("Can you drop the keys round on Saturday?"). A
+// receipt's "Need help?" or "Would you like to rate your order?" is not one.
+const READER_ASK = /\b(?:can|could|would|will) you\b|\b(?:are|do|did|have) you\b[^.!?\n]*\?/i;
+const STOCK_ASK = /\b(?:did you know|would you like|(?:have|got) (?:a|any) (?:questions?|queries)|do you have (?:any )?(?:questions?|queries)|need (?:any )?help|how (?:did we do|likely|was your)|(?:leave|write) (?:us )?a review|(?:rate|review) (?:us|our|your (?:order|purchase|experience|stay|visit|delivery|driver))|(?:give|leave|share|send) (?:us )?(?:your |some )?feedback|survey|recommend us|unsubscribe|preferences|not you|wasn't you|was this you)\b/i;
+const asksReader = (s) => (READER_ASK.test(s) || (/\bplease\b/i.test(s) && FIRST_PERSON.test(s))) && !STOCK_ASK.test(s);
+
+// Whether `re` matches somewhere other than the writer's own sentences: a person's "I had to
+// unsubscribe from everything" is not a newsletter footer. Looks at the first 100 matches.
+function saidByOthers(re, s) {
+  let n = 0;
+  for (const m of s.matchAll(new RegExp(re.source, 'gi'))) {
+    if (++n > 100) break;
+    const head = s.slice(Math.max(0, m.index - 300), m.index).split(/[.!?](?=\s)|\n/).pop();
+    const tail = s.slice(m.index + m[0].length, m.index + m[0].length + 300).split(/[.!?](?=\s|$)|\n/)[0];
+    if (!FIRST_PERSON.test(`${head}${m[0]}${tail}`)) return true;
+  }
+  return false;
+}
 
 // `massMail` is true only on strong evidence (List-* headers passed in as `bulk`, or a
 // newsletter-style sender); only then are actions and urgency switched off.
@@ -495,8 +564,9 @@ function classify({ from = '', subject = '', text = '', bulk = false }) {
   const s = `${subject || ''}\n${text}`.replace(/’/g, "'");
   const massMail = Boolean(bulk) || BULK_SENDER.test(f);
   let category = 'person';
-  if (RECEIPT_RE.test(s)) category = 'receipt';
-  else if (massMail || BULK_CUES.test(s) || /\bnewsletter\b/i.test(subject || '')) category = PROMO_RE.test(s) ? 'promo' : 'newsletter';
+  // "Payment received for the van, thanks. Can you drop the keys round?" is a person writing.
+  if (saidByOthers(RECEIPT_RE, s) && !splitSentences(s.slice(0, DETAIL_LIMIT)).some(asksReader)) category = 'receipt';
+  else if (massMail || saidByOthers(BULK_CUES, s) || /\bnewsletter\b/i.test(subject || '')) category = PROMO_RE.test(s.replace(NOT_PROMO, ' ')) ? 'promo' : 'newsletter';
   else if (NOTIFY_SENDER.test(f)) category = 'notification';
   return { category, massMail };
 }
@@ -672,6 +742,10 @@ const DETAIL_LIMIT = 50_000;
  * @param {{ text?: string, html?: string, subject?: string, from?: string, bulk?: boolean }} email
  *   bulk: optional, and true switches off actions and questions. The app leaves it out:
  *   mailing-list headers are weighed in triage.js, where they can't hide a real ask.
+ * @returns {object} body, keyPoints, questions, actions, dates, times, amounts, links,
+ *   category, urgency, stats, and forwarded: [{ at, date }], one per forwarded or quoted
+ *   message kept in the body: `at` is where its "Forwarded message…:" label starts in body,
+ *   `date` the day it was sent ('YYYY-MM-DD', from its Date:/Sent: header) or null if unknown.
  */
 function clean(email = {}) {
   const raw = (typeof email.text === 'string' && email.text.trim()) ? email.text : htmlToText(email.html);
@@ -685,40 +759,34 @@ function clean(email = {}) {
   // email (a log, a huge newsletter) is kept as it is, so it cannot stall the main process.
   let room = DETAIL_LIMIT;
   let overflow = '';
-  const cleanedText = segments
-    .map(({ label, text: part }) => {
-      if (room <= 0) {
-        overflow += `\n${label || ''}\n${part}`;
-        return '';
-      }
-      let head = part;
-      if (part.length > room) {
-        const cut = part.lastIndexOf('\n', room);
-        head = part.slice(0, cut > 0 ? cut : room);
-        overflow += part.slice(head.length);
-      }
-      room -= head.length;
-      const kept = cutSignature(head)
-        .split('\n')
-        .filter((l) => !isGreetingLine(l) && !/^\s*[_=*~-]{5,}\s*$/.test(l))
-        .join('\n')
-        .trim();
-      return label ? `${label}\n\n${kept}` : kept;
-    })
-    .filter(Boolean)
-    .join('\n\n');
-
-  // Units are sentences, or the lines of a list or "Label: value" block.
-  const blocks = cleanedText
-    .split(/\n\s*\n/)
-    .map((p) => p.trim())
-    .filter(Boolean)
-    .map((p) => {
-      if (LABEL_RE.test(p)) return { label: true, units: [p] };
-      const structured = isStructured(p);
-      const units = structured ? p.split('\n').map((l) => l.replace(/[ \t]+/g, ' ').trim()).filter(Boolean) : splitSentences(p);
-      return { structured, units };
-    });
+  const overflowLabels = []; // forwarded segments that only made it into the overflow
+  // Units are sentences, or the lines of a list or "Label: value" block. A forwarded
+  // segment's label ("Forwarded message from …:") is a block of its own that keeps its date.
+  const toBlock = (p) => {
+    const structured = isStructured(p);
+    const units = structured ? p.split('\n').map((l) => l.replace(/[ \t]+/g, ' ').trim()).filter(Boolean) : splitSentences(p);
+    return { structured, units };
+  };
+  const blocks = segments.flatMap(({ label, date, text: part }) => {
+    if (room <= 0) {
+      overflow += `\n${label || ''}\n${part}`;
+      if (label) overflowLabels.push({ label, date });
+      return [];
+    }
+    let head = part;
+    if (part.length > room) {
+      const cut = part.lastIndexOf('\n', room);
+      head = part.slice(0, cut > 0 ? cut : room);
+      overflow += part.slice(head.length);
+    }
+    room -= head.length;
+    const kept = cutSignature(head)
+      .split('\n')
+      .filter((l) => !isGreetingLine(l) && !/^\s*[_=*~-]{5,}\s*$/.test(l))
+      .join('\n');
+    const paragraphs = kept.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean).map(toBlock);
+    return label ? [{ label: true, date, units: [label] }, ...paragraphs] : paragraphs;
+  });
 
   // Footer text is only dropped from the paragraphs after the last one with an ask, amount,
   // date or action, and never from the first one.
@@ -744,7 +812,25 @@ function clean(email = {}) {
   const { texts, links } = shortenUrls(keptBlocks.flatMap((b) => b.units));
   let t = 0;
   for (const b of keptBlocks) b.units = texts.slice(t, (t += b.units.length));
-  const body = keptBlocks.map((b) => (b.structured || b.overflow ? b.units.join('\n') : joinSentences(b.units))).join('\n\n');
+  // Where each forwarded segment starts in the body, with the day it was sent, so dates.js can
+  // count its "within 28 days" from then rather than from when it was forwarded.
+  const forwarded = [];
+  let at = 0;
+  const body = keptBlocks.map((b) => {
+    const piece = b.structured || b.overflow ? b.units.join('\n') : joinSentences(b.units);
+    if (b.label) forwarded.push({ at, date: b.date || null });
+    if (b.overflow) {
+      let from = 0;
+      for (const { label, date } of overflowLabels) {
+        const i = piece.indexOf(label, from);
+        if (i < 0) continue;
+        forwarded.push({ at: at + i, date: date || null });
+        from = i + label.length;
+      }
+    }
+    at += piece.length + 2;
+    return piece;
+  }).join('\n\n');
   const allSentences = keptBlocks
     .filter((b) => !b.label && !b.overflow)
     .flatMap((b) => (b.structured ? b.units.flatMap((u) => splitSentences(u.replace(LIST_MARKER, ''))) : b.units))
@@ -759,7 +845,7 @@ function clean(email = {}) {
   const marketing = massMail && (category === 'newsletter' || category === 'promo');
   const questions = marketing ? [] : uniq(allSentences.filter((s) => /\?\s*$/.test(s)));
   const actions = marketing ? [] : uniq(
-    allSentences.filter((s) => ACTION_CUES.test(s) && !/\?\s*$/.test(s) && s.length < 240),
+    allSentences.filter((s) => ACTION_CUES.test(s) && !/\?\s*$/.test(s) && s.length < 240 && !promisesToAsk(s)),
   );
   const dates = uniq([...body.matchAll(DATE_RE)].map((m) => m[0].trim()).filter(realDate));
   const times = uniq([...body.matchAll(TIME_RE)].map((m) => m[0].trim()));
@@ -780,6 +866,7 @@ function clean(email = {}) {
     times,
     amounts,
     links,
+    forwarded,
     category,
     urgency: urgent ? 'high' : (actions.length || questions.length) && personLike ? 'normal' : 'low',
     stats: { rawWords, keptWords, saved: Math.max(0, rawWords - keptWords) },

@@ -176,6 +176,30 @@ test('tighten: a negation in the 3 words before a phrase blocks it', () => {
   assert.strictEqual(tighten('We did not hear back, so in order to be safe we stopped.'), 'We did not hear back, so to be safe we stopped.');
 });
 
+test('tighten: "we need you to" becomes "please" only where it opens a clause, never inside a condition', () => {
+  for (const s of [
+    'If we need you to provide more documents, we will write to you.',
+    "We'll let you know if we need you to sign anything.",
+    'We will contact you if we would like you to attend an interview.',
+    'Let me know if I need you to bring anything.',
+    'If prices change, and we need you to sign again, we will tell you.',
+    'When we would like you to start, we will call.',
+    'Tell me whether you would be able to come.',
+    // "Would it be possible to get a copy?" doesn't say who would get it.
+    'Would it be possible to get a copy of the invoice for our records?',
+  ]) {
+    assert.strictEqual(tighten(s), s, s);
+  }
+  assert.strictEqual(tighten('Hi Will, we need you to sign the form.'), 'Hi Will, please sign the form.');
+  assert.strictEqual(tighten('The skip is booked, so we need you to move the van.'), 'The skip is booked, so please move the van.');
+  assert.strictEqual(tighten('The skip is booked; we need you to move the van.'), 'The skip is booked; please move the van.');
+  assert.strictEqual(tighten('Furthermore, we would need you to confirm by Friday.'), 'Please confirm by Friday.');
+  assert.strictEqual(tighten('Thanks. Would you be able to call me?'), 'Thanks. Could you call me?');
+  // Through the whole pipeline: a solicitor's "if" is not a request, so it doesn't lead.
+  const s = summary({ from: 'helen@wardsolicitors.example', subject: 'Your documents', sent: at(2026, 11, 3), text: 'Dear Will,\n\nThank you for sending the signed documents, which we received this morning.\n\nIf we need you to sign anything else, we will let you know.\n\nKind regards,\nHelen' });
+  assert.doesNotMatch(s.gist, /please/i);
+});
+
 test('tighten: quoted text, title case, and fewer than 3 words are left alone', () => {
   assert.strictEqual(tighten('He said "in order to win" and left.'), 'He said "in order to win" and left.');
   assert.strictEqual(tighten('He said “in order to win” and left.'), 'He said “in order to win” and left.');
@@ -255,6 +279,10 @@ test('tighten never changes a fact, and running it twice changes nothing (every 
     'Kindly note that the office will be closed in the near future.',
     'NB: in order to comply, HMRC is able to fine you £100 per day.',
     'Read the guide at [gov.uk] in order to file on a monthly basis.',
+    'If we need you to provide more documents, we will write to you.',
+    "We'll let you know if we need you to sign anything.",
+    'Hi Will, we need you to sign the form by 6 November.',
+    'Would it be possible to get a copy of the invoice for our records?',
   ]);
   for (const e of [SARAH, PRIYA, DAD, BANK, ...demo]) {
     const c = clean({ text: e.text, html: e.html, subject: e.subject, from: typeof e.from === 'string' ? e.from : e.from.address });
@@ -365,6 +393,48 @@ test('dates come from the deadlines: what it is for, the date as written, and th
   // Deadlines with no date text or a bad day don't break anything.
   const odd = heuristicSummary(cleaned, 's', '', { deadlines: [null, { text: 'Friday', sentence: 'By Friday please.', day: 'nope' }, { text: '', day: '2026-11-06' }] });
   assert.deepStrictEqual(odd.dates, [{ what: '', when: 'Friday', day: null }]);
+});
+
+test('what a deadline is for keeps its "not" or "unless" when a long one is shortened', () => {
+  const dates = (t) => summary({ from: 'membership@fitgym.example', subject: 'Renewal', sent: at(2026, 11, 3), text: t }).dates;
+  const gym = dates('Your annual membership and locker hire will renew automatically on 20 November 2026 and £480 will be taken from your card on that day unless you cancel it before 13 November by calling us.');
+  assert.deepStrictEqual(gym.find((d) => d.day === '2026-11-13'), { what: '£480 will be taken from … unless you cancel it', when: '13 November', day: '2026-11-13' });
+  const passport = dates('Please make sure you do not send the original documents or your passport to us before 20 November.');
+  assert.deepStrictEqual(passport, [{ what: '… not send the original documents or your passport to us', when: '20 November', day: '2026-11-20' }]);
+  // A long one with a negation near the end, and one without: start … end, as before.
+  const late = dates('Your new tenancy agreement for the flat at 12 Elm Road must not be signed by the guarantor before 20 November.');
+  assert.strictEqual(late[0].what, 'Your new tenancy agreement … not be signed by the guarantor');
+  const plain = dates('This is a reminder that your online Self Assessment tax return for the year must be submitted by 31 January 2027.');
+  assert.deepStrictEqual(plain[0].what, 'Your online Self Assessment tax … must be submitted');
+  for (const d of [...gym, ...passport, ...late, ...plain]) assert.ok(d.what.split(/\s+/).filter((w) => w !== '…').length <= 10, d.what);
+});
+
+test('names: an ask that speaks to the user by name leads the gist', () => {
+  const cc = { from: 'mark@ellisheating.example', subject: 'Elm Road', sent: at(2026, 11, 3), text: 'Hi Tom,\n\nCan you drain the system on Thursday?\n\nWill, could you send me the invoice by Friday? I need it for the client.\n\nThanks,\nMark' };
+  const gist = (email, names, extra = {}) => {
+    const cleaned = { ...clean({ text: email.text, subject: email.subject, from: email.from }), ...extra };
+    const deadlines = findDeadlines({ subject: email.subject, body: cleaned.body, questions: cleaned.questions, actions: cleaned.actions }, email.sent);
+    return heuristicSummary(cleaned, email.subject, email.text, { deadlines, names }).gist;
+  };
+  assert.strictEqual(gist(cc, ['will']), 'Will, could you send me the invoice by Friday?');
+  // Without names, or with someone else's, the first ask leads as before.
+  assert.strictEqual(gist(cc, []), 'Can you drain the system on Thursday?');
+  assert.strictEqual(gist(cc, undefined), 'Can you drain the system on Thursday?');
+  assert.strictEqual(gist(cc, ['sam']), 'Can you drain the system on Thursday?');
+  // Odd values are ignored; capitals in the names don't matter.
+  assert.strictEqual(gist(cc, [42, null, 'w', 'Will']), 'Will, could you send me the invoice by Friday?');
+  // The name at the end, or in the middle, counts; "Will you…" and "the will" don't.
+  const end = { ...cc, text: 'Can you drain the system on Thursday? And can you send me the invoice by Friday, Will?' };
+  assert.strictEqual(gist(end, ['will']), 'And can you send me the invoice by Friday, Will?');
+  const middle = { ...cc, text: 'Can you drain the system on Thursday? Could you, Will, send me the invoice?' };
+  assert.strictEqual(gist(middle, ['will']), 'Could you, Will, send me the invoice?');
+  const modal = { ...cc, text: 'Can you drain the system on Thursday? Will you send me the invoice? Please read the will of the client.' };
+  assert.strictEqual(gist(modal, ['will']), 'Can you drain the system on Thursday?');
+  // In a group's email (a newsletter to the cleaner) the named ask leads; in a promotion it doesn't.
+  const group = { from: 'jane.doe@example.net', subject: '[Harrow Juniors] Match', sent: at(2026, 11, 3), text: 'Hi all,\n\nThe match is moved to Sunday 8 November at 10am. Please confirm your child can play by Thursday.\n\nWill, could you bring the corner flags?\n\nThanks, Jane\n\n--\nTo unsubscribe from this group, send an email to harrow-juniors+unsubscribe@example.net.' };
+  assert.strictEqual(clean({ text: group.text, from: group.from }).category, 'newsletter');
+  assert.strictEqual(gist(group, ['will']), 'Will, could you bring the corner flags?');
+  assert.notStrictEqual(gist(group, ['will'], { category: 'promo' }), 'Will, could you bring the corner flags?');
 });
 
 test('word counts: "Short version: 38 of 205 words"', () => {

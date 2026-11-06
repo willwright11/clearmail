@@ -8,12 +8,13 @@ const demo = require('../src/demo');
 const { buildSentBatch } = require('../src/demo-sent');
 const history = require('../src/history');
 const { briefWindow } = require('../src/brief');
+const { replyTarget } = require('../src/reply-target');
 
 const HOUR = 3600_000;
 const DAY = 24 * HOUR;
 const NOW = new Date(2026, 10, 3, 9, 15).getTime(); // Tue 3 Nov 2026, 09:15
 const EMAIL_VIEW = ['accountEmail', 'accountId', 'attachments', 'canOpen', 'cleanedBody', 'date', 'done', 'from', 'id', 'isNew', 'links', 'notNoise',
-  'original', 'receivedAt', 'replyTo', 'seen', 'senderRule', 'subject', 'summary', 'triage'];
+  'original', 'receivedAt', 'replyNote', 'replyTarget', 'replyTo', 'seen', 'senderRule', 'subject', 'summary', 'triage'];
 
 function raw(id, extra = {}) {
   const date = extra.date || new Date(NOW - HOUR).toISOString();
@@ -107,6 +108,7 @@ test('buildEmailView: exactly the contract fields, as plain text, never the HTML
   assert.deepStrictEqual(Object.keys(v).sort(), EMAIL_VIEW);
   assert.deepStrictEqual(v.from, { name: 'bob@example.com', address: 'bob@example.com' });
   assert.deepStrictEqual(v.replyTo, { name: 'help@example.com', address: 'help@example.com' });
+  assert.deepStrictEqual([v.replyTarget, v.replyNote], [{ name: 'help@example.com', address: 'help@example.com' }, null]);
   assert.strictEqual(v.date, new Date(NOW).toISOString(), 'a bad date reads as now');
   assert.strictEqual(v.receivedAt, v.date);
   assert.deepStrictEqual(v.attachments, [{ filename: 'a.pdf', size: 20 }, { filename: 'attachment', size: 3 }]);
@@ -114,6 +116,99 @@ test('buildEmailView: exactly the contract fields, as plain text, never the HTML
   assert.ok(!JSON.stringify(v).includes('ItemID'), 'the Outlook link stays in main');
   assert.deepStrictEqual([v.isNew, v.done, v.notNoise, v.senderRule, v.canOpen], [true, false, false, null, true]);
   assert.strictEqual(view.buildEmailView(item(r), { triage: {}, senderRule: 'delete' }).senderRule, null);
+});
+
+test('buildEmailView: one address a reply goes to, the one both backends send to', () => {
+  const ev = (extra) => view.buildEmailView(item(raw('r1', extra)), { triage: {}, now: NOW });
+  const reply = (v) => [v.replyTarget, v.replyTo, v.replyNote];
+  assert.deepStrictEqual(reply(ev({})), [{ name: 'Ann', address: 'ann@example.com' }, null, null], 'From, by default');
+
+  // "Kestrel Bank Fraud Team <fraud-team>" is no address: the reply goes to From, and the
+  // reply box says From (it used to name the Reply-To while the reply went to From).
+  const bank = { name: 'Kestrel Bank', address: 'alerts@kestrel-secure.example' };
+  assert.deepStrictEqual(reply(ev({ from: bank, replyTo: { name: 'Kestrel Bank Fraud Team', address: 'fraud-team' } })), [bank, null, null]);
+
+  // A Reply-To on the sender's own domain, as universities and shops use: no note.
+  const library = { name: 'Library', address: 'library@lboro.ac.uk' };
+  assert.deepStrictEqual(reply(ev({ from: { name: 'Student Services', address: 'noreply@lboro.ac.uk' }, replyTo: library })), [library, library, null]);
+  // On another domain: the box says where it really goes.
+  const elsewhere = ev({ from: { name: 'Kestrel Bank', address: 'alerts@kestrelbank.example' }, replyTo: { name: '', address: ' Support@Kestrel-Help.example ' } });
+  const support = { name: 'support@kestrel-help.example', address: 'support@kestrel-help.example' };
+  assert.deepStrictEqual(reply(elsewhere), [support, support, 'Replies go to support@kestrel-help.example, not the address it came from.']);
+
+  // No address at all: nothing to reply to (Reply is turned off, and main refuses it).
+  assert.deepStrictEqual(reply(ev({ from: { name: 'Mail Delivery System', address: '' }, replyTo: { name: 'x', address: 'nobody' } })), [null, null, null]);
+  assert.deepStrictEqual(reply(ev({ from: { name: 'Odd', address: 'not an address' }, replyTo: null })), [null, null, null]);
+
+  // Graph lists every Reply-To address: only the first real one is ever used.
+  const list = { from: bank, replyTo: [{ name: 'x', address: 'fraud-team' }, { name: 'Support', address: 'support@kestrel-help.example' }, { name: 'y', address: 'collector@attacker.example' }] };
+  assert.deepStrictEqual(replyTarget(list), { name: 'Support', address: 'support@kestrel-help.example' });
+  // Every sample email can be answered.
+  for (const m of demoView().emails) assert.ok(m.replyTarget && m.replyTarget.address === m.from.address, m.id);
+});
+
+test('firstNames: the first word of each account name, lower-cased, letters only, 2 letters or more', () => {
+  assert.deepStrictEqual(view.firstNames(['Will Wright', 'WILL W', '  Ann-Marie Jones', 'J Smith', '', null, 42, 'Zoë Ball', 'Will,']), ['will', 'annmarie', 'zoë']);
+  assert.deepStrictEqual(view.firstNames([]), []);
+  assert.deepStrictEqual(view.firstNames([demo.ME.name]), ['will']);
+});
+
+test('prepareEmail and buildBriefView pass on the user\'s names and the forwarded parts', () => {
+  const paths = Object.fromEntries(['cleaner', 'summarize', 'dates', 'triage'].map((n) => [n, require.resolve(`../src/${n}`)]));
+  const viewPath = require.resolve('../src/view');
+  const real = Object.fromEntries(Object.entries(paths).map(([n, p]) => [n, require.cache[p].exports]));
+  const seen = { summary: [], deadlines: [], triage: [] };
+  const forwarded = [{ at: 12, date: '2026-10-30T09:00:00.000Z' }];
+  require.cache[paths.cleaner].exports = { ...real.cleaner, clean: (...args) => ({ ...real.cleaner.clean(...args), forwarded }) };
+  require.cache[paths.summarize].exports = {
+    ...real.summarize,
+    heuristicSummary: (...args) => { seen.summary.push(args[3]); return real.summarize.heuristicSummary(...args); },
+  };
+  require.cache[paths.dates].exports = { ...real.dates, findDeadlines: (...args) => { seen.deadlines.push(args); return real.dates.findDeadlines(...args); } };
+  require.cache[paths.triage].exports = { ...real.triage, triageAll: (...args) => { seen.triage.push(args[1]); return real.triage.triageAll(...args); } };
+  delete require.cache[viewPath];
+  try {
+    const v = require('../src/view');
+    const r = raw('n1', { cc: [{ name: 'Will', address: 'will@example.com' }], to: [{ name: 'Ann', address: 'ann@example.com' }], text: 'Hi Ann,\n\nWill, could you send the forms by Friday?\n\nThanks' });
+    const p = v.prepareEmail(r, { names: ['will'] });
+    assert.deepStrictEqual(seen.summary[0].names, ['will']);
+    assert.strictEqual(seen.summary[0].deadlines, p.deadlines);
+    const [input, ref, opts] = seen.deadlines[0];
+    assert.strictEqual(input.forwarded, forwarded, 'the cleaner\'s forwarded parts reach findDeadlines');
+    assert.strictEqual(input.body, p.cleaned.body);
+    assert.deepStrictEqual([ref, opts], [r.date, { order: 'dmy' }]);
+    // Worked out again when the names change (an account renamed), not otherwise.
+    assert.strictEqual(v.prepareEmail(r, { names: ['will'], previous: p }), p);
+    assert.notStrictEqual(v.prepareEmail(r, { names: ['bill'], previous: p }), p);
+    assert.deepStrictEqual(seen.summary.at(-1).names, ['bill']);
+    // No names: an empty list, never undefined.
+    v.prepareEmail(raw('n2'));
+    assert.deepStrictEqual(seen.summary.at(-1).names, []);
+
+    v.buildBriefView({
+      now: NOW, demo: false, demoReason: null, since: NOW - DAY, sinceLabel: '', accounts: [], history: null, marks: null,
+      items: [{ id: 'acc1:n1', accountId: 'acc1', accountEmail: 'will@example.com', raw: r, prep: p, canOpen: true }], names: ['will'],
+    });
+    assert.deepStrictEqual(seen.triage[0].names, ['will'], 'the TriageContext gets the names');
+    v.buildBriefView({ now: NOW, demo: false, demoReason: null, since: NOW - DAY, sinceLabel: '', accounts: [], history: null, marks: null, items: [] });
+    assert.deepStrictEqual(seen.triage[1].names, []);
+
+    // An email the cleaner chokes on has no forwarded parts.
+    require.cache[paths.cleaner].exports = { ...real.cleaner, clean: () => { throw new Error('boom'); } };
+    delete require.cache[viewPath];
+    const original = console.error;
+    console.error = () => {};
+    try {
+      require('../src/view').prepareEmail(raw('n3'));
+    } finally {
+      console.error = original;
+    }
+    assert.deepStrictEqual(seen.deadlines.at(-1)[0].forwarded, []);
+  } finally {
+    for (const [n, p] of Object.entries(paths)) require.cache[p].exports = real[n];
+    delete require.cache[viewPath];
+    require('../src/view');
+  }
 });
 
 test('buildBriefView: the demo inbox sorts as designed, in display order, with counts', () => {

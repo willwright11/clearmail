@@ -164,6 +164,46 @@ test('briefCounts: needs you over 30 days, the rest since the window, done left 
   assert.deepStrictEqual(briefCounts(null, { since: SINCE, now: NOW }), { needsYou: 0, needsYouNew: 0, worthKnowing: 0, noise: 0, done: 0 });
 });
 
+test('briefCounts: a Needs-you email older than 30 days still counts when it is due soon, flagged or always important', () => {
+  const old = (extra, triage = {}) => item('needs-you', 24 * 45, { ...extra, triage: { bucket: 'needs-you', reasons: ['Due soon'], codes: ['deadline-soon'], deadline: null, ...triage } });
+  const due = (daysAway) => ({ text: '31 January 2027', day: '2027-01-31', label: 'Sun 31 Jan', daysAway, uncertain: false, time: null });
+  const counted = (it) => briefCounts([it], { since: SINCE, now: NOW }).needsYou;
+  assert.strictEqual(counted(old({})), 0, 'old and nothing at stake: left out, as before');
+  assert.strictEqual(counted(old({}, { deadline: due(11) })), 1, 'due in 11 days');
+  assert.strictEqual(counted(old({}, { deadline: due(14) })), 1);
+  assert.strictEqual(counted(old({}, { deadline: due(0) })), 1, 'due today');
+  assert.strictEqual(counted(old({}, { deadline: due(-3) })), 1, 'overdue');
+  assert.strictEqual(counted(old({}, { deadline: due(15) })), 0, 'more than two weeks off');
+  assert.strictEqual(counted(old({}, { deadline: { daysAway: NaN } })), 0);
+  assert.strictEqual(counted(old({}, { codes: ['flagged'] })), 1, 'flagged in Outlook');
+  assert.strictEqual(counted(old({ flagged: true })), 1);
+  assert.strictEqual(counted(old({}, { codes: ['rule-important'] })), 1, 'from a sender marked always important');
+  assert.strictEqual(counted(old({ senderRule: 'important' })), 1);
+  assert.strictEqual(counted(old({ done: true }, { deadline: due(3) })), 0, 'done is done');
+  // Only Needs you is counted this way; old Worth knowing stays out of the window.
+  assert.strictEqual(briefCounts([item('worth-knowing', 24 * 45, { triage: { bucket: 'worth-knowing', deadline: due(3) } })], { since: SINCE, now: NOW }).worthKnowing, 0);
+});
+
+test("The HMRC reminder from November needs you in the brief on 20 January (real pipeline)", () => {
+  const triage = require('../src/triage');
+  const real = require('./fixtures/real-emails');
+  // Received on 1 Nov 2026, about the 31 Jan 2027 deadline; the brief is on 20 Jan 2027 at 07:30.
+  const now = local(2027, 1, 20, 7, 30);
+  const raw = real.raw({
+    id: 'hmrc-november', date: '2026-11-01T10:00:00.000Z', from: { name: 'HMRC', address: 'noreply@notifications.service.gov.uk' },
+    subject: 'Action required: your Self Assessment tax return', headers: real.LU,
+    text: 'Your online Self Assessment tax return must be submitted by 31 January 2027.',
+  });
+  const result = triage.triage(real.prepare(raw), { now, me: new Set([real.ME.address]), names: real.NAMES, historyKnown: true });
+  assert.strictEqual(result.bucket, 'needs-you');
+  assert.strictEqual(result.reasons[0], 'Due Sun 31 Jan');
+  const view = { id: raw.id, receivedAt: raw.receivedAt, triage: result, done: false };
+  const { since, label } = briefWindow(now, { lastAt: now - DAY, lastSince: now - 2 * DAY });
+  const counts = briefCounts([view], { since, now });
+  assert.deepStrictEqual(counts, { needsYou: 1, needsYouNew: 0, worthKnowing: 0, noise: 0, done: 0 });
+  assert.strictEqual(briefText(counts, { sinceLabel: label }).body, '1 needs you');
+});
+
 test('briefText: counts with plurals, zeros left out, and the quiet and failed variants', () => {
   const text = (counts, opts) => briefText({ needsYou: 0, needsYouNew: 0, worthKnowing: 0, noise: 0, done: 0, ...counts }, opts);
   assert.deepStrictEqual(text({ needsYou: 2, worthKnowing: 5, noise: 23 }), { title: 'Morning brief', body: '2 need you · 5 worth knowing · 23 noise hidden' });
@@ -335,6 +375,40 @@ test('scheduler: retries carry on just past the catch-up time, then stop', async
   assert.strictEqual(await h.at(2026, 11, 3, 18, 3), 'failed');
   assert.strictEqual(await h.at(2026, 11, 3, 18, 8), 'failed');
   assert.deepStrictEqual(h.calls.map((c) => c.final), [false, false, false, true]);
+});
+
+test('scheduler: a late brief that keeps failing gets its 3rd try and the final notice just after midnight', async () => {
+  const h = harness({ settings: { brief: { ...EVERY_DAY, time: '23:50' } } });
+  h.result = () => ({ ok: false });
+  assert.strictEqual(await h.at(2026, 11, 3, 23, 50), 'failed');
+  assert.strictEqual(await h.at(2026, 11, 3, 23, 55), 'failed');
+  assert.strictEqual(await h.at(2026, 11, 4, 0, 0), 'failed', 'the 3rd try, after midnight');
+  assert.deepStrictEqual(h.calls.map((c) => [c.slot, c.final]), [
+    [local(2026, 11, 3, 23, 50), false], [local(2026, 11, 3, 23, 50), false], [local(2026, 11, 3, 23, 50), false], [local(2026, 11, 3, 23, 50), true],
+  ]);
+  // That brief is over, and the new day's comes at its own time.
+  h.result = () => ({ ok: true });
+  assert.strictEqual(await h.at(2026, 11, 4, 0, 5), 'not-due');
+  assert.strictEqual(await h.at(2026, 11, 4, 23, 49), 'not-due');
+  assert.strictEqual(await h.at(2026, 11, 4, 23, 50), 'delivered');
+  assert.strictEqual(h.calls.at(-1).slot, local(2026, 11, 4, 23, 50));
+});
+
+test('scheduler: a late brief that fails once and then works just after midnight is delivered once', async () => {
+  const h = harness({ settings: { brief: { ...EVERY_DAY, time: '23:58' } } });
+  h.result = () => ({ ok: false });
+  assert.strictEqual(await h.at(2026, 11, 3, 23, 58), 'failed');
+  h.result = () => ({ ok: true });
+  assert.strictEqual(await h.at(2026, 11, 4, 0, 3), 'delivered', "yesterday's brief, retried");
+  assert.strictEqual(h.calls.at(-1).slot, local(2026, 11, 3, 23, 58));
+  assert.strictEqual(await h.at(2026, 11, 4, 0, 10), 'not-due');
+  // Past the retry window (the catch-up time plus two retries), a failure is not retried.
+  const late = harness({ settings: { brief: { ...EVERY_DAY, time: '23:58' } } });
+  late.result = () => ({ ok: false });
+  assert.strictEqual(await late.at(2026, 11, 3, 23, 58), 'failed');
+  late.result = () => ({ ok: true });
+  assert.strictEqual(await late.at(2026, 11, 4, 0, 11), 'not-due');
+  assert.strictEqual(late.calls.length, 1);
 });
 
 test('scheduler: two checks at once deliver only one brief', async () => {

@@ -243,6 +243,9 @@ function tidyEmail(m) {
     accountEmail: str(m?.accountEmail), // the user's address it was sent to; replies go out from it
     from: { name: str(from.name) || str(from.address) || 'Unknown sender', address: str(from.address) },
     replyTo: tidyAddress(m?.replyTo),
+    // Where a reply goes, worked out by main (null: there is no address to reply to).
+    replyTarget: tidyAddress(m?.replyTarget),
+    replyNote: str(m?.replyNote) || null, // "Replies go to …, not the address it came from."
     subject: str(m?.subject),
     date: iso,
     receivedAt: Number.isNaN(received.getTime()) ? iso : received.toISOString(),
@@ -280,8 +283,15 @@ const ruleKey = (m) => m.from.address.trim().toLowerCase();
 
 // ---------- the BriefView ----------
 
+// A reply still waiting (or one that failed) keeps its email on screen until it is resolved,
+// even if a refresh no longer lists that email, so Undo, Retry and Edit stay within reach.
+const hasOpenReply = (id) => repliesFor(id).some((r) => r.status === 'pending' || r.status === 'failed');
+
 function applyView(view) {
   const emails = arr(view.emails).map(tidyEmail).filter((m) => m.id);
+  const ids = new Set(emails.map((m) => m.id));
+  const kept = state.emails.filter((m) => !ids.has(m.id) && hasOpenReply(m.id));
+  emails.push(...kept);
   state.emails = emails;
   state.byId = new Map(emails.map((m) => [m.id, m]));
   state.accounts = arr(view.accounts).map(tidyAccount).filter((a) => a.id);
@@ -603,15 +613,22 @@ function isSendKey(e) {
 
 const repliesFor = (id) => state.replies.get(id) || [];
 const pendingReply = (id) => repliesFor(id).find((r) => r.status === 'pending') || null;
-const replyTarget = (m) => m.replyTo || m.from;
+// The one address main sends the reply to; null when the email has none.
+const replyTarget = (m) => m.replyTarget || null;
+const targetName = (m) => (replyTarget(m) ? replyTarget(m).name || replyTarget(m).address : m.from.name);
+const NO_REPLY_ADDRESS = 'This email has no address to reply to.';
 
 function replyFromLine(m) {
   const to = replyTarget(m);
+  if (!to) return el('p', { class: 'reply-from' }, NO_REPLY_ADDRESS);
   const from = m.accountEmail || (state.demo ? 'the demo account' : 'your account');
   return el('p', { class: 'reply-from' },
     'From ', el('b', {}, from), ' to ', el('b', {}, to.name || to.address),
     to.name && to.address && to.name !== to.address ? el('span', { class: 'addr' }, ` (${to.address})`) : null);
 }
+
+// Said in the reply box when the reply goes to another domain than the sender's.
+const replyNoteLine = (m) => (m.replyNote ? el('p', { class: 'caution reply-note', role: 'note' }, m.replyNote) : null);
 
 function autosize(t) {
   if (!t || !t.isConnected || !t.offsetParent) return; // hidden: measuring now would collapse it
@@ -623,6 +640,15 @@ function autosize(t) {
 function composer(m, { onClose = null } = {}) {
   const pending = pendingReply(m.id);
   const to = replyTarget(m);
+  if (!to) {
+    // Nowhere to send it: say so, with no box to type into.
+    return el('div', { class: 'composer-box', 'data-for': m.id, 'data-pending': 'false', 'data-no-reply': 'true' },
+      replyFromLine(m),
+      el('div', { class: 'composer-actions' },
+        el('span', { class: 'composer-hint' }, 'Reply to it in your usual mail app instead.'),
+        onClose ? el('button', { type: 'button', class: 'btn', 'data-act': 'reply-close', onclick: () => onClose() }, 'Close') : null,
+        el('button', { type: 'button', class: 'btn primary', 'data-act': 'send', disabled: true, title: NO_REPLY_ADDRESS }, 'Send')));
+  }
   const input = el('textarea', {
     rows: 3, 'data-act': 'reply-text', placeholder: 'Write your reply',
     'aria-label': `Reply to ${to.name || to.address}`,
@@ -644,6 +670,7 @@ function composer(m, { onClose = null } = {}) {
     },
   },
   replyFromLine(m),
+  replyNoteLine(m),
   input,
   el('div', { class: 'composer-actions' },
     hint,
@@ -667,6 +694,10 @@ function composerKey(e, m, input, hint, onClose) {
 
 function submitReply(m, input, hint) {
   const body = input.value.trim();
+  if (!replyTarget(m)) {
+    if (hint) hint.textContent = NO_REPLY_ADDRESS;
+    return;
+  }
   if (pendingReply(m.id)) {
     if (hint) hint.textContent = 'Wait for your last reply to send, or undo it first.';
     return;
@@ -682,7 +713,7 @@ function submitReply(m, input, hint) {
 // Hands the reply to main, which waits 5 seconds before sending it. The result arrives later
 // on reply:result (handleReplyResult).
 async function queueReply(m, body) {
-  if (pendingReply(m.id)) return;
+  if (pendingReply(m.id) || !replyTarget(m)) return;
   const entry = {
     body, date: new Date().toISOString(), status: 'pending', error: null,
     sendAt: Date.now() + 5000, undoing: false, accountEmail: m.accountEmail,
@@ -701,7 +732,7 @@ async function queueReply(m, body) {
     if (entry.status !== 'pending') return;
     entry.status = 'failed';
     entry.error = errText(err);
-    notice(`Your reply to ${replyTarget(m).name || replyTarget(m).address} wasn't sent: ${entry.error}`);
+    notice(`Your reply to ${targetName(m)} wasn't sent: ${entry.error}`);
   }
   renderAll();
 }
@@ -719,7 +750,7 @@ function handleReplyResult(data) {
   } else {
     entry.status = 'failed';
     entry.error = str(data?.error) || 'Something went wrong. Please try again.';
-    const who = m ? replyTarget(m).name || replyTarget(m).address : 'them';
+    const who = m ? targetName(m) : 'them';
     notice(`Your reply to ${who} wasn't sent: ${entry.error}`);
   }
   renderAll();
@@ -752,7 +783,8 @@ async function undoReply(m) {
   } else {
     entry.tooLate = true;
     renderAll();
-    if (entry.status === 'pending') notice('Too late to undo: the reply is already on its way.');
+    if (res?.sending) notice("Too late to undo — it's being sent.");
+    else if (entry.status === 'pending') notice('Too late to undo: the reply is already on its way.');
   }
 }
 

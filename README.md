@@ -15,7 +15,7 @@ ClearMail **reads** your email and **sends only the replies you write**. It can'
 The **Brief** tab is ClearMail's main screen. It sorts the email from all your accounts into four parts:
 
 - **Needs you:** a person asking you a question or to do something, a deadline coming up (a tax return, a bill, a form to hand in), a payment due, an email you flagged in Outlook, or anyone you marked **Always important**. The most urgent come first: overdue, then the soonest deadline.
-- **Worth knowing:** receipts, order updates, emails you're only copied (CC'd) on, emails you've already replied to, security alerts, newsletters you usually open, and deadlines further away. New ones since your last brief are at the top; older ones are under **Earlier**.
+- **Worth knowing:** receipts, order updates, emails you're only copied (CC'd) on (unless they ask you by name, like *"Will, could you…"*), emails you've already replied to, security alerts, newsletters you usually open, and deadlines further away. New ones since your last brief are at the top; older ones are under **Earlier**.
 - **Noise** (folded away): promotions, newsletters you never open, old sign-in codes, and senders you chose **Always noise**. For example "7 hidden: 5 newsletters, 1 promotion, 1 old sign-in code". **Noise is only hidden, never deleted:** open it any time to read an email or click **Not noise**.
 - **Done** (folded away): emails you've dealt with. Replying from ClearMail marks an email done. **Undo** puts it back.
 
@@ -29,7 +29,11 @@ Each email shows:
 The buttons on each email:
 
 - **Read** opens the short version and the **full original email** (with a switch to the cleaned version) right there. Nothing the cleaner removed is out of reach.
-- **Reply** opens a reply box. It always says which of your addresses the reply comes **from** and who it goes **to**. Press **Send** or **⌘↩** (a plain Enter just starts a new line). ClearMail then waits **5 seconds** and shows **Sending… Undo**, so you can change your mind. The reply goes to the sender (or the Reply-To address the email asks for), from the account the email was sent to.
+- **Reply** opens a reply box. It always says which of your addresses the reply comes **from** and who it goes **to**. Press **Send** or **⌘↩** (a plain Enter just starts a new line). ClearMail then waits **5 seconds** and shows **Sending… Undo**, so you can change your mind. The reply goes to one address only: the sender, or the first Reply-To address the email asks for. It's sent from the account the email was sent to.
+  - If the Reply-To address ends differently from the sender's (the part after the @), the reply box warns you in yellow: *"Replies go to …, not the address it came from."* Fake bank emails often do this, so check the address before you send.
+  - If an email has no address to reply to, **Reply** is greyed out. Reply to it from your usual mail app instead.
+  - If you close the window or quit ClearMail during the 5 seconds, it asks first. **Don't close** (or **Don't quit**) keeps the reply and its Undo. **Close without sending** (or **Quit without sending**) means it isn't sent. If your Mac shuts down, restarts or logs out, a waiting reply isn't sent.
+  - Once the 5 seconds are up, the reply is on its way and can't be undone. If you press Undo just too late, ClearMail says *"Too late to undo — it's being sent."*
 - **✓ Done** moves it to Done (only in ClearMail; nothing changes in your mailbox).
 - **⋯** has **Always important**, **Always noise**, and **Open in Outlook on the web** (Outlook accounts) or **Open in Mail** (other accounts).
 
@@ -49,7 +53,7 @@ The **By person** tab groups emails by sender, like a chat. Each email has a bad
 
 ### How ClearMail decides
 
-ClearMail sorts with rules, not AI. It looks at who the email is to (you, or only CC), whether it's from a mailing list or sent automatically, whether a person asks you something, the dates in it, whether you flagged it in Outlook, whether Outlook filed it under **Other**, how often you open that sender's emails, and **who you've written to** (from your Sent folder). An email only goes to Noise if it's clearly a newsletter, a promotion or automatic, or you chose Always noise for that sender. A person asking you something, a deadline, a payment due or someone you write to is never hidden.
+ClearMail sorts with rules, not AI. It looks at who the email is to (you, or only CC, and whether it asks you by name: the first name Microsoft has for your Outlook account, or Will in demo mode), whether it's from a mailing list or sent automatically, whether a person asks you something, the dates in it, whether you flagged it in Outlook, whether Outlook filed it under **Other**, how often you open that sender's emails, and **who you've written to** (from your Sent folder). An email only goes to Noise if it's clearly a newsletter, a promotion or automatic, or you chose Always noise for that sender. A person asking you something, a deadline, a payment due or someone you write to is never hidden. In a forwarded email, dates like "within 28 days" are counted from the day the original was sent, not the day it was forwarded.
 
 It won't always be right. One click on **Always important**, **Always noise** or **Not noise** fixes a sender or an email, and ClearMail remembers it. Your rules are listed in **Settings** → **Sorting rules**, where you can remove them.
 
@@ -220,7 +224,7 @@ University and work accounts use the same steps and the same ID. However, your o
 - **ClearMail never changes your mailbox.** It can't delete, move, flag or mark anything as read:
   - **Outlook:** ClearMail only asks Microsoft for permission to read mail and send mail (plus to stay signed in and read your name and address). It has no permission to change anything, and its code refuses to send any request that would. You can take its permission back at any time: for personal accounts at <https://account.live.com/consent/Manage>, for work or university accounts in the My Apps portal at <https://myapps.microsoft.com>.
   - **Gmail, iCloud, Yahoo and others:** ClearMail opens your inbox read-only, so reading never marks anything as read. The only thing it ever adds is a copy of a reply you sent, in your Sent folder.
-- **Replies only when you press Send.** ClearMail never writes or sends anything by itself. Each reply waits 5 seconds so you can **Undo** it, and quitting ClearMail during those 5 seconds means it isn't sent. A reply only goes to the person who emailed you (or the Reply-To address their email gives), from the account the email was sent to, and the From/To line in the reply box always shows both.
+- **Replies only when you press Send.** ClearMail never writes or sends anything by itself. Each reply waits 5 seconds so you can **Undo** it. If you close the window or quit during those 5 seconds, ClearMail asks first, and if you go ahead the reply isn't sent. A reply only goes to one address: the person who emailed you, or the first Reply-To address their email gives. It's sent from the account the email was sent to, and the From/To line in the reply box always shows both. When the Reply-To address ends differently from the sender's, the reply box warns you.
 - **Your passwords and Microsoft sign-ins** are encrypted with the macOS Keychain and stored only on your Mac.
 - **What ClearMail keeps on your Mac:** your settings, your sorting rules and Done marks, and a list of the addresses you've sent email to with how many times (from your Sent folder, so it knows who you know). These files can only be read by your Mac user account. ClearMail doesn't keep the text of your emails on disk.
 - **Email HTML is never displayed.** It's converted to plain text, so tracking pixels and remote images never load. The page runs sandboxed with a strict Content Security Policy. Links open in your browser only after you confirm.

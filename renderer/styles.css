@@ -256,6 +256,7 @@ button:disabled { cursor: default; opacity: 0.55; }
 }
 .reply-from { margin: 0 0 6px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .reply-from b { color: var(--text); font-weight: 600; }
+.composer-box .reply-note { margin: 0 0 8px; } /* "Replies go to …", above the text box */
 .composer-box textarea {
   display: block; width: 100%; min-height: 72px; max-height: 260px; resize: vertical;
   border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;

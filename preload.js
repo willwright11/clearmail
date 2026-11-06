@@ -31,7 +31,8 @@ contextBridge.exposeInMainWorld('clearmail', {
   // Resolves { queued: true, sendAt }: main sends it after 5 seconds unless undoReply is
   // called first. The outcome arrives on onReplyResult.
   reply: (id, body) => ipcRenderer.invoke('email:reply', { id, body }),
-  // Resolves { undone: true } if the reply was stopped in time.
+  // Resolves { undone: true } if the reply was stopped in time, or { undone: false, sending: true }
+  // when it is already on its way.
   undoReply: (id) => ipcRenderer.invoke('email:undoReply', { id }),
   openLink: (url) => ipcRenderer.invoke('link:open', url).then(nothing),
   // Sorting changes (kept in ClearMail only, never in the mailbox); each resolves a BriefView.

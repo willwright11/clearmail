@@ -45,7 +45,7 @@ const { splitSentences } = require('./cleaner');
  * @property {boolean|null} focused  Outlook's Focused (true) / Other (false); null over IMAP
  * @property {MailHeaders|null} headers
  * @property {string|null} webLink
- * @property {{ body: string, questions: string[], actions: string[], amounts: string[], category: string, urgency: string }} cleaned
+ * @property {{ body: string, questions: string[], actions: string[], amounts: string[], dates: string[], category: string, urgency: string }} cleaned
  *   what cleaner.clean() returned
  * @property {Deadline[]} deadlines
  *
@@ -59,6 +59,9 @@ const { splitSentences } = require('./cleaner');
  * @property {boolean} historyKnown  whether the Sent history could be read
  * @property {(input: TriageInput) => (string|number|null)} repliedAt  when the user last replied
  *   in this email's conversation, or null
+ * @property {string[]} [names]  the user's first names, lower-case ('will'). An ask that
+ *   names the user ("Will, could you…", "…, Will?") is for them even when they are only CC'd
+ *   or it went to a group, and its deadline is the one shown.
  *
  * @typedef {object} TriageDeadline
  * @property {string} text
@@ -94,19 +97,34 @@ const NOREPLY_RE = /(?:^|[-._+])(?:no[-_]?reply|do[-_]?not[-_]?reply)(?:[-._+@]|
 // Marketing copy. In bulk or automated mail these sentences never count as a deadline or a
 // payment ("Today only: 30% off, ends midnight" is not something the user owes).
 const MARKETING_RE = /\d\s?%\s?off\b|\b(?:sale|offer ends|today only|last chance|limited[- ]time|while stocks? lasts?|shop now|deals?|vouchers?)\b/i;
-// What turns a date in bulk or automated mail into something the user has to do.
-const OBLIGATION_RE = /\byour (?:payment|bill|tax|return|account|statement|renewal|policy|subscription|appointment|booking|order|application|card|direct debit|balance|invoice|coursework|assignment|exam)\b|\baction required\b|\byou (?:must|need to|have to|owe)\b|\b(?:payment|amount|balance) (?:is )?due\b|\bdue (?:on|by|in)\b|\boverdue\b|\bfinal (?:notice|reminder|demand)\b|\bwill be (?:taken|collected|charged|debited)\b|\bsubmit|\bhand in\b|\bregister by\b/i;
-// Strong "you owe this" wording. Protects bulk or automated mail even when no date was found
-// in it (a tax reminder must never become noise just because its date wasn't recognised).
-const STRONG_OBLIGATION_RE = /\baction required\b|\bfinal (?:notice|reminder|demand)\b|\boverdue\b|\b(?:payment|amount|balance) (?:is )?(?:now )?due\b|\byou owe\b/i;
+// What turns a date in bulk or automated mail into something the user has to do. A bare
+// "your order" isn't here ("your order will be delivered by Friday" is news, not a task),
+// but "your order must be collected by…" is: "your … must / needs to".
+const OBLIGATION_RE = /\byour (?:payment|bill|tax|return|account|statement|renewal|policy|subscription|appointment|booking|application|card|direct debit|balance|invoice|coursework|assignment|exam)\b|\byour\s+(?:[\w-]+\s+){1,3}(?:must|needs? to)\b|\baction required\b|\byou (?:must|need to|have to|owe)\b|\b(?:payment|amount|balance) (?:is )?due\b|\bdue (?:on|by|in)\b|\boverdue\b|\bfinal (?:notice|reminder|demand)\b|\bwill be (?:taken|collected|charged|debited)\b|\bsubmit|\bhand in\b|\bregister by\b|\b(?:expires?|expiry|deadline|no later than)\b/i;
+// Strong "you have to act" wording. Protects bulk or automated mail even when no date was
+// found in it (a tax reminder must never become noise just because its date wasn't
+// recognised). It only lifts an email to Worth knowing, so a wrong match costs little.
+const STRONG_OBLIGATION_RE = /\baction (?:required|needed)\b|\b(?:response|reply) (?:required|needed)\b|\byou (?:must|need to|have to)\b|\bpenalty\b|\b(?:could not|couldn't|unable to) (?:take|collect|process)\b|\bfinal (?:notice|reminder|demand)\b|\boverdue\b|\b(?:payment|amount|balance) (?:is )?(?:now )?due\b|\byou owe\b/i;
+// When something will arrive ("your order will be delivered by Friday", "should arrive by
+// Thursday"): news, not a task for the user, unless the same sentence also asks for
+// something (STATUS_ASK_RE: a fee to pay, "please", "can you", "must"…).
+const DELIVERY_RE = /\b(?:will|should|is (?:expected|due|scheduled|set) to|are (?:expected|due|scheduled|set) to)(?: now)?(?: be)? (?:arrive|deliver(?:ed)?|dispatch(?:ed)?|ship(?:ped)?|post(?:ed)?|with you)\b|\b(?:has|have) been (?:dispatched|shipped|posted)\b|\bout for delivery\b|\b(?:scheduled|due|booked|set) for (?:delivery|dispatch)\b|\b(?:expected|estimated|scheduled) (?:delivery|arrival)\b|\bon (?:its|their) way\b|\barriv(?:es|ing)\b|\bready (?:to collect|for collection)\b/i;
+const STATUS_ASK_RE = /\?|\b(?:pay|fees?|charges?|duty|please|can you|could you|would you|let (?:me|us) know|must|needs? to|required)\b|\byou (?:have to|owe|should)\b/i;
+const deliveryOnly = (sentence) => DELIVERY_RE.test(sentence) && !STATUS_ASK_RE.test(sentence);
 const MONEY_RE = /[£$€]\s?\d/;
 // "due to high demand" means "because of", unless it's "the amount due to…".
 const DUE_CUE_RE = /\bdue\b(?! to\b)|\b(?:amount|balance|payment|sum) due to\b|\b(?:owe[sd]?|overdue|pay by|minimum payment|direct debit|will be (?:taken|collected))\b/i;
-// Subjects of security notices.
-const SECURITY_RE = /\b(?:new sign[- ]?in|sign[- ]?in (?:attempt|alert|activity|request)|new (?:login|log[- ]in)|login (?:attempt|alert)|security (?:alert|notice|notification|warning|code|info(?:rmation)?)|verification code|password (?:reset|change|changed|updated)|reset your password|unusual (?:sign[- ]?in |login )?activity|suspicious (?:activity|sign[- ]?in|login))\b/i;
+// Security notices (and bank fraud checks), in the subject or the start of the body.
+const SECURITY_RE = /\b(?:new sign[- ]?in|sign[- ]?in (?:attempt|alert|activity|request)|new (?:login|log[- ]in)|login (?:attempt|alert)|security (?:alert|notice|notification|warning|code|info(?:rmation)?)|verification code|password (?:reset|change|changed|updated)|reset your password|unusual (?:sign[- ]?in |login )?activity|suspicious (?:activity|sign[- ]?in|login|payment|transaction)|fraud(?: alert)?|unusual (?:payment|transaction)|did you (?:make|authori[sz]e) this)\b/i;
+const SECURITY_SCAN = 300; // characters of the body checked for security wording
 // One-time codes: "Your verification code is 482913", "482913 is your code".
 const OTP_RE = /\b(?:(?:verification|security|sign[- ]?in|log[- ]?in|login|one[- ]time|authentication|access|confirmation|single[- ]use)\s+(?:code|passcode|pin)|passcode|otp)\b\D{0,40}?\b\d{4,8}\b|\b\d{4,8}\b is your (?:[\w-]+ ){0,3}(?:code|passcode|otp)\b/i;
 const CODE_RE = /\bcode\b\D{0,40}?\b\d{4,8}\b/i; // a bare "code 1234" only counts in a security notice
+// A code is only a sign-in code with sign-in wording around it: a holiday cottage's
+// "key safe access code is 4821" is not one.
+const SIGN_IN_RE = /\b(?:sign(?:ing)?[- ]?in|log(?:ging)?[- ]?in|login|verif(?:y|ying|ication)|authenticat(?:e|ion|or)|two[- ](?:factor|step)|2fa)\b|\bexpires? in \d+ ?(?:minutes?|mins?|hours?)\b/i;
+// Same-day words: they don't make a code email a dated event ("use it today").
+const SAME_DAY_RE = /^(?:today|tonight|this (?:morning|afternoon|evening)|end of (?:the )?day|eod|cob)$/i;
 // Asks to sign in, verify an account, give bank or card details, buy gift cards, change
 // payment details, move money or pay.
 const CAUTION_RE = new RegExp([
@@ -137,7 +155,7 @@ const REASON_TEXT = {
   'from-me': () => 'Sent from your own address',
   'replied': () => "You've already replied",
   'cc-only': () => "You're only CC'd",
-  'group': (p) => `Sent to ${p.count} people`,
+  'group': (p) => (p.list ? 'Sent to a mailing list' : `Sent to ${p.count} people`),
   'asks-action': () => 'Asks you to do something',
   'asks-question': () => 'Asks you a question',
   'urgent': () => "Says it's urgent",
@@ -260,6 +278,24 @@ function toSet(v) {
 
 const PREPARED = Symbol('prepared');
 
+// Any case of a word, as a regex source ("hi" → "[hH][iI]").
+const anyCase = (word) => word.replace(/\p{L}/gu, (ch) => `[${ch.toLowerCase()}${ch.toUpperCase()}]`);
+const LEAD_WORDS = ['and', 'also', 'but', 'plus', 'then', 'oh', 'ok', 'okay', 'so', 'hi', 'hello', 'hey', 'dear', 'thanks', 'morning', 'afternoon'];
+
+// The user's first names as one pattern, or null. A name only counts when it is how the
+// sentence addresses someone, with a capital letter: "Will, could you…", "Hi Will, can
+// you…", "and Will, …" or "…, Will?" (so "Will you be there?" and "we will, if needed,"
+// never count).
+function namePattern(names) {
+  const list = [...toSet(names)]
+    .map((n) => String(n).trim().toLowerCase())
+    .filter((n) => /^\p{L}{2,40}$/u.test(n));
+  if (!list.length) return null;
+  const name = `(?:${[...new Set(list)].map((n) => `${n[0].toUpperCase()}${anyCase(n.slice(1))}`).join('|')})`;
+  const lead = String.raw`(?:^|[,;:—–]\s*|\s[-–—]\s*|\b(?:${LEAD_WORDS.map(anyCase).join('|')})\s+)`;
+  return new RegExp(String.raw`${lead}${name}\s*[,:!—–]|[,—–]\s*${name}\s*[?.!]*\s*$`, 'u');
+}
+
 // Fills in anything missing, so a partial context never throws.
 function prepareContext(ctx = {}) {
   if (ctx && ctx[PREPARED]) return ctx;
@@ -284,6 +320,7 @@ function prepareContext(ctx = {}) {
     me,
     rules,
     notNoise: toSet(c.notNoise),
+    names: namePattern(Array.isArray(c.names) || c.names instanceof Set ? c.names : []),
     historyKnown: c.historyKnown === true,
     wroteTo: (addr) => {
       const n = Number(call(c.wroteTo, addr, 0));
@@ -345,9 +382,17 @@ function signals(input, c, stats) {
 
   const precedence = headerText(headers.precedence);
   const autoSubmitted = headerText(headers.autoSubmitted);
-  const isBulk = Boolean(headers.listUnsubscribe) || Boolean(headers.listId)
-    || ['bulk', 'list', 'junk'].includes(precedence) || category === 'newsletter' || category === 'promo';
-  const isAutomated = autoSubmitted.startsWith('auto-') || category === 'notification' || category === 'receipt' || NOREPLY_RE.test(from);
+  const listHeaders = Boolean(headers.listUnsubscribe) || Boolean(headers.listId) || ['bulk', 'list'].includes(precedence);
+  // Someone writing from their own webmail (Gmail, Outlook.com…) is a person, even when the
+  // email came through a discussion group (Google Groups adds List-Id and List-Unsubscribe)
+  // or mentions "unsubscribe", a sale or a payment received. Companies can't send bulk mail
+  // as @gmail.com. Only Precedence: junk, Auto-Submitted or a no-reply address count there.
+  const webmail = FREEMAIL.has(from.slice(from.lastIndexOf('@') + 1));
+  const discussion = webmail && listHeaders;
+  const isBulk = precedence === 'junk'
+    || (!webmail && (listHeaders || category === 'newsletter' || category === 'promo'));
+  const isAutomated = autoSubmitted.startsWith('auto-') || NOREPLY_RE.test(from)
+    || (!webmail && (category === 'notification' || category === 'receipt'));
   const isPerson = !isBulk && !isAutomated;
 
   // Marketing sentences are only ignored in bulk or automated mail; a person's words all count.
@@ -356,21 +401,35 @@ function signals(input, c, stats) {
   const moneyDue = counted.some((s) => MONEY_RE.test(s) && DUE_CUE_RE.test(s));
   const obligation = !isPerson && counted.some((s) => STRONG_OBLIGATION_RE.test(s));
 
-  // Deadlines: a person's needs a cue word or to sit inside an ask; bulk or automated mail's
-  // needs obligation wording ("your tax return", "payment due") and no marketing.
+  // A person's asks (not "the steel will be delivered by Friday"), and the one that names
+  // the user ("Will, could you…"), which is theirs even when they're only CC'd.
+  const questions = isPerson ? listOf(cleaned.questions) : [];
+  const actions = isPerson ? listOf(cleaned.actions).filter((a) => !deliveryOnly(a)) : [];
+  const named = (sentence) => Boolean(c.names) && c.names.test(sentence);
+  const namedAsk = [...actions.map((text) => ({ text, kind: 'action' })), ...questions.map((text) => ({ text, kind: 'question' }))]
+    .find((a) => named(a.text)) || null;
+
+  // Deadlines: a person's needs a cue word or to sit inside an ask. Bulk or automated mail's
+  // needs obligation wording ("your tax return", "expires") or to be something the sender
+  // asked for with a cue word ("Please return the form by Friday"), and no marketing.
+  // "Your order will be delivered by Friday" is neither.
   const qualifying = [];
   for (const d of Array.isArray(m.deadlines) ? m.deadlines : []) {
     if (!d || typeof d !== 'object' || Number.isNaN(dayUTC(d.day))) continue;
+    const sentence = textOf(d.sentence) || (d.source === 'subject' ? subject : '');
+    if (deliveryOnly(sentence)) continue;
     if (isPerson) {
       if (!(d.cue || d.source === 'ask')) continue;
     } else {
-      const sentence = textOf(d.sentence) || (d.source === 'subject' ? subject : '');
-      if (!OBLIGATION_RE.test(sentence) || MARKETING_RE.test(sentence)) continue;
+      const asked = d.source === 'ask' && Boolean(d.cue);
+      if (!(asked || OBLIGATION_RE.test(sentence)) || MARKETING_RE.test(sentence)) continue;
     }
-    qualifying.push({ d, daysAway: daysBetween(c.today, d.day) });
+    qualifying.push({ d, daysAway: daysBetween(c.today, d.day), named: d.source === 'ask' && named(sentence) });
   }
   const byDay = (a, b) => a.daysAway - b.daysAway || Number(Boolean(a.d.uncertain)) - Number(Boolean(b.d.uncertain));
-  const current = qualifying.filter((q) => q.daysAway >= -14).sort(byDay)[0] || null;
+  const upcoming = qualifying.filter((q) => q.daysAway >= -14).sort(byDay);
+  // The deadline of the ask that names the user comes first; otherwise the soonest.
+  const current = upcoming.find((q) => q.named) || upcoming[0] || null;
   const past = qualifying.filter((q) => q.daysAway < -14).sort(byDay).pop() || null;
   const describe = (q) => q && {
     text: textOf(q.d.text),
@@ -381,14 +440,21 @@ function signals(input, c, stats) {
     uncertain: q.d.uncertain === true,
   };
 
-  const questions = isPerson ? listOf(cleaned.questions) : [];
-  const actions = isPerson ? listOf(cleaned.actions) : [];
   const received = receivedTime(m, c.now);
   const ageMs = Math.max(0, c.now - received);
   const replied = toMs(c.repliedAt(m));
   const st = (stats instanceof Map && stats.get(from)) || null;
   const all = `${subject}\n${body}`;
-  const security = SECURITY_RE.test(subject);
+  const subjectSecurity = SECURITY_RE.test(subject);
+  const codeLike = OTP_RE.test(all) || (subjectSecurity && CODE_RE.test(all));
+  // The start of the body counts too (a fraud check may only say "Did you make this
+  // payment?" in its subject), except in an email with a code, which always mentions it.
+  const security = subjectSecurity || (!codeLike && SECURITY_RE.test(body.slice(0, SECURITY_SCAN)));
+  // A sign-in code needs sign-in wording, and an email about a dated booking or a deadline
+  // still to come is never one (a holiday cottage's key-safe code stays useful until then).
+  const dated = (Array.isArray(m.deadlines) && m.deadlines.some((d) => d && daysBetween(c.today, d.day) >= 0))
+    || listOf(cleaned.dates).some((d) => !SAME_DAY_RE.test(d.trim().replace(/^(?:by|before|until|till|on|from)\s+/i, '')));
+  const otp = codeLike && (security || SIGN_IN_RE.test(all)) && !dated;
   const wrote = c.wroteTo(from);
   const fromMe = Boolean(from) && c.me.has(from);
 
@@ -404,23 +470,26 @@ function signals(input, c, stats) {
     replied: !Number.isNaN(replied) && replied > received,
     addressing,
     recipients,
-    group: recipients > 10 && addressing !== 'cc',
+    // Many recipients, or a post to a discussion group (unless it was also sent To the user).
+    group: (recipients > 10 && addressing !== 'cc') || (discussion && addressing !== 'to'),
+    discussion,
     isBulk,
     isAutomated,
     isPerson,
     questions: questions.length > 0,
     actions: actions.length > 0,
     asks: questions.length > 0 || actions.length > 0,
+    named: namedAsk,
     urgent: textOf(cleaned.urgency) === 'high',
     deadline: describe(current),
     pastDeadline: describe(past),
     moneyDue,
     obligation,
     ageMs,
-    receipt: category === 'receipt',
-    promo: category === 'promo',
+    receipt: category === 'receipt' && !webmail,
+    promo: category === 'promo' && !webmail,
     security,
-    otp: OTP_RE.test(all) || (security && CODE_RE.test(all)),
+    otp,
     focused: typeof m.focused === 'boolean' ? m.focused : null,
     importance: textOf(m.importance).toLowerCase(),
     wrote,
@@ -444,9 +513,11 @@ function decide(s) {
   if (s.rule && s.rule.rule === 'noise' && noiseOk) return [NOISE, 'rule-noise'];              // 3
   if (s.fromMe) return [WORTH, 'from-me'];                                                     // 4
   if (s.replied) return [WORTH, 'replied'];                                                    // 5
-  if (s.isPerson && s.addressing === 'cc' && (s.asks || s.deadline)) return [WORTH, 'cc-only']; // 6
-  if (s.isPerson && s.group && s.asks && !(s.deadline && s.deadline.daysAway <= 7)) return [WORTH, 'group']; // 7
+  // 6 and 7: an ask that names the user ("Will, could you…") is for them all the same
+  if (s.isPerson && s.addressing === 'cc' && (s.asks || s.deadline) && !s.named) return [WORTH, 'cc-only']; // 6
+  if (s.isPerson && s.group && s.asks && !s.named && !(s.deadline && s.deadline.daysAway <= 7)) return [WORTH, 'group']; // 7
   if (s.isPerson && s.ageMs <= 14 * DAY && (s.asks || inRange(s.deadline, -3, 7) || s.urgent)) { // 8
+    if (s.named) return [NEEDS, s.named.kind === 'action' ? 'asks-action' : 'asks-question'];
     if (s.actions) return [NEEDS, 'asks-action'];
     if (s.questions) return [NEEDS, 'asks-question'];
     return [NEEDS, inRange(s.deadline, -3, 7) ? dueCode(s.deadline) : 'urgent'];
@@ -470,7 +541,7 @@ function decide(s) {
   if (s.isBulk && s.usuallyRead) return [WORTH, 'usually-read'];                               // 18
   if (s.isBulk && noiseOk) return [NOISE, 'newsletter'];                                       // 19
   if (s.isAutomated && s.focused === false && noiseOk) return [NOISE, 'outlook-other'];         // 20
-  if (s.isAutomated && s.ignored && noiseOk) return [NOISE, 'ignored'];                        // 21
+  if (s.isAutomated && s.ignored && !s.security && noiseOk) return [NOISE, 'ignored'];          // 21
   if (s.isAutomated) return [WORTH, s.notNoise ? 'not-noise' : 'automated'];                    // 22
   return [WORTH, s.notNoise && !s.isPerson ? 'not-noise' : 'fyi'];                             // 23
 }
@@ -480,7 +551,7 @@ function params(code, s) {
   switch (code) {
     case 'flagged': return { outlook: s.outlook };
     case 'rule-important': return { name: s.rule.key.startsWith('@') ? `everyone at ${s.rule.key.slice(1)}` : s.fromName };
-    case 'group': return { count: s.recipients };
+    case 'group': return { count: s.recipients, list: s.discussion && s.recipients <= 10 };
     case 'deadline-soon': case 'overdue': case 'deadline-later': return s.deadline || {};
     case 'deadline-past': return s.pastDeadline || {};
     case 'payment-due': return s.deadline || {};
@@ -503,7 +574,7 @@ function supporting(s, lead) {
   if (s.asks && !ASK_CODES.has(lead) && !['replied', 'cc-only', 'group'].includes(lead)) add(s.actions ? 'asks-action' : 'asks-question');
   if (s.wrote > 0) add('known-contact');
   else if (s.isPerson && s.historyKnown) add('first-contact');
-  if (s.addressing === 'cc') add('cc-only');
+  if (s.addressing === 'cc' && !s.named) add('cc-only');
   if (s.ignored && lead !== 'newsletter') add('ignored');
   if (s.importance === 'high') add('high-importance');
   if (s.focused === false) add('outlook-other');

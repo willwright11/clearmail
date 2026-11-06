@@ -208,6 +208,17 @@ function card(m, compact) {
   replyStates(m));
 }
 
+// Reply is off when the email has no address to reply to (main would refuse it anyway).
+function replyButton(m, act, { composing = false } = {}) {
+  const canReply = Boolean(replyTarget(m));
+  return el('button', {
+    type: 'button', class: 'btn', 'data-act': act, 'aria-expanded': act === 'reply' ? String(composing) : null,
+    disabled: !canReply, title: canReply ? null : NO_REPLY_ADDRESS,
+    'aria-label': canReply ? `Reply to ${targetName(m)}` : NO_REPLY_ADDRESS,
+    onclick: () => (composing ? focusComposer(m.id) : openComposer(m)),
+  }, 'Reply');
+}
+
 function cardActions(m, reading) {
   const busy = state.busy.has(m.id);
   const composing = state.composing.has(m.id);
@@ -216,11 +227,7 @@ function cardActions(m, reading) {
       type: 'button', class: 'btn', 'data-act': 'read', 'aria-expanded': String(Boolean(reading)),
       onclick: () => toggleRead(m),
     }, reading ? 'Hide' : 'Read'),
-    el('button', {
-      type: 'button', class: 'btn', 'data-act': 'reply', 'aria-expanded': String(composing),
-      'aria-label': `Reply to ${replyTarget(m).name || replyTarget(m).address}`,
-      onclick: () => (composing ? focusComposer(m.id) : openComposer(m)),
-    }, 'Reply'),
+    replyButton(m, 'reply', { composing }),
     el('button', {
       type: 'button', class: 'btn', 'data-act': 'done', disabled: busy,
       title: 'Mark it done: it moves to Done, nothing changes in your mailbox', onclick: () => setDone([m.id], true),
@@ -297,7 +304,7 @@ function readPanel(m, view, { reply }) {
       renderAll();
     }),
     readNote(),
-    reply ? el('button', { type: 'button', class: 'btn', 'data-act': 'read-reply', onclick: () => openComposer(m) }, 'Reply') : null);
+    reply ? replyButton(m, 'read-reply') : null);
 }
 
 function toggleRead(m) {
