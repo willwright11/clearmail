@@ -1,11 +1,156 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const { simpleParser } = require('mailparser');
-const { clean, htmlToText, splitSentences } = require('../src/cleaner');
+const { clean, htmlToText, splitSentences, countWords, realDate, DATE_SOURCE, TIME_SOURCE, MONEY_SOURCE } = require('../src/cleaner');
 const demo = require('../src/demo');
 
-const byId = (id) => demo.find((m) => m.id === id);
-const run = (m) => clean({ text: m.text, subject: m.subject, from: m.from.address });
+// The demo inbox works its dates out from today, so these tests use fixed copies of the
+// original demo emails.
+const FIXTURES = {
+  'demo-1': {
+    from: 'sarah.collins@brightbuild.co.uk',
+    subject: 'RE: Site visit + quote for the Harrow extension',
+    text: `Hi Will,
+
+I hope this email finds you well and that you had a lovely weekend.
+
+Just wanted to reach out regarding the Harrow extension. We had a look at the drawings with the team on Friday.
+
+Could you send over the revised drawings showing the steel beam position? We'll need them before we can finalise anything.
+
+Let me know if you have any questions.
+
+Kind regards,
+Sarah Collins
+Project Coordinator | BrightBuild Ltd
+Registered in England No. 0123456. This email and any attachments are confidential and intended solely for the intended recipient.`,
+  },
+  'demo-2': {
+    from: 'sarah.collins@brightbuild.co.uk',
+    subject: 'RE: Site visit + quote for the Harrow extension',
+    text: `Hi Will,
+
+I hope you're well and thank you so much for getting back to me so promptly, it's really appreciated.
+
+Following on from our conversation last week, and further to the drawings you kindly sent over, I'm pleased to say that we've now had the opportunity to review everything internally with the wider team. I've attached the revised quote, which comes to £14,750 including VAT. This is slightly higher than the initial estimate, mainly because of the additional steelwork that was identified.
+
+In terms of next steps, we would need you to confirm you're happy to proceed by Friday 17th October so that we can hold the start date of Monday 3rd November. If we don't hear back by then, we may have to release the slot to another client, as our schedule is quite busy at the moment.
+
+Also, would you be able to make a site meeting on Wednesday at 10am to go over the access arrangements?
+
+Please don't hesitate to get in touch if you have any questions at all.
+
+Looking forward to hearing from you.
+
+Kind regards,
+Sarah
+
+On Mon, 6 Oct 2026 at 09:12, Will Wright <will@example.com> wrote:
+> Hi Sarah, drawings attached. Thanks, Will
+> Previous message text...`,
+  },
+  'demo-4': {
+    from: 'noreply@notifications.service.gov.uk',
+    subject: 'Action required: your Self Assessment tax return',
+    text: `Dear Customer,
+
+This is a reminder that your online Self Assessment tax return for the 2025 to 2026 tax year must be submitted by 31 January 2027.
+
+You must also pay any tax you owe by 31 January 2027. If you miss the deadline you may have to pay a penalty of £100.
+
+Sign in to your account at https://www.gov.uk/log-in-file-self-assessment-tax-return to file your return.
+
+Do not reply to this email. This mailbox is not monitored.
+
+HM Revenue and Customs`,
+  },
+  'demo-5': {
+    from: 'orders@screwfix.com',
+    subject: 'Your order confirmation #SF-4471920',
+    text: `Thanks for your order!
+
+Order number: SF-4471920
+DeWalt 18V Combi Drill x1 — £129.99
+Total paid: £129.99
+
+Your order will be ready to collect from Harrow Wealdstone tomorrow after 2pm. Please bring your order number and photo ID.
+
+View your order: https://www.screwfix.com/orders/SF-4471920?utm_source=email&utm_campaign=order_conf
+
+You are receiving this email because you placed an order with Screwfix. Privacy policy | Unsubscribe | Manage preferences`,
+  },
+  'demo-6': {
+    from: 'newsletter@weeklybuilder.com',
+    subject: "🏗️ This week in construction: 12 trends you can't ignore",
+    text: `View this email in your browser
+
+Happy Monday!
+
+Welcome to another bumper edition of The Weekly Builder. We've got loads for you this week so grab a cuppa and settle in.
+
+Timber prices fell 4% in September, the third monthly drop in a row.
+
+New Part L building regulations guidance is due in December.
+
+Our top 12 trends piece is here: https://weeklybuilder.com/trends?ref=nl
+
+Have a great week!
+
+The Weekly Builder team
+You are receiving this because you signed up at weeklybuilder.com. Unsubscribe here.`,
+  },
+  'demo-7': {
+    from: 'priya@shahaccounting.co.uk',
+    subject: 'Quick one — VAT receipts',
+    text: `Hi Will,
+
+Hope all is good with you!
+
+Quick one — I'm missing receipts for three purchases in August totalling £412.60. Could you dig them out and upload them to the shared folder by end of the week? The VAT return is due on 7 November so I need a few days to get it done.
+
+Also, did you buy the van outright or is it on finance?
+
+Cheers,
+Priya
+
+--
+Priya Shah ACCA
+Shah Accounting | 020 7946 0000`,
+  },
+  'demo-8': {
+    from: 'jo.patel@example.com',
+    subject: 'Fwd: Planning decision - 12 Elm Road',
+    text: `Hi Will,
+
+FYI - see below. Can you get the appeal in? I'm away until Monday.
+
+Thanks,
+Jo
+
+---------- Forwarded message ---------
+From: Northfield Borough Council Planning <planning@northfield-council.example>
+Date: Wed, 14 Oct 2026 at 16:05
+Subject: Planning decision - 12 Elm Road
+To: Jo Patel <jo.patel@example.com>
+
+Dear Ms Patel,
+
+Application 26/1234: single-storey rear extension at 12 Elm Road.
+
+We have refused this application because the extension is too close to the boundary with number 14.
+
+You can appeal within 28 days of this notice, so by 11 November 2026. The appeal fee of £462 is non-refundable.
+
+Yours sincerely,
+Planning Services
+Northfield Borough Council
+
+This email and any attachments are confidential and intended solely for the intended recipient.`,
+  },
+};
+
+const byId = (id) => FIXTURES[id];
+const run = (m) => clean({ text: m.text, subject: m.subject, from: m.from });
 const text = (t, extra = {}) => clean({ text: t, ...extra });
 
 test('strips greetings, pleasantries, sign-off, signature and quoted reply', () => {
@@ -213,6 +358,86 @@ test('F32: only strong evidence of mass mail switches off actions and questions'
   assert.ok(c.actions.length && c.questions.length);
 });
 
+test('a person\'s own "unsubscribe", "offer", "sale" or "payment received" does not make a newsletter, promo or receipt', () => {
+  const category = (from, subject, t) => clean({ from, subject, text: t }).category;
+  // A friend's new address: their own "I had to unsubscribe" is not a newsletter footer.
+  assert.strictEqual(category('tomhughes88@example.net', 'New address', 'Hi Will,\n\nNew email address - the old one got hacked so I had to unsubscribe from everything.\n\nCan you give me a call tonight? Something has happened with Mum.\n\nTom'), 'person');
+  assert.strictEqual(category('tom@x.co.uk', 'New address', "This is my new address, I've had to unsubscribe from everything. Are you still OK to help me move on Saturday?"), 'person');
+  // A job offer and a house sale with a mailing footer: mass mail, but not a promotion.
+  assert.strictEqual(category('rachel.green@acme.example', 'Job offer - Site Manager', "Dear Will,\n\nWe're delighted to offer you the role of Site Manager, with a salary of £48,000.\n\nPlease confirm by Friday 13 November whether you accept.\n\nYou are receiving this email because you applied via our careers site. Manage your preferences or unsubscribe.\n\nRachel"), 'newsletter');
+  assert.strictEqual(category('case-updates@smithco.example', 'Completion date agreed', 'Completion of the sale is now set for Friday 13 November.\n\nPlease transfer the balance of £12,500 by Thursday 12 November.\n\nYou are receiving this because you are a client of Smith & Co. Manage preferences | Unsubscribe'), 'newsletter');
+  for (const t of ['We have had an offer of £430,000 on the house.', 'Congratulations on the job offer!', 'The house is for sale again.', 'The sale of the yard completes on Friday.']) {
+    assert.strictEqual(category('agent@homes.example', 'Elm Road', `${t}\n\nUnsubscribe`), 'newsletter', t);
+  }
+  // "Payment received" with a question for the reader is a person writing, not a receipt.
+  assert.strictEqual(category('gary@lanebuilders.example', 'Van', 'Hi Will,\n\nPayment received for the van, thanks.\n\nCan you drop the keys round on Saturday?\n\nGary'), 'person');
+  assert.strictEqual(category('gary@lanebuilders.example', 'Van', "I've had the payment received note from the bank. Speak soon."), 'person');
+  assert.strictEqual(category('accounts@supplier.example', 'Invoice no. 4471', 'Invoice no. 4471 is attached. Could you review it and check the rate for the extra day?'), 'person');
+
+  // The other way round: real promotions, newsletters and receipts keep their category.
+  const promos = [
+    ['Offer', 'Last chance! 50% off today only.\n\nUnsubscribe | View in browser'],
+    ['Black Friday', 'Our biggest sale of the year starts now.\n\nUnsubscribe'],
+    ['Special offer', "We'd like to offer you a voucher for your next order.\n\nYou're receiving this because you subscribed. Unsubscribe"],
+    ['Clearance', 'Clearance deals on drills this week.\n\nManage your preferences'],
+  ];
+  for (const [subject, t] of promos) assert.strictEqual(category('hello@shop.example', subject, t), 'promo', subject);
+  assert.strictEqual(category('editor@weeklybuilder.example', 'Issue 42', 'Timber prices are up again this week.\n\nUnsubscribe'), 'newsletter');
+  assert.strictEqual(category('news@site.example', 'Update', "I'm delighted to share this month's news. Prices are up.\n\nTo stop getting these, unsubscribe here."), 'newsletter');
+  const receipts = [
+    ['Your order', "Thanks for your order! Order #12345 confirmed. Total: £45.99. We'll email you when it ships. Questions? Reply to this email."],
+    ['Dispatched', 'Your order has been dispatched. Order number: 1234-5678. Need help? Contact us.'],
+    ['Payment received', "We've received your payment of £120.00. Please allow up to 3 working days for this to show. If you have any questions, please contact us."],
+    ['Receipt', 'Your receipt from Sam\'s Plumbing. Amount: £85.00. Please keep this for your records. Would you like to leave a review?'],
+    ['Order confirmation', 'Thank you for your purchase! Did you know you can track your order in our app?'],
+    ['Shipped', 'Your order has been shipped. Do you have any questions about your order? Contact our team.'],
+    ['Ready', 'Your order is ready for collection. How likely are you to recommend us to a friend?'],
+    ['On its way', 'Your order has been dispatched. Could you rate your delivery? Can you spare a minute for our survey?'],
+    ['Order', 'Order number:\n12345\n\nThanks for shopping with us.'],
+  ];
+  for (const [subject, t] of receipts) assert.strictEqual(category('orders@shop.example', subject, t), 'receipt', subject);
+});
+
+test('"by the 15th" and "before the 15th" are dates; "on the 3rd floor" is not', () => {
+  assert.deepStrictEqual(text('Please pay before the 15th.').dates, ['before the 15th']);
+  assert.deepStrictEqual(text('Please pay by the 15th of this month, thanks.').dates, ['by the 15th of this month']);
+  assert.deepStrictEqual(text('The rent must be in by the 1st at the latest.').dates, ['by the 1st']);
+  assert.deepStrictEqual(text('Pay by the 15th of November.').dates, ['15th of November']);
+  for (const t of ['The office is on the 3rd floor.', 'Turn left by the 2nd house.', 'He came in before the 3rd round of talks.']) {
+    assert.deepStrictEqual(text(t).dates, [], t);
+  }
+});
+
+test('forwarded and quoted messages: where each starts in the body, and the day it was sent', () => {
+  const body = 'Your application 26/1234 has been refused. You may appeal within 28 days.';
+  const at = (c) => c.forwarded.map((f) => [c.body.slice(f.at, f.at + 18), f.date]);
+  // Gmail, Outlook, Apple Mail and Outlook's "Original Message", with and without a note above.
+  const gmail = `---------- Forwarded message ---------\nFrom: Harrow Council <planning@harrow.gov.uk>\nDate: Tue, 13 Oct 2026 at 16:05\nSubject: Planning decision\nTo: Jo <jo@example.com>\n\n${body}`;
+  assert.deepStrictEqual(at(text(`FYI - can you sort this?\n\n${gmail}`, { subject: 'Fwd: Planning' })), [['Forwarded message ', '2026-10-13']]);
+  assert.deepStrictEqual(text(gmail, { subject: 'Fwd: Planning' }).forwarded, [{ at: 0, date: '2026-10-13' }]);
+  const outlook = text(`See below\n\n________________________________\nFrom: Harrow Council <planning@harrow.gov.uk>\nSent: Monday, October 12, 2026 9:12 AM\nTo: Jo Patel <jo@example.com>\nSubject: Planning decision\n\n${body}`, { subject: 'FW: Planning' });
+  assert.deepStrictEqual(at(outlook), [['Forwarded message ', '2026-10-12']]);
+  const apple = text(`FYI\n\nBegin forwarded message:\n\nFrom: Harrow Council <planning@harrow.gov.uk>\nSubject: Planning decision\nDate: 13 October 2026 at 09:12:00 BST\nTo: Jo Patel <jo@example.com>\n\n${body}`, { subject: 'Fwd: Planning' });
+  assert.deepStrictEqual(at(apple), [['Forwarded message ', '2026-10-13']]);
+  const appleHtml = clean({ subject: 'Fwd: decision', html: '<div>FYI</div><blockquote type="cite"><div>Begin forwarded message:</div><br><div><b>From: </b>Council &lt;p@c.gov.uk&gt;<br><b>Subject: </b>Decision<br><b>Date: </b>13 October 2026 at 09:12:00 BST<br><b>To: </b>Jo &lt;jo@x.com&gt;</div><br><div>Refused. Appeal by 10 November 2026.</div></blockquote>' });
+  assert.deepStrictEqual(at(appleHtml), [['Forwarded message ', '2026-10-13']]);
+  // A day-month order that can't be known for sure is null; one that can is read.
+  const original = (sent) => text(`See below\n\n-----Original Message-----\nFrom: Sam <sam@x.com>\nSent: ${sent}\nTo: Jo <jo@example.com>\nSubject: Invoice\n\nPlease pay within 7 days.`, { subject: 'FW: Invoice' }).forwarded.map((f) => f.date);
+  assert.deepStrictEqual(original('10/11/2026 09:12'), [null]);
+  assert.deepStrictEqual(original('13/10/2026 09:12'), ['2026-10-13']);
+  assert.deepStrictEqual(original('2026-10-13 09:12'), ['2026-10-13']);
+  assert.deepStrictEqual(original('31 February 2026 09:12'), [null]);
+  // Two forwards in one: each keeps its own day, in order.
+  const twice = text(`Over to you.\n\n---------- Forwarded message ---------\nFrom: Jo <jo@example.com>\nDate: Mon, 2 Nov 2026 at 08:00\nSubject: Fwd: Invoice\nTo: Sam <sam@example.com>\n\nCan you deal with this?\n\n---------- Forwarded message ---------\nFrom: Supplier <accounts@supplier.example>\nDate: Thu, 15 Oct 2026 at 10:30\nSubject: Invoice\nTo: Jo <jo@example.com>\n\nPlease pay within 30 days.`, { subject: 'Fwd: Fwd: Invoice' });
+  assert.deepStrictEqual(at(twice), [['Forwarded message ', '2026-11-02'], ['Earlier message fr', '2026-10-15']]);
+  // Not forwarded: none. A reply's quoted history is cut, so it has none either.
+  assert.deepStrictEqual(text('Can you call me?').forwarded, []);
+  assert.deepStrictEqual(text('Yes, I will sort it by Friday.\n\nOn Mon, 13 Oct 2026 at 09:12, Will <will@x.com> wrote:\n> Can you do it within 7 days?', { subject: 'Re: x' }).forwarded, []);
+  // A forward past the first 50,000 characters is kept as it is, and still found.
+  const huge = text(`${'Some notes about the site. '.repeat(2200)}\n\n${gmail}`, { subject: 'Fwd: Planning' });
+  assert.deepStrictEqual(at(huge), [['Forwarded message ', '2026-10-13']]);
+});
+
 test('F33: URLs drop html-to-text brackets and keep balanced parentheses', async () => {
   let c = text('Pay online: Pay now [https://pay.example.com/inv/4471?t=abc]');
   assert.strictEqual(c.links[0].url, 'https://pay.example.com/inv/4471?t=abc');
@@ -362,4 +587,227 @@ test('promos and newsletters are never marked time-sensitive', () => {
   assert.strictEqual(promo.urgency, 'low');
   const person = clean({ from: 'sam@builder.example', subject: 'Skip', text: 'The skip permit expires tomorrow, can you renew it?' });
   assert.strictEqual(person.urgency, 'high');
+});
+
+test('the date, time and money patterns are exported for dates.js and summarize.js', () => {
+  const dates = [...'Pay by Friday 17th October, or 16/10/2026, or by end of the week. We offer 24/7 support.'.matchAll(new RegExp(DATE_SOURCE, 'g'))].map((m) => m[0]).filter(realDate);
+  assert.deepStrictEqual(dates, ['by Friday 17th October', '16/10/2026', 'end of the week']);
+  assert.strictEqual(realDate('24/7'), false);
+  assert.strictEqual(realDate('12-34-56'), false);
+  assert.strictEqual(realDate('17/10'), true);
+  assert.deepStrictEqual([...'Meet at 10am or 14:30'.matchAll(new RegExp(TIME_SOURCE, 'gi'))].map((m) => m[0]), ['10am', '14:30']);
+  assert.deepStrictEqual([...'£14,750, then £500 more and 20 GBP'.matchAll(new RegExp(MONEY_SOURCE, 'gi'))].map((m) => m[0]), ['£14,750', '£500', '20 GBP']);
+  assert.strictEqual(countWords('  one two\nthree\t four  '), 4);
+  assert.strictEqual(countWords(''), 0);
+});
+
+test('every email in the demo inbox cleans with its amounts and asks intact', () => {
+  for (const m of demo) {
+    const c = clean({ text: m.text, html: m.html, subject: m.subject, from: m.from.address });
+    assert.ok(c.body.trim(), `${m.id} keeps some text`);
+    for (const a of c.amounts) assert.ok(c.body.includes(a), `${m.id}: ${a} is in the body`);
+    for (const q of [...c.questions, ...c.actions]) assert.ok(c.body.includes(q), `${m.id}: "${q}" is in the body`);
+    assert.ok(c.stats.keptWords <= c.stats.rawWords, m.id);
+  }
+});
+
+test('"If we need you to sign anything else, we will let you know" asks for nothing now', () => {
+  const cleanOf = (sentence) => clean({ from: 'helen@wardsolicitors.example', subject: 'Your documents', text: `Dear Will,\n\n${sentence}\n\nKind regards,\nHelen` });
+  const actionsOf = (sentence) => cleanOf(sentence).actions;
+  // The sender promising to get in touch if something happens: neither an action nor a question.
+  for (const s of [
+    'If we need you to sign anything else, we will let you know.',
+    "We'll let you know if we need you to sign anything.",
+    'We will write to you if we need any more documents.',
+    'Should you need anything, we will let you know.',
+    'If we need anything else we will let you know.',
+    'If the payment fails, we will send you a reminder.',
+    'We’ll send you a reminder if the payment fails.',
+    "I'll let you know if you need to sign anything else.",
+    'If we need anything by Friday, we will let you know.',
+    'Thanks for the forms, and if we need you to sign anything else we will be in touch.',
+    'Please note that if we need anything else, we will let you know.',
+    "Once the parts arrive, we'll let you know.",
+    'If anything changes, we will let you know what we need by Friday.',
+    'If we need you to sign anything else, we will get back to you.',
+    'We will get back to you if the bank needs anything else.',
+    'If the survey is delayed, we will keep you updated.',
+  ]) {
+    const c = cleanOf(s);
+    assert.deepStrictEqual(c.actions, [], s);
+    assert.deepStrictEqual(c.questions, [], s);
+  }
+  // Still asks: an imperative or request, the sender needing something of the reader, a
+  // condition the reader acts on, a warning or the reader's deadline, an ask outside the promise.
+  for (const s of [
+    'If you can, please send the form by Friday.',
+    'If we need you to sign anything else, we will let you know, so please keep an eye on your email.',
+    'If you need to change the date, please call us.',
+    "If we don't hear from you by Friday, we will cancel the booking.",
+    'If the payment is not received by Friday, we will cancel the order.',
+    'If you want to go ahead, we will need you to sign the contract by Friday.',
+    'We will need you to sign the contract if you want to go ahead.',
+    'We would be grateful if you could send the form by Friday.',
+    "I'd be grateful if you'd confirm your address.",
+    'If you could send the signed form, we will book you in.',
+    'If you sign and return the form, we will send the keys.',
+    'If you let us know your availability, we will book an engineer.',
+    'If your payment reaches us by Friday, we will waive the late fee.',
+    "Once you've signed it, we'll send the keys.",
+    'Sign the form, and if anything changes we will let you know.',
+    'Your invoice is due on Friday, and if it is late we will add a fee.',
+    'We can book you in on Monday if that suits.',
+    // What the sender will need comes from the reader; "cannot" is a warning too.
+    'If you would like to proceed, we will need a deposit of £500 by Friday.',
+    'If you want to keep your place, we will need confirmation by Friday.',
+    'If you would like to go ahead, we will send the contract for you to sign.',
+    'If you cannot pay, we will cancel the order.',
+    // A promise to do anything but get in touch may be waiting for the reader's answer. (The
+    // first four were pinned as promises before; only getting in touch counts now.)
+    "If anything changes, I'll send you the new dates.",
+    'In the event that the survey is delayed, we will confirm a new date.',
+    'If, as we expect, the parts arrive, we will book you in for Monday.',
+    "If you'd like a copy, I will send one over.",
+    'If you are happy with the quote, we will book you in for Monday.',
+    'If you agree, we will submit the application on Monday.',
+    "We'll submit the application on Monday if you agree.",
+    'If the direct debit fails, we will remind you to pay by Friday.',
+  ]) assert.deepStrictEqual(actionsOf(s), [s], s);
+  // A promise put as a question waits for an answer, so it stays a question.
+  const q = "If it suits you, I'll come round on Monday at 9am?";
+  assert.deepStrictEqual(cleanOf(q).questions, [q]);
+});
+
+test('"Please don\'t reply to this email" and "There\'s nothing you need to do" are not asks', () => {
+  const gym = (footer) => clean({ from: 'info@puregym.com', subject: 'Your membership has been frozen', text: `Hi Will,\n\nYour membership freeze has been set up as requested. Your membership will restart on 1 December 2026.\n\n${footer}` });
+  // A footer of its own goes, whichever apostrophe it has.
+  for (const footer of ["Please don't reply to this email.", 'Please don’t reply to this email.', "This is an automated email, please don't reply.", "Don't reply to this email, it isn't monitored.", 'Please do not respond to this message.']) {
+    const c = gym(footer);
+    assert.deepStrictEqual([c.actions, c.questions, c.urgency], [[], [], 'low'], footer);
+    assert.strictEqual(c.body, 'Your membership freeze has been set up as requested. Your membership will restart on 1 December 2026.', footer);
+  }
+  // Kept next to the facts, it still asks for nothing.
+  const asks = (sentence) => {
+    const c = clean({ from: 'hello@octopus.energy', subject: 'Your statement', text: `Your balance is £42.17 in credit. ${sentence} Your next statement will be ready in December.` });
+    assert.ok(c.body.includes(sentence), sentence);
+    return c.actions;
+  };
+  for (const s of [
+    "Please don't reply to this email.",
+    'Please don’t reply to this email.',
+    'Please do not reply to this email.',
+    'Do not respond to this message.',
+    "There's nothing you need to do.",
+    'There’s nothing you need to do.',
+    'There is nothing for you to do.',
+    'No action is needed.',
+    'No further action is required.',
+    "You don't need to reply.",
+    'There is no need to respond.',
+    // "Ignore this" when it's already done.
+    'If you have already paid, please ignore this reminder.',
+    'Please disregard this email if you have already paid.',
+    'If you have already sent it, please ignore this letter.',
+    "If you've already booked, you can safely ignore this message.",
+  ]) assert.deepStrictEqual(asks(s), [], s);
+  // Still asks: another request in the sentence, a reply that's only on hold, or a warning.
+  for (const s of [
+    'Do not reply to this email, but please call us by Friday.',
+    'Please do not reply to this email until you have spoken to legal.',
+    'Please ignore this letter unless you have not paid yet.',
+    'There is nothing else you need to do, but please check the date.',
+    'If you do not respond we may charge you a penalty.',
+    "If you don't reply by Friday, we will cancel the booking.",
+    'If you ignore this reminder, you will need to pay a £70 fee.',
+  ]) assert.deepStrictEqual(asks(s), [s], s);
+  // And when the sentence says what to do instead: Mum's "don't reply, ring Dad" asks.
+  for (const s of [
+    "Don't reply to this, ring Dad on 07700 900123 tonight.",
+    "My phone is broken so please don't reply to this email, ring Dad on his mobile instead.",
+    'Please do not reply to this email; instead, call the office.',
+  ]) assert.deepStrictEqual(clean({ from: 'sue.wright@btinternet.com', subject: 'phone', text: `Hi love\n\n${s}\n\nSee you Sunday.\n\nMum` }).actions, [s], s);
+});
+
+test('a friend\'s "let me know", "tell me", "ring me" and casual questions without a "?" are asks', () => {
+  const of = (t) => clean({ from: 'sue.wright@btinternet.com', subject: 'hi', text: t });
+  // Requests without "please" or a "?".
+  for (const s of [
+    'I have sent you a little something in the post. Let me know when it arrives.',
+    'The glazier can come Tuesday or Thursday next week. Let me know which day suits.',
+    "We're having a few people round on Saturday from 8. Let us know if you can make it.",
+    "Gran wants to know what you'd like for Christmas. Tell me by the weekend so she can order it.",
+    'RING ME WHEN YOU GET THIS ITS ABOUT GRANDAD',
+    'Call me when you are free.',
+    "Text me when you're home safe.",
+    'Phone me tonight.',
+    'Get back to me when you can.',
+  ]) {
+    const c = of(s);
+    assert.strictEqual(c.actions.length, 1, s);
+    assert.strictEqual(c.urgency, 'normal', s);
+  }
+  // The stock offer of help is not an ask.
+  for (const s of [
+    'The report is attached, let me know if you have any questions.',
+    'The van is booked for Friday morning, let us know if you need anything else.',
+    "The keys are under the mat, let me know if there's any problem.",
+    'The week 6 slides are now on Learn, let me know if I can help.',
+    'The van is booked, let us know if we can do anything else.',
+  ]) assert.deepStrictEqual(of(s).actions, [], s);
+  // Casual questions: questions, not actions.
+  for (const s of [
+    'are u coming to the union tonight',
+    'have you got my phone charger i cant find it anywhere',
+    'u still up for 5 a side tues need to tell the pitch by sat',
+    'are you coming home sunday for dinner let me know so i can get enough in',
+    'hey r u around later',
+    'will you be in on saturday.',
+  ]) {
+    const c = of(s);
+    assert.deepStrictEqual([c.questions, c.actions], [[s], []], s);
+  }
+  // A request stays an action; a statement or a long sentence is not a question.
+  for (const s of ['can you book the fiesta in for its MOT its due on the 20th', 'Could you send the signed form by Friday.']) {
+    assert.deepStrictEqual([of(s).questions, of(s).actions], [[], [s]], s);
+  }
+  for (const s of ['You still owe me a fiver.', `are you ${'still thinking about what we said about the house and the garden and the car and the holiday '.repeat(3)}`]) {
+    assert.deepStrictEqual(of(s).questions, [], s);
+  }
+});
+
+test('"Thank you for your interest in…" is dropped when it says nothing else, so the news comes first', () => {
+  const c = clean({ from: 'graduates@arup.com', subject: 'Your application - Summer Placement 2027', text: 'Dear Will,\n\nThank you for your interest in the Summer Placement programme at Arup.\n\nUnfortunately, on this occasion we will not be taking your application forward.\n\nWe wish you every success.\n\nArup Early Careers' });
+  assert.match(c.body, /^Unfortunately, on this occasion we will not be taking your application forward\./);
+  assert.doesNotMatch(c.body, /Thank you for your interest/);
+  for (const t of ['Thank you for applying for the Graduate Engineer role.', 'Thanks for your application to Atkins.', 'Thank you for your application.']) {
+    assert.strictEqual(clean({ text: `${t}\n\nYour interview is on Monday 9 November at 10am.` }).body, 'Your interview is on Monday 9 November at 10am.', t);
+  }
+  // With a fact in it, it stays.
+  for (const t of ['Thank you for your application, which we received on 3 November.', 'Thank you for your interest in the £2,000 bursary.']) {
+    assert.match(clean({ text: `${t}\n\nWe will be in touch.` }).body, new RegExp(`^${t.replace(/[.$£,]/g, '\\$&')}`), t);
+  }
+});
+
+test('"Dear will_w99," is a greeting line; "Hi Will running late" is not', () => {
+  const c = clean({ from: 'ebay@ebay.co.uk', subject: 'mikey_k1 has sent you a question', text: 'Dear will_w99,\n\nmikey_k1 has sent you a question about your item.\n\nhi do these come with the original box? and could u post by tues' });
+  assert.match(c.body, /^mikey_k1 has sent you a question about your item\./);
+  for (const g of ['Dear will_w99,', 'Hi will,', 'Hello customer,', 'Dear zoë ,', 'hey jake99,']) {
+    assert.strictEqual(clean({ text: `${g}\nThe parcel is at the depot.` }).body, 'The parcel is at the depot.', g);
+  }
+  // More than one word, or no comma, is content.
+  for (const t of ['Hi Will running late', 'hi will running late,', 'Hey 07700 900123,']) {
+    assert.match(clean({ text: `${t}\nThe parcel is at the depot.` }).body, new RegExp(`^${t}`), t);
+  }
+});
+
+test('an insurance renewal\'s "No Claims Discount" is not a promotion', () => {
+  const category = (t) => clean({ from: 'renewals@admiral.com', subject: 'Your car insurance renewal documents', text: `${t}\n\nUnsubscribe` }).category;
+  for (const t of [
+    'Renewal date: 22/11/2026\nRenewal premium: £1,284.37\nNo Claims Discount: 2 years',
+    'Your policy renews on 22/11/2026. Your renewal premium is £1,284.37 and your no-claims bonus is 5 years.',
+    'Your home insurance renews on 3 December 2026. Your no claims discount has been applied.',
+  ]) assert.strictEqual(category(t), 'newsletter', t);
+  // A real discount is still a promotion.
+  assert.strictEqual(category('Get a 10% discount when you add breakdown cover.'), 'promo');
+  assert.strictEqual(category('No claims discount? Get 20% off your first year with us.'), 'promo');
 });

@@ -1,7 +1,7 @@
 // Offline "waffle remover": strips quoted replies, signatures, legal footers and
 // pleasantries, then pulls out the bits people tend to miss (asks, dates, money,
-// links). Works with no network and no API key; the AI summariser builds on it.
-// When in doubt it keeps text: a bit of leftover waffle beats a lost fact.
+// links). Works entirely offline; summarize.js (short versions) and dates.js (deadlines)
+// build on it. When in doubt it keeps text: a bit of leftover waffle beats a lost fact.
 
 // ---------- Dates, money, links ----------
 
@@ -32,6 +32,8 @@ const DATE_RE = new RegExp(
     '(?<![\\d.,/£$€-])\\d{1,2}([.-])\\d{1,2}\\1(?:\\d{4}|\\d{2})(?!\\d)',
     '\\b\\d{4}-\\d{2}-\\d{2}\\b',
     `\\b${anyOf(['today', 'tonight', 'tomorrow', 'this weekend', 'this week', 'this morning', 'this afternoon', 'this evening', 'next week', 'next month', 'end of the day', 'end of day', 'end of the week', 'end of week', 'end of the month', 'end of month', 'eod', 'eow', 'cob'])}\\b`,
+    // by the 15th, before the 1st of next month (not "on the 3rd floor" or "by the 15th of May")
+    `\\b${anyOf(['by', 'before', 'on', 'until', 'till'])}[ \\t]+${ci('the')}[ \\t]+\\d{1,2}(?:st|nd|rd|th)\\b(?:[ \\t]+${ci('of')}[ \\t]+${anyOf(['this', 'next'])}[ \\t]+${ci('month')}\\b|(?=[ \\t]*(?:[.,;:!?)\\n]|$)|[ \\t]+${anyOf(['at', 'to', 'so', 'and', 'or', 'but', 'please', 'if', 'otherwise', 'when', 'because', 'as', 'in', 'with', 'then', 'unless', 'latest'])}\\b))`,
   ].join('|'),
   'g',
 );
@@ -59,7 +61,144 @@ function realDate(d) {
 const hasKeyFacts = (s) => s.includes('?') || MONEY_TEST.test(s) || DATE_TEST.test(s);
 const hasFacts = (s) => /[\d£$€?]/.test(s) || DATE_TEST.test(s) || TIME_TEST.test(s);
 
-const ACTION_CUES = /\b(?:please|could you|can you|would you|need you to|you need to|you must|required|action required|make sure|remember to|don't forget|deadline|due|by (?:eod|end of day|cob|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|asap|urgent|sign|approve|confirm|reply|respond|submit|pay|book|send)\b/i;
+// "Let me know which day suits" asks; the stock "Let me know if you have any questions" and
+// the offer "Let me know if I can help" don't.
+const ACTION_CUES = /\b(?:please|could you|can you|would you|need you to|you need to|you must|required|action required|make sure|remember to|don't forget|deadline|due|by (?:eod|end of day|cob|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|asap|urgent|sign|approve|confirm|reply|respond|submit|pay|book|send|(?:ring|call|text|phone) me|tell me|get back to me)\b|\blet (?:me|us) know\b(?![ \t]+if[ \t]+(?:(?:you[ \t]+(?:have|need)|there(?:[ \t]+(?:are|is)|'s))[ \t]+any|(?:I|we)[ \t]+(?:can|could)[ \t]+(?:help|assist|do[ \t]+anything)\b))/i;
+
+// Sentences that tell the reader there is nothing to do: "Please don't reply to this email",
+// "There's nothing you need to do", "If you have already paid, please ignore this reminder".
+// Removed (with a "please" in front) before looking for an ask, so "Do not reply to this
+// email, but please call us by Friday" still asks, and so does "Please do not reply until
+// you have spoken to legal". Not when the same sentence says what to do instead: Mum's
+// "Don't reply to this, ring Dad tonight" asks. "Don't reply" and "ignore this" only count
+// as instructions: "If you do not respond we may charge you a penalty" is a warning, so it asks.
+// Runs with curly apostrophes made straight.
+const NOT_INSTRUCTION = String.raw`(?<!(?:\b(?:you|we|they|who|if|to|not|never)|n't)[ \t]+)`;
+const NOT_LATER = String.raw`(?![^.!?;]*\b(?:until|till|unless|before)\b)(?![^.!?]*\b(?:instead|ring|call|phone|text|contact|speak|talk|write[ \t]+to|get[ \t]+in[ \t]+touch)\b)`;
+const NOT_AN_ASK = new RegExp([
+  String.raw`${NOT_INSTRUCTION}\b(?:please[ \t]+)?(?:do not|don't|dont)[ \t]+(?:reply|respond)(?:[ \t]+(?:directly[ \t]+)?to[ \t]+this[ \t]+(?:e-?mail|message|address))?\b${NOT_LATER}`,
+  String.raw`(?:\byou[ \t]+can[ \t]+(?:safely[ \t]+)?|${NOT_INSTRUCTION}\b(?:please[ \t]+)?)(?:ignore|disregard)[ \t]+this[ \t]+(?:e-?mail|reminder|message|letter|notice)\b${NOT_LATER}`,
+  String.raw`\bnothing[ \t]+(?:(?:else|more|further)[ \t]+)?(?:you[ \t]+(?:need|have)|for[ \t]+you)[ \t]+to[ \t]+do\b`,
+  String.raw`\bno[ \t]+(?:further[ \t]+)?action[ \t]+(?:is[ \t]+)?(?:needed|required)\b`,
+  String.raw`\b(?:no[ \t]+need|(?:do not|don't|dont)[ \t]+need)[ \t]+to[ \t]+(?:reply|respond|do anything)\b`,
+].join('|'), 'gi');
+// The sentence without its "nothing to do" parts, for looking for an ask.
+const withoutNonAsks = (s) => String(s).replace(/’/g, "'").replace(NOT_AN_ASK, ' ');
+
+// A short casual question written without its "?": "are u coming to the union tonight",
+// "have you got my charger i cant find it", "u still up for 5 a side tues".
+const LEAD_IN = '(?:(?:hi|hey|hiya|oi|oh|ok|okay|so|and|also|btw)[ \\t]*,?[ \\t]+)?';
+const CASUAL_QUESTION = new RegExp(`^${LEAD_IN}(?:are|r|do|did|have|has|is|was|were|can|could|will|would)[ \\t]+(?:you|u|ya)\\b`, 'i');
+const STILL_QUESTION = new RegExp(`^${LEAD_IN}(?:you|u|ya)[ \\t]+still\\b`, 'i');
+// "You still owe me £5." with its full stop is a statement.
+const ENDS_STATEMENT = /[.!]["')\]]*\s*$/;
+// "can you book the car in for its MOT" is a request, so it stays an action.
+const REQUEST_MODAL = new RegExp(`^${LEAD_IN}(?:can|could|will|would)\\b`, 'i');
+const modalRequest = (s) => REQUEST_MODAL.test(s) && ACTION_CUES.test(withoutNonAsks(s));
+const isQuestion = (s) => /\?\s*$/.test(s)
+  || (s.length < 200 && ((CASUAL_QUESTION.test(s) && !modalRequest(s)) || (STILL_QUESTION.test(s) && !ENDS_STATEMENT.test(s))));
+
+/**
+ * Whether a sentence only tells the reader there is nothing to do ("Please don't reply to this
+ * email", "If you have already paid, please ignore this reminder"): it is never an action,
+ * and summarize.js never leads with it.
+ */
+function asksNothing(sentence) {
+  const s = String(sentence ?? '');
+  const rest = withoutNonAsks(s);
+  return rest !== s.replace(/’/g, "'") && !ACTION_CUES.test(rest) && !isQuestion(s);
+}
+
+// ---------- Promises (not asks) ----------
+
+// The sender promising to get in touch if something happens asks nothing of the reader now:
+// "If we need you to sign anything else, we will let you know." / "If the payment fails, we'll
+// send you a reminder." / "We will write to you if we need any more documents." / "Once the
+// parts arrive, we'll let you know." A promise to do anything else may be waiting for the
+// reader's answer, so it still counts as an ask: "If you are happy with the quote, we will
+// book you in for Monday", "If you agree, we will submit the application", "Once you've
+// signed it, we'll send the keys". Not "we can" or "we could" either: "We can book you in if
+// that suits" is an offer waiting for an answer.
+// These run on the sentence with curly apostrophes made straight.
+const WILL = String.raw`\b(?:we|I)(?:'(?:ll|d)|[ \t]+(?:will|shall|would|may|might))\b`;
+const WILL_RE = new RegExp(WILL, 'i');
+const WILL_ALL = new RegExp(WILL, 'gi'); // only used with matchAll, so its lastIndex stays 0
+const GET_IN_TOUCH = new RegExp(String.raw`^${WILL}[ \t]+(?:let you know|write to you|contact you|be in touch|get in touch|get back to you|keep you (?:posted|updated|informed)|update you|notify you|remind you|tell you|ask you|email you|call you|phone you|ring you|text you|send you an? (?:reminder|email|e-mail|text|message|update)s?)\b`, 'i');
+const IF_WORD = String.raw`\b(?:if|should|in case|in the event that)\b`;
+const WHEN_WORD = String.raw`\b(?:when|whenever|once|as soon as)\b`;
+const IF_ALL = new RegExp(IF_WORD, 'gi');
+const WHEN_ALL = new RegExp(WHEN_WORD, 'gi');
+// After "we will …", "should" only starts a condition as in "should you need anything".
+const IF_AFTER = /\b(?:if|in case|in the event that|should(?=[ \t]+(?:you|we|I|it|there|anything|any|the)\b))\b/i;
+const WHEN_AFTER = new RegExp(WHEN_WORD, 'i');
+const CLAUSE_START = /(?:^|[,;:—–(][ \t]*|\b(?:and|but|so|then|also|or|that)[ \t]+)$/i;
+const CLAUSE_END = /[,;:—–()]/;
+const DIRECT_REQUEST = /\b(?:please|could you|can you|would you|you need to|you must|make sure|remember to|don't forget|do not forget)\b/i;
+// "…, we will need you to sign", "We would be grateful if…", "I'd recommend you send it…",
+// "…, and you'll need to sign it": the sender's part asks something of the reader after all.
+const NEEDS_READER = /\b(?:need|require|want|expect|ask|like|advise|urge|remind)[ \t]+you[ \t]+to\b|\b(?:grateful|appreciate|obliged|suggest|recommend|advise)\b|\byou(?:'ll|'d|[ \t]+(?:will|would|may|might))?[ \t]+(?:need to|have to|must|should)\b/i;
+// A warning in the condition ("If we don't hear from you by Friday, …", "If you miss the
+// appointment, …", "If you cannot pay, …") implies an ask. "If the payment fails, …" is not one.
+const WARNING = /\b(?:not|no|never|cannot|unable|you[ \t]+(?:fail|miss))\b|n't\b/i;
+// The condition asks the reader to do something: "If you could send…", "If you sign and return it…".
+const READER_ACTS = /^[ \t]*you(?:(?:[ \t]+(?:could|would)|'d)[ \t]+(?!(?:like|prefer|rather|want|wish|need|not|never)\b)\p{L}|(?:[ \t]+(?:can|just|simply))?[ \t]+(?:sign|send|pay|book|confirm|reply|respond|submit|approve|return|complete|upload|fill (?:in|out)|bring|let (?:us|me) know|get back)\b)/iu;
+
+// Each way to read `s` as "If <condition>, we will <get in touch>" or "We will <get in touch>
+// if <condition>", as [condition start, condition end, promise start, promise end].
+function promiseReadings(s) {
+  const readings = [];
+  for (const all of [IF_ALL, WHEN_ALL]) {
+    for (const m of s.matchAll(all)) {
+      const from = m.index + m[0].length;
+      const w = CLAUSE_START.test(s.slice(0, m.index)) && WILL_RE.exec(s.slice(from));
+      if (!w || /[.!?;:]/.test(s.slice(from, from + w.index))) continue;
+      const ws = from + w.index;
+      if (!GET_IN_TOUCH.test(s.slice(ws))) continue;
+      // The condition runs to its first comma (or straight into "we will").
+      const comma = s.slice(from, ws).search(CLAUSE_END);
+      const rest = s.slice(ws).search(CLAUSE_END);
+      readings.push([from, comma < 0 ? ws : from + comma, ws, rest < 0 ? s.length : ws + rest]);
+    }
+  }
+  for (const w of s.matchAll(WILL_ALL)) {
+    if (!CLAUSE_START.test(s.slice(0, w.index))) continue;
+    const clause = s.slice(w.index).split(/[;:—–()]|[.!?](?=\s|$)/)[0];
+    const c = GET_IN_TOUCH.test(clause) && (IF_AFTER.exec(clause) || WHEN_AFTER.exec(clause));
+    if (!c) continue;
+    // The condition runs from "if" to the end of its clause.
+    const cs = w.index + c.index + c[0].length;
+    const comma = s.slice(cs).search(CLAUSE_END);
+    readings.push([cs, comma < 0 ? s.length : cs + comma, w.index, w.index + c.index]);
+  }
+  return readings;
+}
+
+/**
+ * Whether a sentence is only the sender's conditional promise to get in touch, with no ask in
+ * it: "If …, we/I will let you know" or "…we/I will write to you if …". A promise to do
+ * anything else ("…, we will book you in", "…, we will need a deposit by Friday") is not one.
+ * It still asks when there is a request anywhere in it ("If you can, please send…", "…, so
+ * please keep the originals"), when the promise needs something of the reader ("…, we'll
+ * remind you to sign"), when the condition is for the reader to act on ("If you could send…",
+ * "If you let us know…"), a warning ("If we don't hear from you…", "If you cannot pay…") or the
+ * reader's deadline ("If your payment reaches us by Friday…"), and when an action cue sits
+ * outside the condition and the promise ("Sign it, and if …").
+ */
+function promisesToAct(sentence) {
+  const s = sentence.replace(/’/g, "'");
+  return promiseReadings(s).some(([cs, ce, ws, we]) => {
+    const condition = s.slice(cs, ce);
+    const promise = s.slice(ws, we);
+    // Everything else in the sentence; "Please note that if…" is not a request.
+    const outside = `${s.slice(0, Math.min(cs, ws))} ${s.slice(Math.min(ce, we), Math.max(cs, ws))} ${s.slice(Math.max(ce, we))}`
+      .replace(/\bplease (?:note|be advised|be aware)\b/gi, '');
+    // "if you need to sign anything" in the condition is only a possibility, not a request.
+    if (DIRECT_REQUEST.test(`${outside} ${promise} ${condition.replace(/\byou[ \t]+(?:need to|must)\b/gi, '')}`)) return false;
+    if (NEEDS_READER.test(promise) || ACTION_CUES.test(outside)) return false;
+    if (WARNING.test(condition) || READER_ACTS.test(condition)) return false;
+    return !(/\byour?\b/i.test(condition) && (DATE_TEST.test(condition) || TIME_TEST.test(condition)));
+  });
+}
 
 // Deadline phrasing, not just any mention of "today" or "important".
 const URGENT_CUES = /\b(?:urgent(?:ly)?|asap|immediately|overdue|final (?:notice|reminder|demand)|last chance|action required|response required|deadline|suspended|time[- ]sensitive|today only|(?:by|before|due|until|end of) (?:today|tonight|eod|cob|end of (?:the )?day)|expir(?:es|ing|y)? (?:today|tomorrow|tonight|in \d+ (?:hours?|days?))|this is (?:urgent|important))\b|\bimportant\s*[:!]/i;
@@ -76,15 +215,15 @@ const REPLY_SUBJECT = /^\s*(?:re|aw|sv|antw|odp|vs)\s*:/i;
 const FORWARD_SUBJECT = /^\s*(?:fwd?|wg|tr|rv|enc)\s*:/i;
 // "On Mon, 13 Oct 2026 at 09:12, Will <will@x.com> wrote:" and the same in other languages.
 const ATTRIBUTION = /^.{0,300}?(?:\bwrote|\bschrieb|\bescribió|\ba écrit|\bha scritto|\bschreef|\bskrev)[^\n]{0,200}:\s*$/i;
-const LABEL_RE = /^(?:Forwarded|Earlier) message(?: from .{1,200})?:$/;
 
 // "From: …" followed by Sent/Date (with a time) and To/Subject lines, as mail clients
-// write above a quoted or forwarded message. Returns { from, end } or null.
+// write above a quoted or forwarded message. Returns { from, end, date } or null.
 function headerBlock(lines, i, afterSeparator) {
   const first = HEADER.exec(lines[i] || '');
   if (!first || first[1].toLowerCase() !== 'from') return null;
   const seen = new Set();
   let timed = false;
+  let date = null;
   let end = i + 1;
   let last = 'from';
   for (; end < lines.length && end < i + 12; end++) {
@@ -94,6 +233,7 @@ function headerBlock(lines, i, afterSeparator) {
       last = h[1].toLowerCase();
       seen.add(last);
       if ((last === 'sent' || last === 'date') && /\d{1,2}[:.]\d{2}/.test(h[2])) timed = true;
+      if ((last === 'sent' || last === 'date') && date === null) date = headerDay(h[2]);
     } else if (!(lines[end].includes('@') && /^(?:to|cc|bcc)$/.test(last))) {
       break; // anything but a wrapped To:/Cc: list ends the block
     }
@@ -101,7 +241,39 @@ function headerBlock(lines, i, afterSeparator) {
   const addressed = /@|<[^>]*>/.test(first[2]);
   if (!timed || !(seen.has('to') || seen.has('cc') || seen.has('subject'))) return null;
   if (!addressed && !afterSeparator && !seen.has('sent')) return null;
-  return { from: senderName(first[2]), end };
+  return { from: senderName(first[2]), end, date };
+}
+
+const MONTH_WORD = '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
+const HEADER_DMY = new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)? (?:of )?${MONTH_WORD}\\.? (\\d{4})\\b`, 'i');
+const HEADER_MDY = new RegExp(`\\b${MONTH_WORD}\\.? (\\d{1,2})(?:st|nd|rd|th)? (\\d{4})\\b`, 'i');
+const monthNumber = (word) => ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].indexOf(word.slice(0, 3).toLowerCase()) + 1;
+
+/**
+ * The day a quoted or forwarded message was sent, from its Date:/Sent: header ("Mon, 13 Oct
+ * 2026 at 09:12", "Monday, October 13, 2026 9:12 AM", "2026-10-13 09:12"), as 'YYYY-MM-DD'.
+ * null when it can't be read for certain: "10/11/2026" could be day first or month first.
+ */
+function headerDay(value) {
+  const v = String(value || '').replace(/[*,]/g, ' ').replace(/\s+/g, ' ');
+  let y = 0;
+  let m = 0;
+  let d = 0;
+  let x;
+  if ((x = /\b(\d{4})-(\d{1,2})-(\d{1,2})\b/.exec(v))) [y, m, d] = [x[1], x[2], x[3]].map(Number);
+  else if ((x = HEADER_DMY.exec(v))) [d, m, y] = [Number(x[1]), monthNumber(x[2]), Number(x[3])];
+  else if ((x = HEADER_MDY.exec(v))) [m, d, y] = [monthNumber(x[1]), Number(x[2]), Number(x[3])];
+  else if ((x = /(?<![\d/.-])(\d{1,2})[/.-](\d{1,2})[/.-](\d{4}|\d{2})(?![\d/.-])/.exec(v))) {
+    const [a, b] = [Number(x[1]), Number(x[2])];
+    y = x[3].length === 2 ? 2000 + Number(x[3]) : Number(x[3]);
+    if (a > 12) [d, m] = [a, b];
+    else if (b > 12 || a === b) [m, d] = [a, b];
+    else return null; // which comes first is a guess
+  }
+  if (!m || y < 1990 || y > 2100) return null;
+  const t = new Date(Date.UTC(y, m - 1, d));
+  if (t.getUTCFullYear() !== y || t.getUTCMonth() !== m - 1 || t.getUTCDate() !== d) return null;
+  return t.toISOString().slice(0, 10);
 }
 
 function senderName(value) {
@@ -136,7 +308,8 @@ function unquote(lines, i) {
 
 // Drops '>' quoted lines and their attributions (inline answers between them stay),
 // cuts the quoted history under an Outlook-style header in a reply, and keeps
-// forwarded messages as labelled segments. Returns [{ label, text }].
+// forwarded messages as labelled segments. Returns [{ label, text, date }]: date is the
+// day a forwarded segment was sent ('YYYY-MM-DD', from its header), or null.
 function splitQuoted(text, subject = '') {
   const lines = text.split('\n');
   const isReply = REPLY_SUBJECT.test(subject);
@@ -144,7 +317,7 @@ function splitQuoted(text, subject = '') {
   // '>' lines are old history only in a reply or under a "… wrote:" attribution. Elsewhere
   // (a booking site quoting a guest, an HTML <blockquote>) they are the content itself.
   const dropQuotes = isReply || lines.some((_, k) => attributionLength(lines, k) > 0);
-  const segments = [{ label: null, lines: [] }];
+  const segments = [{ label: null, date: null, lines: [] }];
   let hasContent = false; // any text kept yet
   for (let i = 0; i < lines.length; i++) {
     // Apple Mail's HTML puts a forwarded message, marker and all, in a blockquote. Unquote
@@ -169,7 +342,7 @@ function splitQuoted(text, subject = '') {
       if (isReply && !forwarded && hasContent) break; // the rest is the thread being replied to
       const from = block ? ` from ${block.from}` : '';
       const first = forwarded && segments.length === 1;
-      segments.push({ label: `${first ? 'Forwarded' : 'Earlier'} message${from}:`, lines: [] });
+      segments.push({ label: `${first ? 'Forwarded' : 'Earlier'} message${from}:`, date: block ? block.date : null, lines: [] });
       i = (block ? block.end : j) - 1;
       continue;
     }
@@ -181,7 +354,7 @@ function splitQuoted(text, subject = '') {
     segments[segments.length - 1].lines.push(line);
     if (line.trim()) hasContent = true;
   }
-  return segments.map((s) => ({ label: s.label, text: s.lines.join('\n') }));
+  return segments.map((s) => ({ label: s.label, date: s.date, text: s.lines.join('\n') }));
 }
 
 // ---------- Signatures ----------
@@ -276,11 +449,14 @@ const FOOTER_HINTS = [
   'manage your preferences', 'email preferences', 'update your preferences', 'registered in england',
   'registered in scotland', 'registered in wales', 'registered office', 'company number', 'company registration',
   'all rights reserved', 'please consider the environment', 'privacy policy', 'privacy notice',
-  'do not reply to this email', 'please do not reply', 'mailbox is not monitored', 'no-reply', 'noreply',
+  'do not reply to this email', 'please do not reply', "please don't reply", "don't reply to this",
+  'please do not respond', "please don't respond", 'do not respond to this', "don't respond to this",
+  'mailbox is not monitored', 'no-reply', 'noreply',
 ];
 const FOOTER_RE = new RegExp(`(?:^|\\W)(?:${FOOTER_HINTS.map((h) => h.replace(/[.*+?^${}()|[\]\\-]/g, '\\$&')).join('|')})(?![a-z])`, 'i');
 
 // A person writing ("I tried to unsubscribe…") is not a footer; footers say "we" and "you".
+// Curly apostrophes are made straight first, so "Please don’t reply" is a footer too.
 const FIRST_PERSON = /\b(?:I|I'm|I’m|I've|I’ve|I'd|I’d|I'll|I’ll|me|my)\b/;
 const isFooter = (s) => FOOTER_RE.test(s.includes('’') ? s.replace(/’/g, "'") : s) && !hasKeyFacts(s) && !FIRST_PERSON.test(s);
 // Boilerplate that is never real content, wherever it sits (other footer text only goes
@@ -301,9 +477,15 @@ function greetingLength(s) {
   return names[0].split(/[ \t]+/).length > 5 ? -1 : g[0].length + names[0].length;
 }
 
+// A greeting word, then one name or username of any case and a comma: "Dear will_w99,",
+// "Hi customer,". One word only, so "Hi Will running late," is still content.
+const GREETING_ONE_NAME = /^[ \t]+(?=[\p{L}\p{N}_.@'-]{2,40}[ \t]*,)[\p{N}_.@'-]*\p{L}[\p{L}\p{N}_.@'-]*[ \t]*,[ \t]*$/u;
+
 const isGreetingLine = (line) => {
-  const n = greetingLength(line.trim());
-  return n >= 0 && /^[ \t]*[,!.:]*[ \t]*$/.test(line.trim().slice(n));
+  const s = line.trim();
+  const n = greetingLength(s);
+  if (n < 0) return false;
+  return /^[ \t]*[,!.:]*[ \t]*$/.test(s.slice(n)) || GREETING_ONE_NAME.test(s.slice(GREETING.exec(s)[0].length));
 };
 
 // "Hi Will, running 20 mins late." -> "running 20 mins late."
@@ -346,7 +528,12 @@ const PLEASANTRY = `(?:${PLEASANTRIES.join('|')})`;
 const JOIN = '(?:\\s*[,;&]\\s*|\\s+[-–—]\\s+|,?\\s+(?:and|but)\\s+(?:that\\s+)?)';
 const FILLER_RE = new RegExp(`^${PLEASANTRY}(?:${JOIN}(?:${PLEASANTRY}|${PLEASANTRY_TAILS.join('|')}))*$`, 'i');
 // Newsletter fluff with an open end: dropped only if the sentence has no facts in it.
-const FILLER_OPEN = [/^welcome to (?:another|this week's|the latest)\b/i, /^(?:we've|we have) got (?:loads|lots|plenty)\b/i];
+// So is a recruiter's "Thank you for your interest in…" opening, so a rejection leads with the news.
+const FILLER_OPEN = [
+  /^welcome to (?:another|this week's|the latest)\b/i,
+  /^(?:we've|we have) got (?:loads|lots|plenty)\b/i,
+  /^(?:thanks|thank you)(?: (?:so|very) much)? for (?:your interest in|applying|your applications?)\b/i,
+];
 
 // Throat-clearing at the start of a sentence; the rest of the sentence is kept.
 const FILLER_PREFIXES = [
@@ -486,7 +673,29 @@ const RECEIPT_RE = /\b(?:your receipt|receipt (?:for|from|no\.?|number|#)|invoic
 const BULK_CUES = /\bunsubscribe\b|\bview (?:this (?:email|message) |it )?(?:in|on) (?:your |a |the )?(?:browser|web)\b|\byou(?:'re| are) receiving this\b|\b(?:manage|update) (?:your )?(?:email |subscription |mailing )?preferences\b/i;
 const BULK_SENDER = /^(?:newsletters?|news|marketing|offers|deals|promos?|promotions)[-._+@]/i;
 const PROMO_RE = /\d+% off\b|\b(?:sale|deals?|offers?|discounts?|promo(?:tion)?s?|vouchers?|coupons?|clearance)\b/i;
+// "offer you the role", "an offer of £250,000", "a job offer", "the sale of the house", "for
+// sale", "completion of the sale", an insurance renewal's "No Claims Discount": an offer, a
+// sale or a discount, but not marketing.
+const NOT_PROMO = /\boffer(?:s|ed|ing)? (?:you|of)\b|\b(?:job|employment|formal|written|verbal|conditional|unconditional) offers?\b|\bcompletion of the sale\b|\bsale of(?! the (?:year|century|season|summer|winter|spring|autumn)\b)|\bfor sale\b|\bno[- ]?claims?[- ](?:discounts?|bonus(?:es)?)\b/gi;
 const NOTIFY_SENDER = /(?:^|[-._+])(?:no[-_]?reply|do[-_]?not[-_]?reply)(?:[-._+@]|$)|^(?:notifications?|alerts?|mailer(?:-daemon)?|bounces?)[-._+@]|@(?:mailer|notifications?|alerts?|bounces?)\./i;
+// A question or request put to the reader ("Can you drop the keys round on Saturday?"). A
+// receipt's "Need help?" or "Would you like to rate your order?" is not one.
+const READER_ASK = /\b(?:can|could|would|will) you\b|\b(?:are|do|did|have) you\b[^.!?\n]*\?/i;
+const STOCK_ASK = /\b(?:did you know|would you like|(?:have|got) (?:a|any) (?:questions?|queries)|do you have (?:any )?(?:questions?|queries)|need (?:any )?help|how (?:did we do|likely|was your)|(?:leave|write) (?:us )?a review|(?:rate|review) (?:us|our|your (?:order|purchase|experience|stay|visit|delivery|driver))|(?:give|leave|share|send) (?:us )?(?:your |some )?feedback|survey|recommend us|unsubscribe|preferences|not you|wasn't you|was this you)\b/i;
+const asksReader = (s) => (READER_ASK.test(s) || (/\bplease\b/i.test(s) && FIRST_PERSON.test(s))) && !STOCK_ASK.test(s);
+
+// Whether `re` matches somewhere other than the writer's own sentences: a person's "I had to
+// unsubscribe from everything" is not a newsletter footer. Looks at the first 100 matches.
+function saidByOthers(re, s) {
+  let n = 0;
+  for (const m of s.matchAll(new RegExp(re.source, 'gi'))) {
+    if (++n > 100) break;
+    const head = s.slice(Math.max(0, m.index - 300), m.index).split(/[.!?](?=\s)|\n/).pop();
+    const tail = s.slice(m.index + m[0].length, m.index + m[0].length + 300).split(/[.!?](?=\s|$)|\n/)[0];
+    if (!FIRST_PERSON.test(`${head}${m[0]}${tail}`)) return true;
+  }
+  return false;
+}
 
 // `massMail` is true only on strong evidence (List-* headers passed in as `bulk`, or a
 // newsletter-style sender); only then are actions and urgency switched off.
@@ -495,8 +704,9 @@ function classify({ from = '', subject = '', text = '', bulk = false }) {
   const s = `${subject || ''}\n${text}`.replace(/’/g, "'");
   const massMail = Boolean(bulk) || BULK_SENDER.test(f);
   let category = 'person';
-  if (RECEIPT_RE.test(s)) category = 'receipt';
-  else if (massMail || BULK_CUES.test(s) || /\bnewsletter\b/i.test(subject || '')) category = PROMO_RE.test(s) ? 'promo' : 'newsletter';
+  // "Payment received for the van, thanks. Can you drop the keys round?" is a person writing.
+  if (saidByOthers(RECEIPT_RE, s) && !splitSentences(s.slice(0, DETAIL_LIMIT)).some(asksReader)) category = 'receipt';
+  else if (massMail || saidByOthers(BULK_CUES, s) || /\bnewsletter\b/i.test(subject || '')) category = PROMO_RE.test(s.replace(NOT_PROMO, ' ')) ? 'promo' : 'newsletter';
   else if (NOTIFY_SENDER.test(f)) category = 'notification';
   return { category, massMail };
 }
@@ -670,7 +880,12 @@ const DETAIL_LIMIT = 50_000;
 
 /**
  * @param {{ text?: string, html?: string, subject?: string, from?: string, bulk?: boolean }} email
- *   bulk: optional, true when the message has List-Unsubscribe/List-Id or Precedence: bulk headers.
+ *   bulk: optional, and true switches off actions and questions. The app leaves it out:
+ *   mailing-list headers are weighed in triage.js, where they can't hide a real ask.
+ * @returns {object} body, keyPoints, questions, actions, dates, times, amounts, links,
+ *   category, urgency, stats, and forwarded: [{ at, date }], one per forwarded or quoted
+ *   message kept in the body: `at` is where its "Forwarded message…:" label starts in body,
+ *   `date` the day it was sent ('YYYY-MM-DD', from its Date:/Sent: header) or null if unknown.
  */
 function clean(email = {}) {
   const raw = (typeof email.text === 'string' && email.text.trim()) ? email.text : htmlToText(email.html);
@@ -684,40 +899,34 @@ function clean(email = {}) {
   // email (a log, a huge newsletter) is kept as it is, so it cannot stall the main process.
   let room = DETAIL_LIMIT;
   let overflow = '';
-  const cleanedText = segments
-    .map(({ label, text: part }) => {
-      if (room <= 0) {
-        overflow += `\n${label || ''}\n${part}`;
-        return '';
-      }
-      let head = part;
-      if (part.length > room) {
-        const cut = part.lastIndexOf('\n', room);
-        head = part.slice(0, cut > 0 ? cut : room);
-        overflow += part.slice(head.length);
-      }
-      room -= head.length;
-      const kept = cutSignature(head)
-        .split('\n')
-        .filter((l) => !isGreetingLine(l) && !/^\s*[_=*~-]{5,}\s*$/.test(l))
-        .join('\n')
-        .trim();
-      return label ? `${label}\n\n${kept}` : kept;
-    })
-    .filter(Boolean)
-    .join('\n\n');
-
-  // Units are sentences, or the lines of a list or "Label: value" block.
-  const blocks = cleanedText
-    .split(/\n\s*\n/)
-    .map((p) => p.trim())
-    .filter(Boolean)
-    .map((p) => {
-      if (LABEL_RE.test(p)) return { label: true, units: [p] };
-      const structured = isStructured(p);
-      const units = structured ? p.split('\n').map((l) => l.replace(/[ \t]+/g, ' ').trim()).filter(Boolean) : splitSentences(p);
-      return { structured, units };
-    });
+  const overflowLabels = []; // forwarded segments that only made it into the overflow
+  // Units are sentences, or the lines of a list or "Label: value" block. A forwarded
+  // segment's label ("Forwarded message from …:") is a block of its own that keeps its date.
+  const toBlock = (p) => {
+    const structured = isStructured(p);
+    const units = structured ? p.split('\n').map((l) => l.replace(/[ \t]+/g, ' ').trim()).filter(Boolean) : splitSentences(p);
+    return { structured, units };
+  };
+  const blocks = segments.flatMap(({ label, date, text: part }) => {
+    if (room <= 0) {
+      overflow += `\n${label || ''}\n${part}`;
+      if (label) overflowLabels.push({ label, date });
+      return [];
+    }
+    let head = part;
+    if (part.length > room) {
+      const cut = part.lastIndexOf('\n', room);
+      head = part.slice(0, cut > 0 ? cut : room);
+      overflow += part.slice(head.length);
+    }
+    room -= head.length;
+    const kept = cutSignature(head)
+      .split('\n')
+      .filter((l) => !isGreetingLine(l) && !/^\s*[_=*~-]{5,}\s*$/.test(l))
+      .join('\n');
+    const paragraphs = kept.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean).map(toBlock);
+    return label ? [{ label: true, date, units: [label] }, ...paragraphs] : paragraphs;
+  });
 
   // Footer text is only dropped from the paragraphs after the last one with an ask, amount,
   // date or action, and never from the first one.
@@ -743,7 +952,25 @@ function clean(email = {}) {
   const { texts, links } = shortenUrls(keptBlocks.flatMap((b) => b.units));
   let t = 0;
   for (const b of keptBlocks) b.units = texts.slice(t, (t += b.units.length));
-  const body = keptBlocks.map((b) => (b.structured || b.overflow ? b.units.join('\n') : joinSentences(b.units))).join('\n\n');
+  // Where each forwarded segment starts in the body, with the day it was sent, so dates.js can
+  // count its "within 28 days" from then rather than from when it was forwarded.
+  const forwarded = [];
+  let at = 0;
+  const body = keptBlocks.map((b) => {
+    const piece = b.structured || b.overflow ? b.units.join('\n') : joinSentences(b.units);
+    if (b.label) forwarded.push({ at, date: b.date || null });
+    if (b.overflow) {
+      let from = 0;
+      for (const { label, date } of overflowLabels) {
+        const i = piece.indexOf(label, from);
+        if (i < 0) continue;
+        forwarded.push({ at: at + i, date: date || null });
+        from = i + label.length;
+      }
+    }
+    at += piece.length + 2;
+    return piece;
+  }).join('\n\n');
   const allSentences = keptBlocks
     .filter((b) => !b.label && !b.overflow)
     .flatMap((b) => (b.structured ? b.units.flatMap((u) => splitSentences(u.replace(LIST_MARKER, ''))) : b.units))
@@ -756,9 +983,10 @@ function clean(email = {}) {
     bulk: email.bulk,
   });
   const marketing = massMail && (category === 'newsletter' || category === 'promo');
-  const questions = marketing ? [] : uniq(allSentences.filter((s) => /\?\s*$/.test(s)));
+  const questions = marketing ? [] : uniq(allSentences.filter(isQuestion));
+  // "Please don't reply to this email" and "There's nothing you need to do" ask for nothing.
   const actions = marketing ? [] : uniq(
-    allSentences.filter((s) => ACTION_CUES.test(s) && !/\?\s*$/.test(s) && s.length < 240),
+    allSentences.filter((s) => ACTION_CUES.test(withoutNonAsks(s)) && !isQuestion(s) && s.length < 240 && !promisesToAct(s)),
   );
   const dates = uniq([...body.matchAll(DATE_RE)].map((m) => m[0].trim()).filter(realDate));
   const times = uniq([...body.matchAll(TIME_RE)].map((m) => m[0].trim()));
@@ -779,10 +1007,23 @@ function clean(email = {}) {
     times,
     amounts,
     links,
+    forwarded,
     category,
     urgency: urgent ? 'high' : (actions.length || questions.length) && personLike ? 'normal' : 'low',
     stats: { rawWords, keptWords, saved: Math.max(0, rawWords - keptWords) },
   };
 }
 
-module.exports = { clean, htmlToText, splitSentences };
+module.exports = {
+  clean,
+  htmlToText,
+  splitSentences,
+  countWords,
+  realDate,
+  asksNothing,
+  // Regex sources (not the regexes, whose lastIndex is shared state) for dates.js and
+  // summarize.js. DATE_SOURCE has one capture group, so use it on its own, not wrapped.
+  DATE_SOURCE: DATE_RE.source,
+  TIME_SOURCE: TIME_RE.source,
+  MONEY_SOURCE: MONEY_RE.source,
+};

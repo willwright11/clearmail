@@ -2,79 +2,176 @@
 // fake web browser that signs in by following the authorize URL back to ClearMail's
 // loopback redirect. installFetch() routes fetch calls for the real Microsoft addresses
 // here, so src/microsoft.js runs with its production endpoints. Used by
-// test/integration.test.js; not a test file itself.
+// test/integration.test.js and test/microsoft.test.js; not a test file itself.
 //
 // It checks what Microsoft checks (PKCE S256, redirect URI, no client secret, the client
-// ID) and answers in Microsoft's formats. Tokens, codes and nothing else start "SECRET-",
-// so a test can make sure none of them is ever logged or saved in plain text.
+// ID, refresh scopes within what was first granted) and answers in Microsoft's formats.
+// Tokens, codes and nothing else start "SECRET-", so a test can make sure none of them is
+// ever logged or saved in plain text.
+//
+// ClearMail may only read. Graph here serves GETs and $batch of GETs; anything else (a
+// reply, /sendMail, /send, PATCH, DELETE, /move, a PATCH inside a $batch...) gets 405 and is
+// recorded in ms.refused, so a test can assert it stays empty.
 const crypto = require('crypto');
 const http = require('http');
 
 const LOGIN = 'https://login.microsoftonline.com';
 const GRAPH = 'https://graph.microsoft.com';
+const GRAPH_PREFIX = `${GRAPH}/`;
+const PERSONAL_TENANT = '9188040d-6c67-4c5b-b112-36a304b66dad';
+const WORK_TENANT = '5b3c2f1e-8d7a-4c6b-9e0f-1a2b3c4d5e6f';
+// Scopes every sign-in may ask for without the app registration listing them.
+const OIDC = new Set(['openid', 'profile', 'email', 'offline_access']);
+// What ClearMail 0.2 asked for: an old consent still grants Mail.ReadWrite (and Mail.Send).
+const LEGACY_SCOPE = 'openid profile email offline_access https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send';
 const realFetch = globalThis.fetch;
 
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('base64url');
+const b64 = (value) => Buffer.from(JSON.stringify(value)).toString('base64url');
+const address = ([name, addr]) => ({ emailAddress: { name, address: addr } });
+const minutesAgoIso = (minutes) => new Date(Date.now() - minutes * 60000).toISOString();
+
+// Scope names as Microsoft compares them: Graph's prefix dropped, case ignored.
+const scopeName = (s) => (s.toLowerCase().startsWith(GRAPH_PREFIX.toLowerCase()) ? s.slice(GRAPH_PREFIX.length) : s).toLowerCase();
+const scopeWords = (text) => String(text || '').split(/\s+/).filter(Boolean);
 
 /**
- * A Graph message. from/replyTo are [name, address]; minutesAgo sets the dates;
- * attachments are { name, size, isInline, contentType }.
+ * A Graph inbox message. from is [name, address]; replyTo is one [name, address] or a list
+ * of them (as Graph lists every Reply-To address); to/cc are lists of them;
+ * minutesAgo sets the dates; attachments are { name, size, isInline, contentType };
+ * headers are extra internet headers ({ 'List-Unsubscribe': '<https://...>' }), only
+ * served by a single-message GET as Graph does. focused: true (Focused), false (Other)
+ * or null (no inferenceClassification).
  */
-function graphMessage({ id, from, replyTo, subject, text, minutesAgo = 60, isRead = false, attachments = [], html = false }) {
-  const when = new Date(Date.now() - minutesAgo * 60000).toISOString();
-  const address = ([name, addr]) => ({ emailAddress: { name, address: addr } });
+function graphMessage({
+  id, from, replyTo, to = [], cc = [], subject, text, minutesAgo = 60, isRead = false, attachments = [], html = false,
+  importance = 'normal', focused = true, flagged = false, conversationId, webLink, headers = {}, inReplyTo = null,
+}) {
+  const when = minutesAgoIso(minutesAgo);
+  const internetMessageId = `<${id}@mail.example>`;
+  const internetMessageHeaders = [
+    { name: 'Message-ID', value: internetMessageId },
+    { name: 'Subject', value: String(subject ?? '') },
+    ...(inReplyTo ? [{ name: 'In-Reply-To', value: inReplyTo }] : []),
+    ...Object.entries(headers).map(([name, value]) => ({ name, value })),
+  ];
   return {
     id,
-    internetMessageId: `<${id}@mail.example>`,
+    internetMessageId,
     subject,
     from: address(from),
     sender: address(from),
-    replyTo: replyTo ? [address(replyTo)] : [],
+    replyTo: !replyTo ? [] : Array.isArray(replyTo[0]) ? replyTo.map(address) : [address(replyTo)],
+    toRecipients: to.map(address),
+    ccRecipients: cc.map(address),
     sentDateTime: when,
     receivedDateTime: when,
     isRead,
+    importance,
+    ...(focused === null ? {} : { inferenceClassification: focused ? 'focused' : 'other' }),
+    flag: { flagStatus: flagged ? 'flagged' : 'notFlagged' },
+    conversationId: conversationId || `conv-${id}`,
+    webLink: webLink || `https://outlook.live.com/owa/?ItemID=${encodeURIComponent(id)}&exvsurl=1&viewmodel=ReadMessageItem`,
     body: { contentType: html ? 'html' : 'text', content: text },
     attachments,
+    internetMessageHeaders,
   };
+}
+
+/**
+ * A message in Sent Items. to/cc/bcc are lists of [name, address]; from defaults to the
+ * mailbox's own address when served.
+ */
+function sentMessage({ id, from, to = [], cc = [], bcc = [], minutesAgo = 60, conversationId, subject = '' }) {
+  return {
+    id,
+    ...(from ? { from: address(from) } : {}),
+    subject,
+    toRecipients: to.map(address),
+    ccRecipients: cc.map(address),
+    bccRecipients: bcc.map(address),
+    conversationId: conversationId || `conv-${id}`,
+    sentDateTime: minutesAgoIso(minutesAgo),
+  };
+}
+
+// Only the $select-ed fields (and id), like Graph; attachments only with $expand.
+function project(message, query) {
+  const fields = new Set(['id', ...String(query.get('$select') || '').split(',').filter(Boolean)]);
+  const out = {};
+  for (const field of fields) if (Object.hasOwn(message, field)) out[field] = structuredClone(message[field]);
+  if (/^attachments\(/.test(query.get('$expand') || '')) out.attachments = structuredClone(message.attachments || []);
+  return out;
 }
 
 async function startMicrosoft({ clientId }) {
   const ms = {
     requests: [], // { method, path, mailbox } for every request
-    replies: [], // { mailbox, id, body }
-    batches: [], // { mailbox, ids }
+    batches: [], // { mailbox, ids }: the messages each $batch read
+    batchRequests: [], // { mailbox, method, url } for every request inside a $batch
+    refused: [], // { mailbox, method, path }: calls that would have sent email or changed a mailbox (405)
     visits: [], // the authorize pages the browser opened: { url, params, status, page }
     refreshTokensUsed: [], // { mailbox, token } for every refresh-token grant
+    tokenScopes: [], // { mailbox, grant, requested, granted } for every token issued
     mailboxes: new Map(),
     // What the user does in the browser, given the authorize URL's query:
     // { email } signs in, { error, description } comes back with an error, { hang: true } never returns.
     choose: () => ({ hang: true }),
     pageSize: 1000,
+    // An old consent that still grants Mail.ReadWrite on every token (also per mailbox).
+    legacyConsent: false,
   };
-  const codes = new Map(); // code -> { email, challenge, method, redirectUri }
+  const codes = new Map(); // code -> { email, challenge, method, redirectUri, scope }
   const accessTokens = new Map(); // token -> email
-  const refreshTokens = new Map(); // token -> email
+  const refreshTokens = new Map(); // token -> { email, scope: the scopes first asked for }
   const revoked = new Set(); // tokens that no longer work
   let n = 0;
 
-  ms.addMailbox = ({ email, displayName, mail = email, userPrincipalName = email, messages = [] }) => {
-    const box = { email, displayName, mail, userPrincipalName, messages, forbidden: false, latestRefreshToken: null };
+  ms.addMailbox = ({ email, displayName, mail = email, userPrincipalName = email, messages = [], sent = [], personal, legacyConsent }) => {
+    const box = {
+      email, displayName, mail, userPrincipalName, messages, sent, forbidden: false, latestRefreshToken: null,
+      personal: personal ?? /@(?:outlook|hotmail|live)\./i.test(email),
+      legacyConsent,
+    };
     ms.mailboxes.set(email, box);
     return box;
   };
   ms.mailbox = (email) => ms.mailboxes.get(email);
   // Like a password change or an admin revoking the sign-in: every token so far stops working.
   ms.revokeAll = (email) => {
-    for (const [token, owner] of [...accessTokens, ...refreshTokens]) if (owner === email) revoked.add(token);
+    for (const [token, owner] of accessTokens) if (owner === email) revoked.add(token);
+    for (const [token, grant] of refreshTokens) if (grant.email === email) revoked.add(token);
+  };
+  // A refresh token as an earlier ClearMail saved it (by default with 0.2's Mail.ReadWrite grant).
+  ms.issueRefreshToken = (email, { scope = LEGACY_SCOPE } = {}) => {
+    const rt = `SECRET-rt-${++n}`;
+    refreshTokens.set(rt, { email, scope });
+    return rt;
   };
 
-  function issue(email) {
+  // Microsoft lists the Graph permissions the access token carries (with their prefix)
+  // and the sign-in ones it granted; an old consent adds what it granted then.
+  function grantedScope(email, requested) {
+    const words = scopeWords(requested).filter((s) => s !== 'offline_access');
+    const box = ms.mailbox(email);
+    if ((box.legacyConsent ?? ms.legacyConsent) && !words.some((s) => scopeName(s) === 'mail.readwrite')) {
+      words.push(`${GRAPH_PREFIX}Mail.ReadWrite`);
+    }
+    return words.join(' ');
+  }
+
+  function issue(email, scope, grant) {
+    const box = ms.mailbox(email);
     const at = `SECRET-at-${++n}`;
     const rt = `SECRET-rt-${++n}`;
     accessTokens.set(at, email);
-    refreshTokens.set(rt, email);
-    ms.mailbox(email).latestRefreshToken = rt;
-    return { token_type: 'Bearer', scope: 'https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/User.Read', expires_in: 3599, ext_expires_in: 3599, access_token: at, refresh_token: rt };
+    refreshTokens.set(rt, { email, scope });
+    box.latestRefreshToken = rt;
+    const granted = grantedScope(email, scope);
+    ms.tokenScopes.push({ mailbox: email, grant, requested: scope, granted });
+    // The id_token's middle part is the claims; its signature is never checked by ClearMail.
+    const idToken = `SECRET-idt.${b64({ tid: box.personal ? PERSONAL_TENANT : WORK_TENANT, preferred_username: email, name: box.displayName })}.sig`;
+    return { token_type: 'Bearer', scope: granted, expires_in: 3599, ext_expires_in: 3599, access_token: at, refresh_token: rt, id_token: idToken };
   }
 
   const oauthError = (error, code, text) => ({ status: 400, json: { error, error_description: `AADSTS${code}: ${text} Trace ID: 0000`, error_codes: [code] } });
@@ -90,19 +187,41 @@ async function startMicrosoft({ clientId }) {
       if (!grant) return oauthError('invalid_grant', 70000, 'The provided authorization code is invalid.');
       if (grant.method !== 'S256' || sha256(form.get('code_verifier') || '') !== grant.challenge) return oauthError('invalid_grant', 501481, 'The Code_Verifier does not match the code_challenge.');
       if (form.get('redirect_uri') !== grant.redirectUri) return oauthError('invalid_grant', 50148, 'The redirect_uri does not match.');
-      return { json: issue(grant.email) };
+      return { json: issue(grant.email, grant.scope, 'authorization_code') };
     }
     if (form.get('grant_type') === 'refresh_token') {
       const rt = form.get('refresh_token');
-      const email = refreshTokens.get(rt);
-      if (email) ms.refreshTokensUsed.push({ mailbox: email, token: rt });
-      if (!email || revoked.has(rt)) return oauthError('invalid_grant', 70008, 'The refresh token has expired or is invalid due to sign-in frequency checks.');
-      return { json: issue(email) }; // Microsoft hands out a new refresh token; the old one keeps working
+      const grant = refreshTokens.get(rt);
+      if (grant) ms.refreshTokensUsed.push({ mailbox: grant.email, token: rt });
+      if (!grant || revoked.has(rt)) return oauthError('invalid_grant', 70008, 'The refresh token has expired or is invalid due to sign-in frequency checks.');
+      // A refresh may only ask for what the first sign-in asked for (or less).
+      const first = new Set(scopeWords(grant.scope).map(scopeName));
+      const outside = scopeWords(form.get('scope')).filter((s) => !OIDC.has(scopeName(s)) && !first.has(scopeName(s)));
+      if (outside.length) return oauthError('invalid_grant', 70000, 'The request was denied because one or more scopes requested are unauthorized or expired. The user must first sign in and grant the client application access to the requested scope.');
+      return { json: issue(grant.email, grant.scope, 'refresh_token') }; // Microsoft hands out a new refresh token; the old one keeps working
     }
     return oauthError('unsupported_grant_type', 70003, 'Unsupported grant type.');
   }
 
-  function graph(request, email) {
+  const notFound = () => graphError(404, 'ErrorItemNotFound', 'The specified object was not found in the store.');
+
+  // One page of a newest-first list, with a nextLink that skips ahead like Graph's.
+  function listPage(all, path, query) {
+    const top = Math.min(Number(query.get('$top')) || 10, ms.pageSize); // Graph may send smaller pages
+    const skip = Number(query.get('$skip') || 0);
+    const page = all.slice(skip, skip + top).map((m) => project(m, query));
+    const next = new URL(`${GRAPH}${path}`);
+    for (const [k, v] of query) next.searchParams.set(k, v);
+    next.searchParams.set('$skip', String(skip + top));
+    return { json: { '@odata.context': 'x', value: page, ...(skip + top < all.length ? { '@odata.nextLink': next.toString() } : {}) } };
+  }
+
+  function refuse(email, method, path) {
+    ms.refused.push({ mailbox: email, method, path });
+    return graphError(405, 'ErrorInvalidRequest', `ClearMail's stand-in Microsoft refuses ${method} ${path}: ClearMail may only read.`);
+  }
+
+  function graph(request, email, { inBatch = false } = {}) {
     const box = ms.mailbox(email);
     const { method, path, query } = request;
     if (method === 'GET' && path === '/v1.0/me') {
@@ -115,38 +234,44 @@ async function startMicrosoft({ clientId }) {
       if (!/^attachments\(\$select=[^)]*\)$/.test(query.get('$expand') || '') || /contentBytes/.test(query.get('$expand'))) {
         return graphError(400, 'BadRequest', 'Unexpected $expand.');
       }
-      const top = Math.min(Number(query.get('$top')), ms.pageSize); // Graph may send smaller pages
-      const skip = Number(query.get('$skip') || 0);
+      // Graph only documents internet headers for one message at a time.
+      if (/internetMessageHeaders/.test(query.get('$select') || '')) return graphError(400, 'BadRequest', 'internetMessageHeaders is not supported on a list.');
       const all = [...box.messages].sort((a, b) => new Date(b.receivedDateTime) - new Date(a.receivedDateTime));
-      const page = all.slice(skip, skip + top).map((m) => structuredClone(m));
-      const more = skip + top < all.length;
-      const next = new URL(`${GRAPH}/v1.0/me/mailFolders/inbox/messages`);
-      for (const [k, v] of query) next.searchParams.set(k, v);
-      next.searchParams.set('$skip', String(skip + top));
-      return { json: { '@odata.context': 'x', value: page, ...(more ? { '@odata.nextLink': next.toString() } : {}) } };
+      return listPage(all, path, query);
     }
-    if (method === 'POST' && path === '/v1.0/$batch') {
+    if (method === 'GET' && path === '/v1.0/me/mailFolders/sentitems/messages') {
+      if (query.get('$orderby') !== 'sentDateTime desc') return graphError(400, 'BadRequest', 'Unexpected $orderby.');
+      let all = [...box.sent].map((m) => (m.from ? m : { ...m, from: address([box.displayName, box.mail || box.userPrincipalName]) }));
+      const filter = query.get('$filter');
+      if (filter) {
+        const m = /^sentDateTime gt (\d{4}-\d\d-\d\dT[\d:.]+Z)$/.exec(filter);
+        if (!m) return graphError(400, 'BadRequest', 'Invalid filter clause');
+        all = all.filter((x) => new Date(x.sentDateTime) > new Date(m[1]));
+      }
+      all.sort((a, b) => new Date(b.sentDateTime) - new Date(a.sentDateTime));
+      return listPage(all, path, query);
+    }
+    const one = /^\/v1\.0\/me\/messages\/([^/]+)$/.exec(path);
+    if (method === 'GET' && one) {
+      const msg = box.messages.find((x) => x.id === decodeURIComponent(one[1]));
+      return msg ? { json: project(msg, query) } : notFound();
+    }
+    if (method === 'POST' && path === '/v1.0/$batch' && !inBatch) {
       const { requests } = JSON.parse(request.text);
       const ids = [];
       const responses = requests.map((r) => {
-        const m = /^\/me\/messages\/([^/?]+)$/.exec(r.url);
-        const id = m && decodeURIComponent(m[1]);
-        const msg = box.messages.find((x) => x.id === id);
-        if (r.method !== 'PATCH' || !msg) return { id: r.id, status: 404, body: { error: { code: 'ErrorItemNotFound', message: 'The specified object was not found in the store.' } } };
-        Object.assign(msg, r.body);
-        ids.push(id);
-        return { id: r.id, status: 200, headers: { 'Content-Type': 'application/json' }, body: { id, isRead: msg.isRead } };
+        ms.batchRequests.push({ mailbox: email, method: r.method, url: r.url });
+        const url = new URL(r.url, 'http://graph.local');
+        const inner = { method: String(r.method || '').toUpperCase(), path: `/v1.0${url.pathname}`, query: url.searchParams, headers: r.headers || {}, text: r.body === undefined ? '' : JSON.stringify(r.body) };
+        const out = inner.method === 'GET' ? graph(inner, email, { inBatch: true }) : refuse(email, inner.method, inner.path);
+        const m = /^\/v1\.0\/me\/messages\/([^/]+)$/.exec(inner.path);
+        if (m && (out.status || 200) === 200) ids.push(decodeURIComponent(m[1]));
+        return { id: r.id, status: out.status || 200, headers: { 'Content-Type': 'application/json' }, body: out.json };
       });
       ms.batches.push({ mailbox: email, ids });
       return { json: { responses: responses.reverse() } }; // Graph answers in any order
     }
-    const reply = /^\/v1\.0\/me\/messages\/([^/]+)\/reply$/.exec(path);
-    if (method === 'POST' && reply) {
-      const id = decodeURIComponent(reply[1]);
-      if (!box.messages.some((x) => x.id === id)) return graphError(404, 'ErrorItemNotFound', 'The specified object was not found in the store.');
-      ms.replies.push({ mailbox: email, id, body: JSON.parse(request.text) });
-      return { status: 202 };
-    }
+    if (method !== 'GET') return refuse(email, method, path);
     return graphError(404, 'NoRoute', `No route for ${method} ${path}`);
   }
 
@@ -190,7 +315,10 @@ async function startMicrosoft({ clientId }) {
       back.search = new URLSearchParams({ error: choice.error, error_description: choice.description || '', state: params.get('state') }).toString();
     } else {
       const code = `SECRET-code-${++n}`;
-      codes.set(code, { email: choice.email, challenge: params.get('code_challenge'), method: params.get('code_challenge_method'), redirectUri: params.get('redirect_uri') });
+      codes.set(code, {
+        email: choice.email, challenge: params.get('code_challenge'), method: params.get('code_challenge_method'),
+        redirectUri: params.get('redirect_uri'), scope: params.get('scope') || '',
+      });
       back.search = new URLSearchParams({ code, state: params.get('state'), session_state: 'abc' }).toString();
     }
     ms.browsing = realFetch(back).then(async (res) => {
@@ -215,4 +343,4 @@ async function startMicrosoft({ clientId }) {
   return ms;
 }
 
-module.exports = { startMicrosoft, graphMessage };
+module.exports = { startMicrosoft, graphMessage, sentMessage, PERSONAL_TENANT, LEGACY_SCOPE };

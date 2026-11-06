@@ -1,12 +1,21 @@
-// Settings and summary cache, kept in the app's userData folder. App passwords, Microsoft
-// sign-ins and the API key are encrypted with the macOS Keychain via Electron's safeStorage.
+// What ClearMail keeps in the app's userData folder, each file readable by the user only (0600).
+// App passwords and Microsoft sign-ins are encrypted with the macOS Keychain via Electron's
+// safeStorage. No email text is ever written to disk.
 //
-// settings.json (version 2):
-//   { version: 2, apiKey, limit, demo, msClientId, accounts: [
-//       { id, kind: 'imap', provider, user, pass, imapHost, imapPort, imapSecurity, smtpHost, smtpPort, smtpSecurity }
-//     | { id, kind: 'microsoft', email, name, refreshToken } ] }
-// pass, refreshToken and apiKey hold encrypted text (base64). Version 1 kept a single IMAP
-// account's fields at the top level; it is read as accounts[0] and rewritten on the next save.
+// settings.json (version 3):
+//   { version: 3, limit, demo, msClientId, brief: { enabled, time, days, openAtLogin }, accounts: [
+//       { id, kind: 'imap', provider, user, pass, imapHost, imapPort, imapSecurity }
+//     | { id, kind: 'microsoft', email, name, refreshToken, grant, grantedScopes, personal, upgrade } ] }
+// pass and refreshToken hold encrypted text (base64). grant is 'read' for a sign-in made by
+// read-only ClearMail (Mail.Read only); migrate() clears every other sign-in (0.2's had
+// Mail.ReadWrite and Mail.Send, an early 0.3's 'read+reply' had Mail.Send) and marks it
+// upgrade: 'reconnect'. Fields ClearMail no longer uses, such as the outgoing-mail server
+// that replies once went through, are dropped. Version 1 kept a single IMAP account's fields
+// at the top level; it is read as accounts[0].
+//
+// state.json: { rules: { address|'@domain': 'important'|'noise' }, done: { emailId: ms },
+//   notNoise: { emailId: ms }, brief: { lastSlot, lastAt, lastSince }, migrated: { localDone } }
+// history.json: { accountId: History } (see src/history.js): who the user has written to.
 
 const crypto = require('crypto');
 const fs = require('fs');
@@ -14,6 +23,9 @@ const path = require('path');
 const { app, safeStorage } = require('electron');
 const { PROVIDERS } = require('./mail');
 const { CLIENT_ID_RE } = require('./config');
+const { normalizeBriefSettings, BRIEF_DEFAULTS } = require('./brief');
+const { isValidRuleKey } = require('./triage');
+const { normalizeHistory } = require('./history');
 
 const file = (name) => path.join(app.getPath('userData'), name);
 
@@ -42,9 +54,11 @@ function readJson(name, fallback) {
 }
 
 // Writes a temp file and renames it over the old one, so a crash mid-write can't corrupt it.
+// Only the user can read the files (0600): they hold who the user writes to.
 function writeJson(name, data) {
   fs.mkdirSync(app.getPath('userData'), { recursive: true });
   const tmp = file(`${name}.tmp`);
+  fs.rmSync(tmp, { force: true }); // a leftover from a crash could have other permissions
   fs.writeFileSync(tmp, JSON.stringify(data), { mode: 0o600 });
   fs.renameSync(tmp, file(name));
 }
@@ -52,18 +66,21 @@ function writeJson(name, data) {
 // ---------- settings ----------
 
 const SECRET_OF = { imap: 'pass', microsoft: 'refreshToken' }; // each account kind's secret
-const IMAP_FIELDS = ['provider', 'user', 'imapHost', 'imapPort', 'imapSecurity', 'smtpHost', 'smtpPort', 'smtpSecurity'];
+const IMAP_FIELDS = ['provider', 'user', 'imapHost', 'imapPort', 'imapSecurity'];
 const PROVIDER_KEYS = [...Object.keys(PROVIDERS), 'custom'];
 const SECURITY = ['tls', 'starttls'];
 const DEFAULT_LIMIT = 60;
 const MAX_LIMIT = 500;
 const MAX_ACCOUNTS = 20;
+const VERSION = 3;
+// What a Microsoft sign-in made by read-only ClearMail was granted: Mail.Read only.
+const GRANT = 'read';
 const ID_RE = /^[0-9a-f]{8,64}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+$/;
 const HOST_RE = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/i;
+const SCOPE_RE = /^[\w.-]{1,100}$/;
 // Microsoft's own consumer domains, which can no longer use an app password.
 const MICROSOFT_MAIL_RE = /@(?:outlook|hotmail|live|msn)\.(?:com|[a-z]{2}|co\.[a-z]{2}|com\.[a-z]{2})$/i;
-const KIND_LABEL = { imap: 'IMAP (incoming)', smtp: 'SMTP (outgoing)' };
 const GONE = 'That account is no longer in ClearMail. Close Settings and try again.';
 
 const isText = (v) => typeof v === 'string';
@@ -88,36 +105,47 @@ function normaliseImap(raw) {
   // Outlook is no longer an IMAP choice (Microsoft turned off app-password IMAP): treat it as custom.
   s.provider = PROVIDER_KEYS.includes(raw.provider) ? raw.provider : raw.provider ? 'custom' : 'gmail';
   s.user = isText(raw.user) ? raw.user.trim() : '';
-  for (const kind of ['imap', 'smtp']) {
-    s[`${kind}Host`] = isText(raw[`${kind}Host`]) ? raw[`${kind}Host`].trim() : '';
-    s[`${kind}Port`] = toPort(raw[`${kind}Port`]) || '';
-    const saved = raw[`${kind}Security`];
-    const legacy = raw[`${kind}Secure`]; // older versions saved a boolean
-    s[`${kind}Security`] = SECURITY.includes(saved) ? saved
-      : legacy === false ? 'starttls' : legacy === true ? 'tls' : defaultSecurity(s[`${kind}Port`]);
-  }
+  s.imapHost = isText(raw.imapHost) ? raw.imapHost.trim() : '';
+  s.imapPort = toPort(raw.imapPort) || '';
+  const legacy = raw.imapSecure; // older versions saved a boolean
+  s.imapSecurity = SECURITY.includes(raw.imapSecurity) ? raw.imapSecurity
+    : legacy === false ? 'starttls' : legacy === true ? 'tls' : defaultSecurity(s.imapPort);
   return s;
+}
+
+// Permissions as Microsoft listed them (short names, e.g. 'Mail.Read'), sorted and capped.
+function scopesOf(value) {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((s) => isText(s) && SCOPE_RE.test(s)))].sort().slice(0, 50);
 }
 
 function normaliseMicrosoft(raw) {
   return {
     email: isText(raw.email) ? raw.email.trim() : '',
     name: isText(raw.name) ? raw.name.replace(/[\x00-\x1f\x7f]+/g, ' ').trim().slice(0, 200) : '',
+    grant: raw.grant === GRANT ? GRANT : '',
+    grantedScopes: scopesOf(raw.grantedScopes),
+    personal: typeof raw.personal === 'boolean' ? raw.personal : null,
+    upgrade: raw.upgrade === 'reconnect' ? 'reconnect' : null,
   };
 }
 
-// Where an IMAP password would be sent. Preset providers ignore the custom host fields.
-function serverIdentity(a) {
+// The IMAP server an account reads from: a preset provider's own (the custom host field is
+// ignored), else the one typed in. Lower-cased.
+function imapHostOf(a) {
   const preset = presetFor(a.provider);
-  const host = (kind) => (preset ? preset[kind].host : a[`${kind}Host`]).toLowerCase();
-  return [a.provider, a.user.toLowerCase(), host('imap'), host('smtp')].join('\n');
+  return (preset ? preset.imap.host : String(a.imapHost || '')).toLowerCase();
+}
+
+// Where an IMAP password would be sent.
+function serverIdentity(a) {
+  return [a.provider, a.user.toLowerCase(), imapHostOf(a)].join('\n');
 }
 
 /** Which mailbox an account reads: the same value means the same mailbox. */
 function accountIdentity(a) {
   if (a.kind === 'microsoft') return `microsoft\n${String(a.email || '').toLowerCase()}`;
-  const preset = presetFor(a.provider);
-  return `imap\n${String(a.user || '').toLowerCase()}\n${(preset ? preset.imap.host : String(a.imapHost || '')).toLowerCase()}`;
+  return `imap\n${String(a.user || '').toLowerCase()}\n${imapHostOf(a)}`;
 }
 
 // An id for an account saved without a usable one (version 1 files). Derived from the
@@ -139,8 +167,11 @@ function newId(doc) {
 
 /**
  * The settings file as plain fields plus secrets still encrypted:
- * { general: { limit, demo, msClientId }, apiKey: Secret, accounts: [{ id, kind, ...fields, secret: Secret }] }
- * where Secret = { cipher, value? } (value is set once the plain text is known).
+ * { version, hadApiKey, hadUnusedFields, general: { limit, demo, msClientId, brief },
+ *   accounts: [{ id, kind, ...fields, secret: Secret }] }
+ * where Secret = { cipher, value? } (value is set once the plain text is known), and
+ * hadUnusedFields is true when an account was saved with fields ClearMail no longer reads
+ * (such as the outgoing-mail server replies once used), which the next write leaves out.
  */
 function readDoc() {
   const raw = readJson('settings.json', {});
@@ -150,6 +181,7 @@ function readDoc() {
   }
   const used = new Set();
   const accounts = [];
+  let hadUnusedFields = false;
   list.forEach((entry, index) => {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return;
     const kind = entry.kind === undefined ? 'imap' : entry.kind;
@@ -161,16 +193,21 @@ function readDoc() {
     const id = isText(entry.id) && ID_RE.test(entry.id) && !used.has(entry.id) ? entry.id : derivedId(index, kind, plain, used);
     used.add(id);
     const cipher = entry[SECRET_OF[kind]];
+    const written = new Set(['id', 'kind', SECRET_OF[kind], ...Object.keys(plain)]);
+    if (Object.keys(entry).some((key) => !written.has(key))) hadUnusedFields = true;
     accounts.push({ id, kind, ...plain, secret: { cipher: isText(cipher) ? cipher : '' } });
   });
   const limit = Number(raw.limit);
   return {
+    version: Number(raw.version) || (list.length ? 1 : 0),
+    hadApiKey: Object.hasOwn(raw, 'apiKey'),
+    hadUnusedFields,
     general: {
       limit: Number.isInteger(limit) && limit >= 1 && limit <= MAX_LIMIT ? limit : DEFAULT_LIMIT,
       demo: raw.demo === true,
       msClientId: clientIdOf(raw.msClientId),
+      brief: normalizeBriefSettings(raw.brief, { lenient: true }),
     },
-    apiKey: { cipher: isText(raw.apiKey) ? raw.apiKey : '' },
     accounts: accounts.slice(0, MAX_ACCOUNTS),
   };
 }
@@ -188,12 +225,12 @@ function decrypt(value) {
 
 function encrypt(value) {
   if (!safeStorage.isEncryptionAvailable()) {
-    throw userError("ClearMail can't reach the macOS Keychain, so it can't store your password or key safely. Quit and reopen ClearMail, then try again.");
+    throw userError("ClearMail can't reach the macOS Keychain, so it can't store your password or sign-in safely. Quit and reopen ClearMail, then try again.");
   }
   try {
     return safeStorage.encryptString(value).toString('base64');
   } catch (err) {
-    throw userError("ClearMail couldn't save your password or key in the macOS Keychain. Quit and reopen ClearMail, then try again.", err);
+    throw userError("ClearMail couldn't save your password or sign-in in the macOS Keychain. Quit and reopen ClearMail, then try again.", err);
   }
 }
 
@@ -210,26 +247,29 @@ function clearSecret(secret) {
 }
 
 /**
- * Settings for the main process: { accounts, apiKey, limit, demo, msClientId, locked: { apiKey } }.
+ * Settings for the main process: { accounts, limit, demo, msClientId, brief }.
  * Each account has its decrypted secret (pass or refreshToken; '' when missing or locked)
- * and locked: true when a saved secret exists but couldn't be decrypted.
+ * and locked: true when a saved secret exists but couldn't be decrypted. A Microsoft sign-in
+ * not made for read-only ClearMail (one that could also send, or change the mailbox) is never
+ * used, even if migrate() couldn't clear it.
  */
 function toSettings(doc) {
   const accounts = doc.accounts.map(({ secret, ...plain }) => {
+    if (plain.kind === 'microsoft' && plain.grant !== GRANT) {
+      return { ...plain, refreshToken: '', locked: false, upgrade: secret.cipher || plain.upgrade ? 'reconnect' : null };
+    }
     const { value, locked } = openSecret(secret);
     return { ...plain, [SECRET_OF[plain.kind]]: value, locked };
   });
-  const apiKey = openSecret(doc.apiKey);
-  return { accounts, apiKey: apiKey.value, ...doc.general, locked: { apiKey: apiKey.locked } };
+  return { accounts, ...doc.general, brief: { ...doc.general.brief, days: [...doc.general.brief.days] } };
 }
 
 // Only what is listed here reaches the disk. Untouched secrets keep their exact stored
 // ciphertext, so a secret the Keychain won't unlock right now is never erased.
 function writeDoc(doc) {
   const out = {
-    version: 2,
+    version: VERSION,
     accounts: doc.accounts.map(({ secret, ...plain }) => ({ ...plain, [SECRET_OF[plain.kind]]: secret.cipher })),
-    apiKey: doc.apiKey.cipher,
     ...doc.general,
   };
   try {
@@ -243,13 +283,64 @@ function loadSettings() {
   return toSettings(readDoc());
 }
 
+/**
+ * Brings files from older versions up to date, once, at startup. Writes only if something
+ * changed, and never throws (a failure is logged and tried again next launch):
+ * - the Claude API key and the AI summary cache (summaries.json) are deleted;
+ * - every Microsoft sign-in whose grant isn't 'read' could do more than read (0.2's was granted
+ *   Mail.ReadWrite and Mail.Send, an early 0.3's 'read+reply' Mail.Send), so it is thrown
+ *   away and the account asks to sign in again;
+ * - IMAP accounts keep their address, app password and incoming (IMAP) server settings, and
+ *   lose the outgoing-mail server settings replies once used.
+ * Account ids never change, so Done, Not noise and the Sent history stay with their account.
+ * @returns {{ changed: boolean, reconnect: string[] }}
+ */
+function migrate() {
+  const out = { changed: false, reconnect: [] };
+  for (const name of ['summaries.json', 'summaries.json.tmp']) {
+    try {
+      if (fs.existsSync(file(name))) {
+        fs.rmSync(file(name), { force: true });
+        out.changed = true;
+      }
+    } catch (err) {
+      console.warn(`Could not delete ${name}:`, err.message);
+    }
+  }
+  if (!fs.existsSync(file('settings.json'))) return out;
+  const doc = readDoc();
+  let write = doc.version !== VERSION || doc.hadApiKey || doc.hadUnusedFields;
+  for (const a of doc.accounts) {
+    if (a.kind !== 'microsoft' || a.grant === GRANT) continue;
+    if (a.secret.cipher) {
+      clearSecret(a.secret);
+      a.upgrade = 'reconnect';
+      out.reconnect.push(a.id);
+      write = true;
+    }
+    if (a.grantedScopes.length) {
+      a.grantedScopes = [];
+      write = true;
+    }
+  }
+  if (write) {
+    try {
+      writeDoc(doc);
+      out.changed = true;
+    } catch (err) {
+      console.error('Could not update the settings file:', err.message);
+    }
+  }
+  return out;
+}
+
 // The trimmed new secret, '' for "keep the saved one", or null for "remove it".
 function secretInput(value, label) {
   if (value === null) return null;
   if (value === undefined || value === '') return '';
   if (!isText(value)) throw userError(`Your ${label} must be text.`);
-  // Passwords are saved exactly as typed (a space can be part of one); keys are trimmed.
-  const v = label === 'app password' ? value : value.trim();
+  // Passwords are saved exactly as typed (a space can be part of one).
+  const v = value;
   if (!v.trim()) return '';
   if (v.length > 4096 || /[\x00-\x1f\x7f]/.test(v)) throw userError(`Your ${label} contains characters that can't be used. Paste it again.`);
   return v;
@@ -258,9 +349,9 @@ function secretInput(value, label) {
 const formError = (what) => userError(`ClearMail couldn't read the ${what}. Please try again.`);
 
 /**
- * Saves the General settings: { apiKey, limit, demo, msClientId }. Missing keys keep their
- * saved value; a blank apiKey keeps the saved key and null removes it. Returns the new
- * settings (as loadSettings) or throws a user-friendly Error, in which case nothing is written.
+ * Saves the General settings and the morning brief: { limit, demo, msClientId, brief }.
+ * Missing keys keep their saved value; brief may be partial. Returns the new settings (as
+ * loadSettings) or throws a user-friendly Error, in which case nothing is written.
  */
 function saveSettings(input) {
   if (!input || typeof input !== 'object') throw formError('settings form');
@@ -282,22 +373,19 @@ function saveSettings(input) {
     }
     doc.general.msClientId = id.toLowerCase();
   }
-  const apiKey = secretInput(input.apiKey, 'Claude API key');
-  if (apiKey && !/^[\x21-\x7e]+$/.test(apiKey)) {
-    throw userError("That Claude API key doesn't look right. Copy it again from console.anthropic.com.");
-  }
-  // Encrypt before writing anything, so a Keychain failure changes nothing.
-  if (apiKey) setSecret(doc.apiKey, apiKey);
-  else if (apiKey === null) clearSecret(doc.apiKey);
+  // Its messages are written for the user ("Choose a time for the morning brief, like 07:30.").
+  if (has('brief')) doc.general.brief = normalizeBriefSettings(input.brief, { base: doc.general.brief });
   writeDoc(doc);
   return toSettings(doc);
 }
 
 /**
- * Adds (no id) or edits an IMAP account. Only known keys are read; missing keys keep
- * their saved value. A blank pass keeps the saved one, except that it is dropped when the
- * provider, address or server changes, so it is never sent to a different server; null
- * removes it. Returns the new settings or throws a user-friendly Error (nothing written).
+ * Adds (no id) or edits an IMAP account: { id?, provider, user, pass, imapHost, imapPort,
+ * imapSecurity }. Only these keys are read (anything else, such as an outgoing-mail server,
+ * is ignored); missing keys keep their saved value. A blank pass keeps the saved one, except
+ * that it is dropped when the provider, address or server changes, so it is never sent to a
+ * different server; null removes it. Returns the new settings or throws a user-friendly
+ * Error (nothing written).
  */
 function saveAccount(input) {
   if (!input || typeof input !== 'object') throw formError('account form');
@@ -331,24 +419,21 @@ function saveAccount(input) {
   if (next.user.toLowerCase() !== before.user.toLowerCase() && MICROSOFT_MAIL_RE.test(next.user)) {
     throw userError('Outlook and Hotmail addresses can\'t use an app password any more. Close this form and choose "Add Outlook or Microsoft 365" instead.');
   }
-  for (const kind of ['imap', 'smtp']) {
-    const [hostKey, portKey, secKey] = [`${kind}Host`, `${kind}Port`, `${kind}Security`];
-    if (has(hostKey)) {
-      const host = isText(input[hostKey]) ? input[hostKey].trim() : null;
-      if (host === null || (host && !HOST_RE.test(host))) {
-        throw userError(`The ${KIND_LABEL[kind]} server name doesn't look right. It should look like ${kind}.example.com.`);
-      }
-      next[hostKey] = host;
+  if (has('imapHost')) {
+    const host = isText(input.imapHost) ? input.imapHost.trim() : null;
+    if (host === null || (host && !HOST_RE.test(host))) {
+      throw userError("The IMAP (incoming) server name doesn't look right. It should look like imap.example.com.");
     }
-    if (has(portKey)) {
-      const port = toPort(input[portKey]);
-      if (port === null) throw userError(`The ${KIND_LABEL[kind]} port must be a number from 1 to 65535.`);
-      next[portKey] = port;
-    }
-    if (has(secKey) && input[secKey] !== '') {
-      if (!SECURITY.includes(input[secKey])) throw userError(`Choose TLS or STARTTLS for the ${KIND_LABEL[kind]} server.`);
-      next[secKey] = input[secKey];
-    }
+    next.imapHost = host;
+  }
+  if (has('imapPort')) {
+    const port = toPort(input.imapPort);
+    if (port === null) throw userError('The IMAP (incoming) port must be a number from 1 to 65535.');
+    next.imapPort = port;
+  }
+  if (has('imapSecurity') && input.imapSecurity !== '') {
+    if (!SECURITY.includes(input.imapSecurity)) throw userError('Choose TLS or STARTTLS for the IMAP (incoming) server.');
+    next.imapSecurity = input.imapSecurity;
   }
   const twin = doc.accounts.find((a) => a !== target && accountIdentity(a) === accountIdentity({ kind: 'imap', ...next }));
   if (twin) throw userError(`${next.user} is already in ClearMail.`);
@@ -378,11 +463,13 @@ function removeAccount(id) {
 const validToken = (t) => isText(t) && t.length > 0 && t.length <= 65536 && /^[\x21-\x7e]+$/.test(t);
 
 /**
- * Saves a Microsoft sign-in: { id?, email, name, refreshToken }. With id, that account is
- * signed in again (and must be the same address); without, an account with the same address
- * is updated, or a new one is added. Returns the new settings or throws a user-friendly Error.
+ * Saves a Microsoft sign-in: { id?, email, name, refreshToken, grantedScopes, personal }.
+ * With id, that account is signed in again (and must be the same address); without, an
+ * account with the same address is updated, or a new one is added. The sign-in is recorded
+ * as 'read' (ClearMail only asks Microsoft for Mail.Read), which ends a pending 'reconnect'.
+ * Returns the new settings or throws a user-friendly Error.
  */
-function saveMicrosoftAccount({ id, email, name, refreshToken } = {}) {
+function saveMicrosoftAccount({ id, email, name, refreshToken, grantedScopes, personal } = {}) {
   const address = isText(email) ? email.trim() : '';
   if (!EMAIL_RE.test(address) || address.length > 254 || /[\x00-\x1f\x7f]/.test(address)) {
     throw userError("Microsoft didn't tell ClearMail the email address of this account, so it couldn't be added. Please try again.");
@@ -403,8 +490,8 @@ function saveMicrosoftAccount({ id, email, name, refreshToken } = {}) {
   }
   const secret = target ? target.secret : { cipher: '' };
   setSecret(secret, refreshToken); // encrypt before writing anything
-  const fields = normaliseMicrosoft({ email: address, name });
-  if (target) Object.assign(target, { name: fields.name || target.name });
+  const fields = normaliseMicrosoft({ email: address, name, grant: GRANT, grantedScopes, personal });
+  if (target) Object.assign(target, { ...fields, email: target.email, name: fields.name || target.name });
   else doc.accounts.push({ id: newId(doc), kind: 'microsoft', ...fields, secret });
   writeDoc(doc);
   return toSettings(doc);
@@ -412,15 +499,31 @@ function saveMicrosoftAccount({ id, email, name, refreshToken } = {}) {
 
 /**
  * Stores a new refresh token Microsoft handed out for a signed-in account. Returns the new
- * settings, or null when the account is gone or the token is unusable (nothing written).
- * Throws a user-friendly Error if it can't be saved.
+ * settings, or null when the account is gone, still needs its read-only sign-in, or the
+ * token is unusable (nothing written). Throws a user-friendly Error if it can't be saved.
  */
 function setRefreshToken(id, refreshToken) {
   if (!validToken(refreshToken)) return null;
   const doc = readDoc();
   const target = doc.accounts.find((a) => a.id === id && a.kind === 'microsoft');
-  if (!target) return null;
+  if (!target || target.grant !== GRANT) return null;
   setSecret(target.secret, refreshToken);
+  writeDoc(doc);
+  return toSettings(doc);
+}
+
+/**
+ * Stores the permissions Microsoft says a signed-in account's token carries, so Settings can
+ * warn about an old Mail.ReadWrite or Mail.Send consent. Returns the new settings, or null
+ * when nothing changed or the account is gone.
+ */
+function setGrantedScopes(id, grantedScopes) {
+  const doc = readDoc();
+  const target = doc.accounts.find((a) => a.id === id && a.kind === 'microsoft');
+  if (!target || target.grant !== GRANT) return null;
+  const scopes = scopesOf(grantedScopes);
+  if (scopes.join(' ') === target.grantedScopes.join(' ')) return null;
+  target.grantedScopes = scopes;
   writeDoc(doc);
   return toSettings(doc);
 }
@@ -437,14 +540,14 @@ function publicAccount(a, needsSignIn) {
     imapHost: imap ? a.imapHost : '',
     imapPort: imap ? a.imapPort : '',
     imapSecurity: imap ? a.imapSecurity : '',
-    smtpHost: imap ? a.smtpHost : '',
-    smtpPort: imap ? a.smtpPort : '',
-    smtpSecurity: imap ? a.smtpSecurity : '',
     hasPass: imap && Boolean(a.pass),
     signedIn: !imap && Boolean(a.refreshToken),
-    // No usable sign-in (never finished, or locked in the Keychain) also needs a new sign-in.
-    needsSignIn: !imap && (!a.refreshToken || needsSignIn.has(a.id)),
+    // No usable sign-in (never finished, one that could do more than read, or locked in the Keychain) also needs a new sign-in.
+    needsSignIn: !imap && (!a.refreshToken || a.upgrade === 'reconnect' || needsSignIn.has(a.id)),
     locked: Boolean(a.locked),
+    grantedScopes: imap ? [] : [...(a.grantedScopes || [])],
+    upgrade: imap ? null : a.upgrade || null,
+    personal: imap ? null : typeof a.personal === 'boolean' ? a.personal : MICROSOFT_MAIL_RE.test(a.email || ''),
   };
 }
 
@@ -457,52 +560,135 @@ function publicSettings(s, { needsSignIn = new Set() } = {}) {
     accounts: s.accounts.map((a) => publicAccount(a, needsSignIn)),
     limit: s.limit,
     demoChosen: Boolean(s.demo),
-    hasApiKey: Boolean(s.apiKey),
-    secretsLocked: Boolean(s.locked?.apiKey || s.accounts.some((a) => a.locked)),
+    secretsLocked: s.accounts.some((a) => a.locked),
     msClientId: s.msClientId || '',
+    brief: { ...(s.brief || BRIEF_DEFAULTS), days: [...(s.brief || BRIEF_DEFAULTS).days] },
   };
 }
 
-// ---------- summary cache ----------
-// { [emailId]: { at, summary } } for AI summaries, or { at, failed } for emails the AI
-// can never summarise (refusals and the like), so they are not sent and billed again.
+// ---------- state.json: sorting rules, Done, Not noise and the brief ----------
 
-const CACHE_FILE = 'summaries.json';
-const CACHE_MAX = 1000;
+const STATE_FILE = 'state.json';
+const STATE_LIMITS = { rules: 2000, marks: 5000, markDays: 60 };
+const DAY_MS = 24 * 3600 * 1000;
+// An email id: '<account id or demo>:<the backend's id>'.
+const EMAIL_ID_RE = /^(?:[0-9a-f]{8,64}|demo):\S/;
+const isEmailId = (id) => isText(id) && id.length <= 2048 && EMAIL_ID_RE.test(id);
 
-const cache = {
-  load() {
-    const out = {};
-    for (const [id, entry] of Object.entries(readJson(CACHE_FILE, {}))) {
-      const ok = entry && Number.isFinite(entry.at) && ((entry.summary && typeof entry.summary === 'object') || isText(entry.failed));
-      if (ok) out[id] = entry;
-    }
-    return out;
-  },
-  save(entries) {
-    writeJson(CACHE_FILE, entries);
-  },
-  /** Keeps every id in keepIds plus the newest other entries, up to max in total. */
-  prune(entries, keepIds, max = CACHE_MAX) {
-    const ids = Object.keys(entries);
-    if (ids.length <= max) return false;
-    const keep = new Set(ids.filter((id) => keepIds.has(id)));
-    const others = ids.filter((id) => !keep.has(id)).sort((a, b) => entries[b].at - entries[a].at);
-    for (const id of others.slice(0, Math.max(0, max - keep.size))) keep.add(id);
-    for (const id of ids) if (!keep.has(id)) delete entries[id];
-    return true;
-  },
-};
+function emptyState() {
+  return { rules: {}, done: {}, notNoise: {}, brief: { lastSlot: null, lastAt: null, lastSince: null }, migrated: {} };
+}
+
+const timeOf = (v) => (Number.isFinite(v) && v > 0 ? v : null);
+
+// The accounts whose entries may be kept, or null for any (options.accountIds: ids or a Set).
+const ownersOf = (accountIds) => (accountIds == null ? null : new Set([].concat(accountIds instanceof Set ? [...accountIds] : accountIds)));
+const ownedBy = (owners, accountId) => !owners || owners.has(accountId);
+
+// { id: ms } with valid ids, at most `limit` (the newest), none older than markDays unless
+// the email is still loaded (`keep`), so a Done email still in the inbox stays done. With
+// `owners`, only marks for those accounts are kept (a removed account's go).
+function marksOf(raw, { now, keep, owners }) {
+  const oldest = now - STATE_LIMITS.markDays * DAY_MS;
+  const entries = Object.entries(raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {})
+    .filter(([id, at]) => isEmailId(id) && Number.isFinite(at) && ownedBy(owners, id.slice(0, id.indexOf(':'))))
+    .map(([id, at]) => [id, Math.min(at, now)])
+    .filter(([id, at]) => at >= oldest || keep.has(id))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, STATE_LIMITS.marks);
+  return Object.fromEntries(entries);
+}
+
+/**
+ * state.json with anything malformed dropped and the caps applied: at most 2000 rules, and
+ * at most 5000 Done and 5000 Not noise marks, none older than 60 days unless its email is in
+ * `keep`. With `accountIds`, marks for any other account are dropped. Never throws.
+ */
+function normalizeState(raw, { now = Date.now(), keep = new Set(), accountIds = null } = {}) {
+  const owners = ownersOf(accountIds);
+  const r = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const rules = {};
+  for (const [key, rule] of Object.entries(r.rules && typeof r.rules === 'object' ? r.rules : {})) {
+    if (Object.keys(rules).length >= STATE_LIMITS.rules) break;
+    if (isValidRuleKey(key) && (rule === 'important' || rule === 'noise')) rules[key] = rule;
+  }
+  const b = r.brief && typeof r.brief === 'object' ? r.brief : {};
+  const m = r.migrated && typeof r.migrated === 'object' ? r.migrated : {};
+  return {
+    rules,
+    done: marksOf(r.done, { now, keep, owners }),
+    notNoise: marksOf(r.notNoise, { now, keep, owners }),
+    brief: { lastSlot: timeOf(b.lastSlot), lastAt: timeOf(b.lastAt), lastSince: timeOf(b.lastSince) },
+    migrated: timeOf(m.localDone) ? { localDone: m.localDone } : {},
+  };
+}
+
+/** state.json; options as normalizeState's (e.g. { accountIds }). */
+function loadState(options) {
+  return normalizeState(readJson(STATE_FILE, {}), options);
+}
+
+/** Saves state.json (normalised); returns what was saved. Throws a user-friendly Error. */
+function saveState(state, options) {
+  const out = normalizeState(state, options);
+  try {
+    writeJson(STATE_FILE, out);
+  } catch (err) {
+    throw userError(`ClearMail couldn't save that change (${err.code || err.message}). Check there is free disk space and try again.`, err);
+  }
+  return out;
+}
+
+// ---------- history.json: who the user has written to, per account ----------
+
+const HISTORY_FILE = 'history.json';
+
+/**
+ * { accountId: History } as saved, each normalised and capped by src/history.js. With
+ * `accountIds`, only those accounts' histories are kept.
+ */
+function loadHistory({ accountIds = null } = {}) {
+  const owners = ownersOf(accountIds);
+  const out = {};
+  for (const [id, h] of Object.entries(readJson(HISTORY_FILE, {}))) if (ID_RE.test(id) && ownedBy(owners, id)) out[id] = normalizeHistory(h);
+  return out;
+}
+
+/**
+ * Saves history.json; returns what was saved. With `accountIds`, any other account's history
+ * is left out (a removed account's never comes back). Throws a user-friendly Error.
+ */
+function saveHistory(histories, { accountIds = null } = {}) {
+  const owners = ownersOf(accountIds);
+  const out = {};
+  for (const [id, h] of Object.entries(histories || {})) if (ID_RE.test(id) && ownedBy(owners, id)) out[id] = normalizeHistory(h);
+  try {
+    writeJson(HISTORY_FILE, out);
+  } catch (err) {
+    throw userError(`ClearMail couldn't save your sent-email history (${err.code || err.message}).`, err);
+  }
+  return out;
+}
 
 module.exports = {
   MICROSOFT_MAIL_RE,
+  GRANT,
+  STATE_LIMITS,
+  migrate,
   loadSettings,
   saveSettings,
   saveAccount,
   removeAccount,
   saveMicrosoftAccount,
   setRefreshToken,
+  setGrantedScopes,
   publicSettings,
   accountIdentity,
-  cache,
+  isEmailId,
+  emptyState,
+  normalizeState,
+  loadState,
+  saveState,
+  loadHistory,
+  saveHistory,
 };

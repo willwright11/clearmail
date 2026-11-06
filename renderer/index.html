@@ -2,63 +2,69 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:;" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'; object-src 'none'" />
   <title>ClearMail</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <div class="app">
-    <aside class="sidebar">
-      <header class="sidebar-head">
-        <h1>ClearMail</h1>
-        <div class="head-actions">
-          <button id="refresh" class="icon-btn" type="button" title="Refresh (⌘R)" aria-label="Refresh inbox">⟳</button>
-          <button id="open-settings" class="icon-btn" type="button" title="Settings (⌘,)" aria-label="Settings">⚙︎</button>
-        </div>
-      </header>
+    <header class="topbar">
+      <span class="brand">ClearMail</span>
+      <div class="tabs" id="tabs" role="tablist" aria-label="Views">
+        <button type="button" role="tab" id="tab-brief" aria-controls="view-brief" aria-selected="true" title="Brief (⌘1)">Brief</button>
+        <button type="button" role="tab" id="tab-people" aria-controls="view-people" aria-selected="false" tabindex="-1" title="By person (⌘2)">By person</button>
+      </div>
+      <div class="head-actions">
+        <button id="refresh" class="icon-btn" type="button" title="Check for new email (⌘R)" aria-label="Check for new email">⟳</button>
+        <button id="open-settings" class="icon-btn" type="button" title="Settings (⌘,)" aria-label="Settings">⚙︎</button>
+      </div>
+    </header>
+
+    <div class="statusbar">
+      <p class="status-line" id="status-line" role="status"></p>
+      <div class="demo-banner" id="demo-banner" role="status" hidden></div>
       <div class="load-error" id="load-error" role="alert" hidden></div>
       <div class="notice" id="notice" role="status" aria-live="polite" hidden></div>
-      <button class="needs-you" id="needs-you" type="button" hidden></button>
-      <input id="search" class="search" type="search" placeholder="Search people or topics" aria-label="Search conversations" />
-      <nav class="filters" id="filters" aria-label="Show">
-        <button data-filter="all" class="chip active" type="button" aria-pressed="true">All</button>
-        <button data-filter="action" class="chip" type="button" aria-pressed="false">Needs me</button>
-        <button data-filter="person" class="chip" type="button" aria-pressed="false">People</button>
-        <button data-filter="updates" class="chip" type="button" aria-pressed="false">Updates</button>
-      </nav>
-      <ul class="chat-list" id="chat-list" role="listbox" aria-label="Conversations"></ul>
-      <footer class="sidebar-foot" id="mode-banner" role="status"></footer>
-    </aside>
+    </div>
 
-    <main class="conversation" id="conversation">
-      <div class="empty" id="empty">
-        <div class="empty-icon" aria-hidden="true">✉︎</div>
-        <p>Pick a conversation.<br />Emails show up as short messages. The important bits are highlighted.</p>
-      </div>
-      <header class="convo-head" id="convo-head" hidden>
-        <div class="avatar" id="convo-avatar" aria-hidden="true"></div>
-        <div class="convo-title">
-          <h2 class="convo-name" id="convo-name"></h2>
-          <div class="convo-sub" id="convo-sub"></div>
-        </div>
-        <button id="convo-done" class="head-btn" type="button" hidden>✓ Mark all done</button>
-      </header>
-      <section class="messages" id="messages" aria-labelledby="convo-name" tabindex="-1" hidden></section>
-      <footer class="composer" id="composer" hidden>
-        <div class="suggestions" id="suggestions" aria-label="Suggested replies"></div>
-        <div class="reply-from" id="reply-from" hidden></div>
-        <form id="reply-form" class="reply-row">
-          <textarea id="reply-input" rows="1" placeholder="Type a reply" aria-label="Reply" aria-describedby="reply-from"></textarea>
-          <button type="submit" class="send" title="Send (↩)" aria-label="Send reply">➤</button>
-        </form>
-      </footer>
+    <main class="view brief-view" id="view-brief" role="tabpanel" aria-labelledby="tab-brief" tabindex="-1">
+      <div class="brief" id="brief" tabindex="-1"></div>
     </main>
+
+    <section class="view people-view" id="view-people" role="tabpanel" aria-labelledby="tab-people" hidden>
+      <aside class="sidebar">
+        <input id="search" class="search" type="search" placeholder="Search people or topics" aria-label="Search conversations" />
+        <div class="filters" id="filters" role="group" aria-label="Show">
+          <button data-filter="all" class="chip active" type="button" aria-pressed="true">All</button>
+          <button data-filter="needs-you" class="chip" type="button" aria-pressed="false">Needs you</button>
+          <button data-filter="worth-knowing" class="chip" type="button" aria-pressed="false">Worth knowing</button>
+          <button data-filter="noise" class="chip" type="button" aria-pressed="false">Noise</button>
+        </div>
+        <ul class="chat-list" id="chat-list" role="listbox" aria-label="People"></ul>
+      </aside>
+
+      <div class="conversation" id="conversation" tabindex="-1">
+        <div class="empty" id="empty">
+          <div class="empty-icon" aria-hidden="true">✉︎</div>
+          <p>Pick a person to see all their emails together.</p>
+        </div>
+        <header class="convo-head" id="convo-head" hidden>
+          <div class="avatar" id="convo-avatar" aria-hidden="true"></div>
+          <div class="convo-title">
+            <h2 class="convo-name" id="convo-name"></h2>
+            <div class="convo-sub" id="convo-sub"></div>
+          </div>
+          <button id="convo-done" class="head-btn" type="button" hidden>✓ Mark all done</button>
+        </header>
+        <section class="messages" id="messages" aria-labelledby="convo-name" tabindex="-1" hidden></section>
+      </div>
+    </section>
   </div>
 
   <dialog id="settings" aria-labelledby="settings-title">
     <div class="dialog-body" id="settings-main">
       <h2 id="settings-title">Settings</h2>
-      <p class="warn" id="secrets-locked" hidden>ClearMail couldn't unlock some of your saved passwords, sign-ins or your Claude key from the macOS Keychain. Quit and reopen ClearMail and choose <b>Always Allow</b> when asked. Or enter them again: the accounts that need it are marked below.</p>
+      <p class="warn" id="secrets-locked" hidden>ClearMail couldn't unlock some of your saved passwords or sign-ins from the macOS Keychain. Quit and reopen ClearMail and choose <b>Always Allow</b> when asked. Or enter them again: the accounts that need it are marked below.</p>
 
       <section class="settings-section" aria-labelledby="accounts-title">
         <h3 id="accounts-title">Accounts</h3>
@@ -93,13 +99,45 @@
           <button type="button" id="add-microsoft" class="add-btn">＋ Add Outlook or Microsoft 365</button>
           <button type="button" id="add-imap" class="add-btn">＋ Add Gmail, iCloud, Yahoo or other</button>
         </div>
+        <p class="hint">ClearMail only reads your email. It can't send, delete, move or mark anything in your mailbox. To reply, use Outlook or your usual mail app.</p>
       </section>
 
       <form id="settings-form" novalidate>
+        <section class="settings-section" aria-labelledby="brief-title">
+          <h3 id="brief-title">Morning brief</h3>
+          <label class="check"><input type="checkbox" name="briefEnabled" /> Send me a morning brief</label>
+          <p class="hint">One notification a day saying how many emails need you. It never shows names or subjects, because it can appear on your lock screen.</p>
+          <div class="brief-fields" id="brief-fields">
+            <label>Time <input type="time" name="briefTime" step="300" class="short" /></label>
+            <fieldset class="days" id="brief-days">
+              <legend>Days</legend>
+            </fieldset>
+            <label class="check"><input type="checkbox" name="openAtLogin" /> Open ClearMail when I log in to my Mac</label>
+            <p class="hint login-status" id="login-status" role="status" hidden></p>
+            <button type="button" id="open-login-items" class="small-btn" hidden>Open Login Items settings</button>
+          </div>
+          <p class="ok-line" id="next-brief" role="status" hidden></p>
+          <p class="warn" id="brief-problem" role="status" hidden></p>
+          <div class="warn" id="notifications-blocked" hidden>
+            <p>macOS isn't showing ClearMail's notifications. Turn them on in System Settings → Notifications → ClearMail.</p>
+            <button type="button" id="open-notifications" class="small-btn">Open Notification settings</button>
+          </div>
+          <div class="brief-test-row">
+            <button type="button" id="brief-test" class="small-btn">Send a test brief now</button>
+            <span class="hint" id="brief-test-status" role="status" aria-live="polite"></span>
+          </div>
+          <p class="hint">ClearMail must be running (closing the window is fine; quitting with ⌘Q stops the brief). Notifications only work in the downloaded app.</p>
+        </section>
+
+        <section class="settings-section" aria-labelledby="rules-title">
+          <h3 id="rules-title">Sorting rules</h3>
+          <ul class="rule-list" id="rule-list" aria-labelledby="rules-title"></ul>
+          <p class="ok-line" id="rules-status" role="status" aria-live="polite" hidden></p>
+          <p class="hint">Removing a rule takes effect straight away.</p>
+        </section>
+
         <section class="settings-section" aria-labelledby="general-title">
           <h3 id="general-title">General</h3>
-          <label>Claude API key (optional) <input name="apiKey" type="password" autocomplete="off" spellcheck="false" /></label>
-          <p class="hint">Without a key, ClearMail still removes waffle offline. With a key, every email gets a plain-English one-liner, a to-do list and suggested replies.</p>
           <label>Emails to load from each account <input name="limit" type="number" min="1" max="500" placeholder="60" class="short" /></label>
           <label class="check"><input type="checkbox" name="demo" /> Demo mode (sample emails)</label>
           <p class="hint" id="demo-flag" hidden>ClearMail was started with <code>--demo</code>, so it shows sample emails until you restart it normally.</p>
@@ -107,12 +145,16 @@
             <summary>Advanced</summary>
             <label>Microsoft app ID for Outlook <input name="msClientId" placeholder="1a2b3c4d-1234-5678-9abc-1234567890ab" spellcheck="false" autocapitalize="off" autocomplete="off" /></label>
             <p class="hint" id="ms-id-hint"></p>
+            <h4 class="can-see-title">What ClearMail can see</h4>
+            <p class="can-see" id="can-see"></p>
+            <p class="hint">Counts only, from the last time your email loaded. Nothing here leaves your Mac.</p>
           </details>
         </section>
         <p class="form-error" id="settings-error" role="alert" hidden></p>
+        <p class="ok-line" id="settings-saved" role="status" hidden></p>
         <div class="dialog-actions">
           <button type="button" id="settings-cancel">Close</button>
-          <button type="submit" id="settings-save" class="primary">Save &amp; reload</button>
+          <button type="submit" id="settings-save" class="primary">Save</button>
         </div>
       </form>
     </div>
@@ -133,17 +175,7 @@
             </select>
           </label>
         </div>
-        <div class="row">
-          <label class="grow">SMTP server (outgoing) <input name="smtpHost" placeholder="smtp.example.com" spellcheck="false" autocapitalize="off" /></label>
-          <label>Port <input name="smtpPort" type="number" min="1" max="65535" placeholder="465" /></label>
-          <label>Security
-            <select name="smtpSecurity">
-              <option value="tls">SSL/TLS</option>
-              <option value="starttls">STARTTLS</option>
-            </select>
-          </label>
-        </div>
-        <p class="hint">SSL/TLS usually uses ports 993 and 465. STARTTLS usually uses 143 and 587.</p>
+        <p class="hint">ClearMail only needs the incoming (IMAP) server, because it only reads. SSL/TLS usually uses port 993; STARTTLS usually uses 143.</p>
       </div>
       <label>Email address <input name="user" type="text" inputmode="email" autocomplete="username" spellcheck="false" autocapitalize="off" /></label>
       <label>App password <input name="pass" type="password" autocomplete="current-password" /></label>
@@ -157,6 +189,10 @@
     </form>
   </dialog>
 
+  <script src="common.js"></script>
+  <script src="brief.js"></script>
+  <script src="people.js"></script>
+  <script src="settings.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

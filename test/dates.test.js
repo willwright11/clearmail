@@ -1,0 +1,474 @@
+// Dates and deadlines, in UK time so the clock changes are exercised. TZ must be set before
+// any Date is made.
+process.env.TZ = 'Europe/London';
+
+const test = require('node:test');
+const assert = require('node:assert');
+const { findDates, findDeadlines, dayKey, daysBetween, formatDay, orderForLocale } = require('../src/dates');
+const { clean } = require('../src/cleaner');
+const demo = require('../src/demo');
+
+const at = (y, m, d, h = 9, min = 0) => new Date(y, m - 1, d, h, min);
+const TUE_3_NOV = at(2026, 11, 3);
+const days = (s, ref = TUE_3_NOV, opts) => findDates(s, ref, opts).map((d) => d.day);
+function one(s, ref = TUE_3_NOV, opts) {
+  const found = findDates(s, ref, opts);
+  assert.strictEqual(found.length, 1, `${s}: ${JSON.stringify(found)}`);
+  return found[0];
+}
+const deadlines = (body, ref = TUE_3_NOV, extra = {}) => findDeadlines({ body, ...extra }, ref);
+const cleanedDeadlines = (text, ref, subject = '') => {
+  const c = clean({ text, subject, from: 'sam@example.com' });
+  return findDeadlines({ subject, body: c.body, questions: c.questions, actions: c.actions }, ref);
+};
+
+test('dayKey, daysBetween and formatDay work on local calendar days', () => {
+  assert.strictEqual(dayKey(at(2026, 10, 25, 0, 30)), '2026-10-25');
+  assert.strictEqual(dayKey(Date.UTC(2026, 5, 30, 23, 30)), '2026-07-01'); // 00:30 BST
+  assert.strictEqual(dayKey('2026-11-03'), '2026-11-03');
+  assert.strictEqual(dayKey('2026-11-03T23:30:00Z'), '2026-11-03'); // GMT in November
+  for (const bad of ['2026-02-31', 'nonsense', '', null, undefined, NaN, true]) assert.strictEqual(dayKey(bad), null, String(bad));
+
+  assert.strictEqual(daysBetween('2026-10-24', '2026-10-26'), 2); // across the autumn change
+  assert.strictEqual(daysBetween('2027-03-27', '2027-03-29'), 2); // across the spring change
+  assert.strictEqual(daysBetween('2026-11-03', '2026-10-30'), -4);
+  assert.strictEqual(daysBetween(at(2026, 10, 25, 23, 59), at(2026, 10, 26, 0, 1)), 1);
+  assert.strictEqual(daysBetween('2026-12-28', '2027-01-05'), 8);
+  assert.ok(Number.isNaN(daysBetween('x', '2026-01-01')));
+
+  const today = '2026-11-03';
+  assert.strictEqual(formatDay('2026-11-03', today), 'today');
+  assert.strictEqual(formatDay('2026-11-04', today), 'tomorrow');
+  assert.strictEqual(formatDay('2026-11-02', today), 'yesterday');
+  assert.strictEqual(formatDay('2026-11-06', today), 'Fri 6 Nov');
+  assert.strictEqual(formatDay('2027-01-31', today), 'Sun 31 Jan 2027');
+  assert.strictEqual(formatDay('2026-11-06', TUE_3_NOV), 'Fri 6 Nov');
+  assert.strictEqual(formatDay('bad', today), '');
+
+  assert.strictEqual(orderForLocale('en-GB'), 'dmy');
+  assert.strictEqual(orderForLocale('en-US'), 'mdy');
+  assert.strictEqual(orderForLocale('fr-FR'), 'dmy');
+  assert.strictEqual(orderForLocale(undefined), 'dmy');
+});
+
+test('DST: "tomorrow", weekdays and "in 2 days" land on the right day across the clock change', () => {
+  // Clocks go back at 02:00 on Sunday 25 October 2026 (that day has 25 hours).
+  const earlySat = at(2026, 10, 24, 0, 15);
+  assert.deepStrictEqual(days('tomorrow', earlySat), ['2026-10-25']);
+  assert.deepStrictEqual(days('in 2 days', earlySat), ['2026-10-26']);
+  assert.deepStrictEqual(days('Monday', earlySat), ['2026-10-26']);
+  assert.deepStrictEqual(days('tomorrow', at(2026, 10, 24, 23, 45)), ['2026-10-25']);
+  // Clocks go forward at 01:00 on Sunday 28 March 2027 (that day has 23 hours).
+  const lateSat = at(2027, 3, 27, 23, 30);
+  assert.deepStrictEqual(days('tomorrow', lateSat), ['2027-03-28']);
+  assert.deepStrictEqual(days('in 2 days', lateSat), ['2027-03-29']);
+  assert.deepStrictEqual(days('Sunday', lateSat), ['2027-03-28']);
+  assert.deepStrictEqual(days('today', at(2027, 3, 28, 0, 30)), ['2027-03-28']);
+  assert.deepStrictEqual(days('today', '2027-03-28T23:30:00Z'), ['2027-03-29']); // 00:30 BST
+});
+
+test('a day and month with no year lands within 60 days back to 305 days ahead', () => {
+  const mon28Dec = at(2026, 12, 28);
+  assert.deepStrictEqual(days('Please pay by 5 January', mon28Dec), ['2027-01-05']);
+  assert.deepStrictEqual(days('by 2 Jan', mon28Dec), ['2027-01-02']);
+  assert.deepStrictEqual(days('by 20 December', mon28Dec), ['2026-12-20']);
+  assert.deepStrictEqual(days('by Friday', mon28Dec), ['2027-01-01']);
+  // Sent 3 November: "30 October" is four days ago, so it is already overdue.
+  const [late] = deadlines('Please reply by 30 October.');
+  assert.deepStrictEqual([late.day, late.cue], ['2026-10-30', 'by']);
+  assert.strictEqual(daysBetween(dayKey(TUE_3_NOV), late.day), -4);
+  // 1 September 2026 is 63 days back, outside the window, so it means next year.
+  assert.deepStrictEqual(days('by 1 September'), ['2027-09-01']);
+  // An explicit year is used as written.
+  assert.deepStrictEqual(days('by 31 January 2027'), ['2027-01-31']);
+  assert.deepStrictEqual(days('by 30 October 2028'), ['2028-10-30']);
+});
+
+test('impossible dates and things that only look like dates are rejected', () => {
+  for (const s of ['Due 31 Feb', 'Due 31 February 2027', 'Due 30/02/2027', 'Due 2027-02-30', 'Deadline: 31 Feb', 'by 29 February 2027']) {
+    assert.deepStrictEqual(findDates(s, TUE_3_NOV), [], s);
+  }
+  assert.deepStrictEqual(days('by 29 February 2028'), ['2028-02-29']);
+  for (const s of ['We offer 24/7 support.', 'Total £12.50 for 3/4 of the order.', 'Sort code 12-34-56.', 'The fix is in version 1.2.', 'Application 26/1234 was refused.', 'I sat down with the client and the sun was out. They wed next year. Your team may 2 days early?']) {
+    assert.deepStrictEqual(findDates(s, TUE_3_NOV), [], s);
+  }
+});
+
+test('a weekday that does not match the date keeps the date, marked uncertain', () => {
+  // 17 October 2026 is a Saturday.
+  let d = one('by Friday 17th October 2026');
+  assert.deepStrictEqual([d.day, d.uncertain, d.text], ['2026-10-17', true, 'Friday 17th October 2026']);
+  d = one('by Saturday 17th October 2026');
+  assert.deepStrictEqual([d.day, d.uncertain], ['2026-10-17', false]);
+  d = one('by Friday 17th October', at(2026, 10, 14));
+  assert.deepStrictEqual([d.day, d.uncertain], ['2026-10-17', true]);
+  // 13 November 2026 is a Friday.
+  d = one('Friday, 13/11 is the deadline');
+  assert.deepStrictEqual([d.day, d.uncertain, d.text, d.cue], ['2026-11-13', false, 'Friday, 13/11', 'deadline']);
+  assert.strictEqual(one('Thursday, 13/11').uncertain, true);
+  d = one('on Friday 13th');
+  assert.deepStrictEqual([d.day, d.uncertain], ['2026-11-13', false]);
+  assert.deepStrictEqual([one('Fri 13 Nov').day, one('Fri 13 Nov').uncertain], ['2026-11-13', false]);
+});
+
+test('numeric dates: the locale order decides 10/11, and a number over 12 overrides it', () => {
+  assert.deepStrictEqual(days('due 10/11'), ['2026-11-10']);
+  assert.deepStrictEqual(days('due 10/11', TUE_3_NOV, { order: 'dmy' }), ['2026-11-10']);
+  assert.deepStrictEqual(days('due 10/11', TUE_3_NOV, { order: 'mdy' }), ['2026-10-11']);
+  assert.deepStrictEqual(days('due 13/11', TUE_3_NOV, { order: 'mdy' }), ['2026-11-13']);
+  assert.deepStrictEqual(days('due 11/13', TUE_3_NOV, { order: 'dmy' }), ['2026-11-13']);
+  assert.deepStrictEqual(days('due 10/11/2027'), ['2027-11-10']);
+  assert.deepStrictEqual(days('due 10/11/27'), ['2027-11-10']);
+  assert.deepStrictEqual(days('due 16.10.2026'), ['2026-10-16']);
+  assert.deepStrictEqual(days('due 16-10-2026'), ['2026-10-16']);
+  assert.deepStrictEqual(days('due 2026-11-20'), ['2026-11-20']);
+  assert.deepStrictEqual(days('due 1999-11-20'), []); // a reference number, not a deadline
+});
+
+test('numeric dates are read the way the email writes them, whatever the locale', () => {
+  const sent = at(2026, 11, 6);
+  const pick = (email, opts) => findDeadlines(email, sent, opts).map((d) => [d.text, d.day, d.uncertain]);
+  // 11/16/2026 can only be month-first, so 12/01/2026 in the same email is 1 December.
+  const us = 'Applications open 11/16/2026 and must be submitted by 12/01/2026.';
+  assert.deepStrictEqual(pick({ body: us }), [['12/01/2026', '2026-12-01', false]]);
+  // On its own, 12/01/2026 is read the locale's way.
+  assert.deepStrictEqual(pick({ body: 'Applications must be submitted by 12/01/2026.' }), [['12/01/2026', '2026-01-12', false]]);
+  assert.deepStrictEqual(pick({ body: 'Applications must be submitted by 12/01/2026.' }, { order: 'mdy' }), [['12/01/2026', '2026-12-01', false]]);
+  // The month-first date can be anywhere: another sentence, an ask, the subject.
+  assert.deepStrictEqual(pick({ subject: 'Applications open 11/16/2026', body: 'Submit yours by 12/01/2026.' }), [['12/01/2026', '2026-12-01', false]]);
+  assert.deepStrictEqual(pick({ body: 'Submit yours by 12/01/2026.', questions: ['Can you start on 11/16/2026?'] }).at(0), ['12/01/2026', '2026-12-01', false]);
+  // And the other way round for a US-locale computer: 16/11/2026 makes the email day-first.
+  assert.deepStrictEqual(pick({ body: 'Opened 16/11/2026. Please reply by 01/12/2026.' }, { order: 'mdy' }), [['01/12/2026', '2026-12-01', false]]);
+  // Dates written both ways, or none that decides: the locale.
+  assert.deepStrictEqual(pick({ body: 'Opens 11/16/2026, closes 20/11/2026. Pay by 10/12/2026.' }).map((d) => d[1]), ['2026-11-20', '2026-12-10']);
+  // Only dates with a year decide: not 24/7, a quiz score of 9/15, a version number or a
+  // year that can't be one.
+  for (const body of ['We offer 24/7 support. Pay by 10/12/2026.', 'You scored 9/15 on the quiz. Book the resit by 10/12/2026.',
+    'Update to version 2.14.26 first. Pay by 10/12/2026.', 'Ref 3/13/1999. Pay by 10/12/2026.']) {
+    assert.deepStrictEqual(pick({ body }), [['10/12/2026', '2026-12-10', false]], body);
+  }
+  assert.deepStrictEqual(pick({ body: 'We offer 24/7 support. Pay by 10/12/2026.' }, { order: 'mdy' }), [['10/12/2026', '2026-10-12', false]]);
+  // A two-digit year counts with a slash.
+  assert.deepStrictEqual(pick({ body: 'Opened 11/16/26. Pay by 12/01/26.' }), [['12/01/26', '2026-12-01', false]]);
+  // But not with dashes: "11-20-29" in a UK bank's email is a sort code, and must not turn the
+  // payment due on 5 December into 12 May (already past, so no deadline at all).
+  for (const body of ['Your minimum payment of £25.00 is due on 05/12/2026. Pay to sort code 11-20-29, account 12345678.',
+    'Please pay £40 by 05/12/2026. Our sort code is 12-24-26.', 'Please pay £40 by 05-12-2026. Bank: Halifax 11-15-31.']) {
+    assert.deepStrictEqual(pick({ body }).at(0).slice(1), ['2026-12-05', false], body);
+  }
+  // Dots and dashes count too.
+  assert.deepStrictEqual(pick({ body: 'Opened 11.16.2026. Pay by 12.01.2026.' }), [['12.01.2026', '2026-12-01', false]]);
+  // The real email, through the cleaner.
+  const c = clean({ text: `Dear applicant,\n\n${us} Late applications cannot be considered.\n\nStudy Abroad Office`, subject: 'Exchange applications', from: 'studyabroad@umich.edu' });
+  assert.deepStrictEqual(pick({ subject: 'Exchange applications', body: c.body, questions: c.questions, actions: c.actions }), [['12/01/2026', '2026-12-01', false]]);
+});
+
+test('an email that looks American marks 11/12/2026 as unsure: dollars only, a US time zone, "November 10, 2026"', () => {
+  const sent = at(2026, 11, 6);
+  const first = (body, opts) => {
+    const [d] = findDeadlines({ body }, sent, opts);
+    return [d.text, d.day, d.uncertain];
+  };
+  for (const body of [
+    'Your subscription will automatically renew on 11/12/2026 for $144.00.',
+    'Submit by 11/12/2026 at 11:59 PM PST.',
+    'Submit by 11/12/2026 (5pm ET).',
+    'Submit by 11/12/2026, 11:59 p.m. Eastern Time.',
+    'Submit by 11/12/2026. The webinar is on November 10, 2026.',
+    'Submit by 11-12-2026. Fee: $20.',
+  ]) {
+    assert.deepStrictEqual(first(body).slice(1), ['2026-12-11', true], body);
+  }
+  // Not American, or nothing to doubt: sure.
+  for (const body of [
+    'Your subscription will renew on 11/12/2026 for $144.00 (£110.00).', // pounds as well
+    'Your subscription will renew on 11/12/2026.', // no signs
+    'Your CT scan is due by 11/12/2026 at 2:30pm. CT department, Level 2.', // "CT" here is a scan
+    'Pay by 11/12/2026. Est. 1894. EST 1894.', // "EST" without a time
+    'Your subscription will renew on 11/11/2026 for $144.00.', // the same both ways
+    'Your subscription will renew on 13/11/2026 for $144.00.', // only one way
+    'Your subscription will renew on 11 December 2026 for $144.00.', // in words
+  ]) {
+    assert.strictEqual(first(body)[2], false, body);
+  }
+  // The email shows its own order: no doubt.
+  assert.deepStrictEqual(first('Opens 11/16/2026. Renews on 11/12/2026 for $5.'), ['11/12/2026', '2026-11-12', false]);
+  // A computer set to month-first already reads it the American way.
+  assert.deepStrictEqual(first('Renews on 11/12/2026 for $5.', { order: 'mdy' }), ['11/12/2026', '2026-11-12', false]);
+  // findDates (one sentence, no email around it) is unchanged.
+  assert.strictEqual(findDates('Renews on 11/12/2026 for $5.', sent)[0].uncertain, false);
+  // The real Grammarly email, through the cleaner.
+  const text = 'Hi Will,\n\nYour annual Grammarly Premium subscription will automatically renew on 11/12/2026 for $144.00.\n\nIf you want to cancel, you must do so before your renewal date.\n\nThe Grammarly Team\n548 Market St, San Francisco, CA';
+  const c = clean({ text, subject: 'Your Grammarly Premium renews soon', from: 'info@send.grammarly.com' });
+  const found = findDeadlines({ subject: 'Your Grammarly Premium renews soon', body: c.body, questions: c.questions, actions: c.actions }, sent);
+  assert.deepStrictEqual(found.map((d) => [d.text, d.day, d.uncertain]), [['11/12/2026', '2026-12-11', true]]);
+});
+
+test('renewals: "renews on", "Renewal date:" and "your renewal date is" are deadlines', () => {
+  for (const [body, cue] of [
+    ['Your policy renews on 22/11/2026.', 'renews'],
+    ['Renewal date: 22/11/2026', 'renewal'],
+    ['Your renewal date is 22/11/2026.', 'renewal'],
+    ['Your membership is renewing on 22 November.', 'renewing'],
+    ['Your policy will renew on 22/11/2026.', 'renew'],
+  ]) {
+    assert.deepStrictEqual(deadlines(body).map((d) => [d.day, d.cue]), [['2026-11-22', cue]], body);
+  }
+  // The Admiral email, through the cleaner: its "Renewal date:" line.
+  const text = "Your car insurance renewal\n\nPolicy number: P12345678\nVehicle: Ford Fiesta EK15 ABC\nRenewal date: 22/11/2026\nRenewal premium: £1,284.37\nNo Claims Discount: 2 years\n\nIf you don't need to make any changes, you don't need to do anything. Your policy will renew automatically and the premium will be taken from your card.\n\nTo stop your policy renewing, call us before your renewal date.\n\nManage your preferences | Unsubscribe";
+  const found = cleanedDeadlines(text, at(2026, 11, 6), 'Your car insurance renewal documents');
+  assert.deepStrictEqual(found.map((d) => [d.day, d.cue]), [['2026-11-22', 'renewal']]);
+  // A renewal mentioned with no date nearby is nothing.
+  assert.deepStrictEqual(deadlines('Renewal premium: £1,284.37. We met on 22 November.'), []);
+});
+
+test('relative dates: "within 28 days", and working days skip the weekend', () => {
+  let d = one('You can appeal within 28 days of this notice.');
+  assert.deepStrictEqual([d.day, d.relative, d.cue, d.text], ['2026-12-01', true, 'within', 'within 28 days']);
+  const fri6Nov = at(2026, 11, 6);
+  d = one('Please reply within 2 working days.', fri6Nov);
+  assert.deepStrictEqual([d.day, d.relative], ['2026-11-10', true]); // Mon, Tue
+  assert.deepStrictEqual(days('within 2 days', fri6Nov), ['2026-11-08']);
+  assert.deepStrictEqual(days('within five business days', fri6Nov), ['2026-11-13']);
+  assert.deepStrictEqual(days('within 1 working day', at(2026, 11, 7)), ['2026-11-09']);
+  assert.deepStrictEqual(days('in a week', fri6Nov), ['2026-11-13']);
+  assert.deepStrictEqual(days('within two weeks', fri6Nov), ['2026-11-20']);
+  assert.deepStrictEqual(days('in a fortnight', fri6Nov), ['2026-11-20']);
+  assert.deepStrictEqual(days('within the next 30 days', fri6Nov), ['2026-12-06']);
+  assert.deepStrictEqual(days('within 1 month', at(2027, 1, 31)), ['2027-02-28']);
+  assert.deepStrictEqual(findDates('It expires in 10 minutes.', TUE_3_NOV), []);
+});
+
+test('weekdays, weeks, weekends and months follow the rules', () => {
+  const check = (s, day, extra = {}, ref = TUE_3_NOV) => {
+    const d = one(s, ref);
+    assert.strictEqual(d.day, day, s);
+    for (const [k, v] of Object.entries(extra)) assert.strictEqual(d[k], v, `${s}: ${k}`);
+  };
+  // Sent on Tuesday 3 November 2026.
+  check('Friday', '2026-11-06', { uncertain: false, precision: 'day' });
+  check('this Friday', '2026-11-06', { uncertain: false, text: 'this Friday' });
+  check('on Mon', '2026-11-09', { text: 'Mon' });
+  check('Tuesday', '2026-11-03', { uncertain: true }); // the same weekday: today, but unsure
+  check('next Friday', '2026-11-13', { uncertain: true });
+  check('next Tuesday', '2026-11-10', { uncertain: true });
+  check('last Friday', '2026-10-30', { past: true });
+  check('this week', '2026-11-06');
+  check('by the end of the week', '2026-11-06');
+  check('EOW', '2026-11-06');
+  check('end of the week', '2026-11-13', {}, at(2026, 11, 7)); // on a Saturday: the coming Friday
+  check('this weekend', '2026-11-07');
+  check('this weekend', '2026-11-08', {}, at(2026, 11, 8)); // on a Sunday: today
+  check('next week', '2026-11-09', { precision: 'week' });
+  check('next week', '2026-11-09', { precision: 'week' }, at(2026, 11, 8));
+  check('next month', '2026-12-01', { precision: 'month' });
+  check('by end of the month', '2026-11-30', { precision: 'day' });
+  check('in December', '2026-12-01', { precision: 'month', text: 'December' });
+  check('by end of March', '2027-03-31', { precision: 'month', text: 'end of March' });
+  check('early March', '2027-03-01', { precision: 'month' });
+  check('mid-March', '2027-03-15', { precision: 'month' });
+  check('in December 2027', '2027-12-01', { precision: 'month', text: 'December 2027' });
+  check('October 2027', '2027-10-01', { precision: 'month' });
+  for (const s of ['today', 'tonight', 'by EOD', 'by end of day', 'by COB', 'this afternoon']) check(s, '2026-11-03');
+  check('tomorrow', '2026-11-04');
+  check('by the day after tomorrow', '2026-11-05', { text: 'the day after tomorrow' });
+});
+
+test('a time written next to the date is kept', () => {
+  assert.strictEqual(one('a site meeting on Wednesday at 10am').time, '10am');
+  assert.strictEqual(one('by 5pm on Friday').time, '5pm');
+  assert.strictEqual(one('Friday 9:30 works').time, '9:30');
+  assert.strictEqual(one('ready tomorrow after 2pm').time, '2pm');
+  assert.strictEqual(one('Offer ends midnight tonight').time, 'midnight');
+  assert.strictEqual(one('Friday 17 October, 3.30pm').time, '3.30pm');
+  assert.strictEqual(one('by Friday').time, null);
+});
+
+test('cue rules: a date is a deadline only with a cue word in the 4 words before it, or inside an ask', () => {
+  // "December" with no cue word is not a deadline; "due in December" is.
+  assert.deepStrictEqual(deadlines('New guidance is expected in December.'), []);
+  const [due] = deadlines('New guidance is due in December.');
+  assert.deepStrictEqual([due.cue, due.day, due.precision, due.source, due.sentence], ['due', '2026-12-01', 'month', 'body', 'New guidance is due in December.']);
+  assert.deepStrictEqual(deadlines('The skip arrives on Friday.'), []);
+  assert.strictEqual(deadlines('Please send it by Friday.')[0].cue, 'by');
+  assert.strictEqual(deadlines('Deadline: 10 November').at(0).cue, 'deadline');
+  assert.strictEqual(deadlines('Fri 13 Nov is the deadline.').at(0).cue, 'deadline');
+  assert.strictEqual(deadlines('Friday at the latest.').at(0).cue, 'deadline');
+  assert.strictEqual(deadlines('Send it no later than 10 November.').at(0).cue, 'no later than');
+  assert.strictEqual(deadlines('Your policy expires on 30 November.').at(0).cue, 'expires');
+  assert.strictEqual(deadlines('Applications close on 30 November.').at(0).cue, 'close');
+  // A cue five or more words back doesn't count.
+  assert.deepStrictEqual(deadlines('We will pay the balance of the account in full on 30 November.'), []);
+  // Inside an ask, no cue is needed.
+  const ask = 'Can you come round on Friday to take a look?';
+  const [inAsk] = deadlines(ask, TUE_3_NOV, { questions: [ask] });
+  assert.deepStrictEqual([inAsk.source, inAsk.cue, inAsk.day], ['ask', null, '2026-11-06']);
+  // The same sentence when it isn't one of the asks: not a deadline.
+  assert.deepStrictEqual(deadlines('Sam comes round on Friday to take a look.'), []);
+  // The subject counts too (with any "RE:"/"Fwd:" taken off).
+  const [subj] = findDeadlines({ subject: 'RE: Invoice due 7 Nov' }, TUE_3_NOV);
+  assert.deepStrictEqual([subj.source, subj.cue, subj.day, subj.sentence], ['subject', 'due', '2026-11-07', 'Invoice due 7 Nov']);
+  assert.deepStrictEqual(findDeadlines({ subject: 'Meeting Friday' }, TUE_3_NOV), []);
+  // "until" is a cue, but not after "away", "closed" and the like.
+  assert.deepStrictEqual(deadlines("I'm away until Monday."), []);
+  assert.deepStrictEqual(deadlines('The yard is closed until Monday.'), []);
+  assert.strictEqual(deadlines('You have until Friday to reply.')[0].cue, 'until');
+  // The same date twice is one deadline, from the first sentence it appears in.
+  const twice = deadlines('Your return must be submitted by 31 January 2027. You must also pay by 31 January 2027.');
+  assert.strictEqual(twice.length, 1);
+  assert.match(twice[0].sentence, /^Your return/);
+  assert.deepStrictEqual(Object.keys(twice[0]).sort(), ['cue', 'day', 'precision', 'relative', 'sentence', 'source', 'text', 'time', 'uncertain']);
+});
+
+test('a time between the cue word and the date: "no later than 5pm on 10 November"', () => {
+  const check = (body, text, cue, time, day) => {
+    const found = deadlines(body);
+    assert.strictEqual(found.length, 1, `${body}: ${JSON.stringify(found)}`);
+    assert.deepStrictEqual([found[0].text, found[0].cue, found[0].time, found[0].day], [text, cue, time, day], body);
+  };
+  check('Your tax return must be filed no later than 5pm on 10 November 2026.', '10 November 2026', 'no later than', '5pm', '2026-11-10');
+  check('Forms must reach our office no later than midnight on 20 November.', '20 November', 'no later than', 'midnight', '2026-11-20');
+  check('The deadline for applications is 12 noon on Friday 13 November.', 'Friday 13 November', 'deadline', '12 noon', '2026-11-13');
+  check('The deadline for all new planning applications to the council is 5.30pm on Friday 13 November.', 'Friday 13 November', 'deadline', '5.30pm', '2026-11-13');
+  check('Payment must be received by our office before 5.30 pm on Friday 6 November.', 'Friday 6 November', 'before', '5.30pm', '2026-11-06');
+  check('Please reply no later than 17:00, 10 November.', '10 November', 'no later than', '17:00', '2026-11-10');
+  // The cue before the time still counts as before, and a time alone makes nothing a deadline.
+  check('Send it by 5pm on Friday.', 'Friday', 'by', '5pm', '2026-11-06');
+  assert.deepStrictEqual(deadlines('The meeting is at 5pm on Friday.'), []);
+  assert.deepStrictEqual(deadlines("We missed the deadline last week, and the party is at 8pm on Friday."), []);
+  assert.deepStrictEqual(deadlines("I'm away until 5pm on Friday."), []);
+});
+
+test('"by the 15th": the next 15th on or after the sent date, uncertain unless the month is said', () => {
+  const check = (s, day, uncertain, ref = TUE_3_NOV) => {
+    const d = one(s, ref);
+    assert.deepStrictEqual([d.day, d.uncertain], [day, uncertain], s);
+    return d;
+  };
+  const d = check('Please pay before the 15th.', '2026-11-15', true);
+  assert.deepStrictEqual([d.text, d.cue], ['the 15th', 'before']);
+  check('Please pay by the 3rd.', '2026-11-03', true); // today is the 3rd
+  check('Please pay by the 1st.', '2026-12-01', true); // the 1st has gone: next month's
+  check('Please pay by the 31st.', '2026-12-31', true); // November has no 31st
+  check('Please pay by the 15th of this month.', '2026-11-15', false);
+  check('Please pay by the 15th of next month.', '2026-12-15', false);
+  check('Please pay by the 2nd of next month.', '2027-01-02', false, at(2026, 12, 20));
+  check('Rent is due on the 5th.', '2027-01-05', true, at(2026, 12, 20));
+  const [rent] = deadlines('The new amount needs to be in my account before the 15th.');
+  assert.deepStrictEqual([rent.day, rent.cue, rent.uncertain], ['2026-11-15', 'before', true]);
+  assert.deepStrictEqual(findDates('The office is on the 3rd floor.', TUE_3_NOV), []);
+});
+
+test('a forwarded message counts its dates from the day it was sent, not the day it was forwarded', () => {
+  // Jo forwards a council refusal of Tue 13 October on Tue 3 November: the appeal is due 10 November.
+  const text = 'Hi Will,\n\nFYI - see below. Can you get the appeal in by Friday?\n\nThanks,\nJo\n\n---------- Forwarded message ---------\nFrom: Northfield Borough Council Planning <planning@northfield-council.example>\nDate: Tue, 13 Oct 2026 at 16:05\nSubject: Planning decision - 12 Elm Road\nTo: Jo Patel <jo.patel@example.com>\n\nDear Ms Patel,\n\nWe have refused this application.\n\nThe decision notice says an appeal must be made within 28 days of this notice. The appeal fee of £462 is non-refundable.\n\nPlanning Services';
+  const c = clean({ text, subject: 'Fwd: Planning decision', from: 'jo.patel@example.com' });
+  const input = { subject: 'Fwd: Planning decision', body: c.body, questions: c.questions, actions: c.actions };
+  const pick = (found) => found.map((d) => [d.text, d.day, d.uncertain]);
+  const sent = at(2026, 11, 3, 11);
+  assert.deepStrictEqual(pick(findDeadlines({ ...input, forwarded: c.forwarded }, sent)), [['Friday', '2026-11-06', false], ['within 28 days', '2026-11-10', false]]);
+  // The note above the forward still counts from when it was sent, and so does the subject.
+  assert.strictEqual(findDeadlines({ ...input, subject: 'Fwd: reply by Monday', forwarded: c.forwarded }, sent)[0].day, '2026-11-09');
+  // A full timestamp works as the date too.
+  const [{ at: start }] = c.forwarded;
+  assert.strictEqual(findDeadlines({ ...input, forwarded: [{ at: start, date: '2026-10-13T15:05:00.000Z' }] }, sent)[1].day, '2026-11-10');
+  // Its date unknown: counted from the forward, but marked uncertain.
+  assert.deepStrictEqual(pick(findDeadlines({ ...input, forwarded: [{ at: start, date: null }] }, sent)), [['Friday', '2026-11-06', false], ['within 28 days', '2026-12-01', true]]);
+  // A date with its month and year written in full doesn't depend on when it was sent.
+  const fixed = findDeadlines({ body: 'See below.\n\nForwarded message:\n\nPlease pay by 20 November 2026.', forwarded: [{ at: 12, date: null }] }, sent);
+  assert.deepStrictEqual(pick(fixed), [['20 November 2026', '2026-11-20', false]]);
+  // An ask that isn't one of the body's sentences as such still counts from its own part.
+  const loose = findDeadlines({ body: 'See below.\n\nForwarded message:\n\nPay it. In 7 days, OK', questions: ['In 7 days'], forwarded: [{ at: 12, date: '2026-10-13' }] }, sent);
+  assert.deepStrictEqual(pick(loose), [['In 7 days', '2026-10-20', false]]);
+  // Odd forwarded parts are ignored.
+  for (const forwarded of [null, 'x', [null, 5, { at: -1, date: '2026-10-13' }, { at: 1e9, date: '2026-10-13' }, { at: 1.5, date: '2026-10-13' }]]) {
+    assert.strictEqual(findDeadlines({ ...input, forwarded }, sent)[1].day, '2026-12-01', JSON.stringify(forwarded));
+  }
+});
+
+test("a 'YYYY-MM-DD' sent date is that day wherever the computer is (here: New York)", () => {
+  const script = "const { findDeadlines } = require('./src/dates'); process.stdout.write(JSON.stringify(findDeadlines({ body: 'Please reply tomorrow. See below.\\n\\nForwarded message:\\n\\nAppeal within 28 days.', forwarded: [{ at: 35, date: '2026-10-13' }] }, '2026-11-03').map((d) => d.day)));";
+  const out = require('node:child_process').execFileSync(process.execPath, ['-e', script], { cwd: require('node:path').join(__dirname, '..'), env: { ...process.env, TZ: 'America/New_York' } });
+  assert.deepStrictEqual(JSON.parse(out), ['2026-11-04', '2026-11-10']);
+});
+
+test('past tense: a date for something that already happened is not a deadline', () => {
+  // demo-1's "on Friday" is about a meeting that already happened.
+  const demo1 = `Hi Will,
+
+I hope this email finds you well and that you had a lovely weekend.
+
+Just wanted to reach out regarding the Harrow extension. We had a look at the drawings with the team on Friday.
+
+Could you send over the revised drawings showing the steel beam position? We'll need them before we can finalise anything.
+
+Let me know if you have any questions.
+
+Kind regards,
+Sarah Collins`;
+  assert.deepStrictEqual(cleanedDeadlines(demo1, at(2026, 11, 2)), []);
+  const past = findDates('We had a look at the drawings with the team on Friday.', TUE_3_NOV)[0];
+  assert.deepStrictEqual([past.past, past.day], [true, '2026-10-30']);
+  // Inside an ask, but about the past.
+  for (const q of ['Did you get the parcel I sent on Monday?', 'Could you send the drawings we discussed on Friday?']) {
+    assert.deepStrictEqual(deadlines(q, TUE_3_NOV, { questions: [q] }), [], q);
+  }
+  // An ask about the future still counts.
+  const q = 'Could you come round on Friday?';
+  assert.strictEqual(deadlines(q, TUE_3_NOV, { questions: [q] }).length, 1);
+  // A deadline that has passed is still a deadline (it is overdue).
+  const [overdue] = deadlines('Your payment was due on Monday, please pay now.');
+  assert.deepStrictEqual([overdue.cue, overdue.day], ['due', '2026-11-02']);
+});
+
+test('the demo inbox: deadlines are real days, have a cue or an ask, and weekday and date agree', () => {
+  const DAY_NAMES = /\b(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\b[^\n]*\d/i;
+  let total = 0;
+  for (const m of demo) {
+    const c = clean({ text: m.text, html: m.html, subject: m.subject, from: m.from.address });
+    const found = findDeadlines({ subject: m.subject, body: c.body, questions: c.questions, actions: c.actions }, m.date);
+    for (const d of found) {
+      total++;
+      assert.strictEqual(dayKey(d.day), d.day, `${m.id}: ${d.text}`);
+      assert.ok(['subject', 'ask', 'body'].includes(d.source));
+      assert.ok(['day', 'week', 'month'].includes(d.precision));
+      assert.ok(d.cue || d.source === 'ask', `${m.id}: ${d.text} has a cue or is in an ask`);
+      assert.ok(d.sentence.toLowerCase().includes(d.text.toLowerCase()), `${m.id}: ${d.text} is in its sentence`);
+      if (DAY_NAMES.test(d.text)) assert.strictEqual(d.uncertain, false, `${m.id}: ${d.text} is on the right weekday`);
+    }
+    if (m.id === 'demo-1') assert.deepStrictEqual(found, [], 'demo-1 only mentions a past Friday');
+    const confirm = /proceed by (\w+ \d+\w\w \w+)/.exec(m.text);
+    if (m.id === 'demo-2' && confirm) {
+      const d = found.find((x) => x.text === confirm[1]);
+      assert.ok(d, `demo-2 has the ${confirm[1]} deadline`);
+      const n = daysBetween(dayKey(m.date), d.day);
+      assert.ok(n >= 1 && n <= 9 && d.cue === 'by' && !d.uncertain, `${confirm[1]} is ${n} days on`);
+      assert.strictEqual(new Date(`${d.day}T12:00`).getDay(), 5);
+    }
+  }
+  assert.ok(total >= 5, `the demo has deadlines (${total})`);
+});
+
+test('odd input never throws and long text is quick', () => {
+  for (const s of [null, undefined, 42, {}, '', '   ']) assert.deepStrictEqual(findDates(s, TUE_3_NOV), []);
+  for (const e of [null, undefined, 42, 'text', {}, { body: 42, questions: 'x', actions: [null, 5] }]) {
+    assert.deepStrictEqual(findDeadlines(e, TUE_3_NOV), []);
+  }
+  // An invalid sent date means "now".
+  assert.deepStrictEqual(days('today', 'not a date'), [dayKey(Date.now())]);
+  assert.deepStrictEqual(days('today', null), [dayKey(Date.now())]);
+  const start = Date.now();
+  findDeadlines({ body: 'Please pay by Friday 13/11, or within 3 working days of 1 December 2026. '.repeat(3000) }, TUE_3_NOV);
+  findDates('by Friday, '.repeat(5000), TUE_3_NOV);
+  assert.ok(Date.now() - start < 3000, `took ${Date.now() - start} ms`);
+});
+
+test('a bank sort code is never read as a date', () => {
+  const sent = at(2026, 11, 6);
+  const pick = (body) => findDeadlines({ body, actions: [body] }, sent).map((d) => [d.text, d.day]);
+  assert.deepStrictEqual(pick('Please pay to sort code 11-20-29 by Friday.'), [['Friday', '2026-11-06']]);
+  assert.deepStrictEqual(pick('Pay the deposit to sort code: 12-24-26, account 12345678, by 20 November.'), [['20 November', '2026-11-20']]);
+  assert.deepStrictEqual(pick('Bank: Kestrel, sort-code 20-11-26. Please pay by 05/12/2026.'), [['05/12/2026', '2026-12-05']]);
+  // Without "sort code" in front, the same shape is still a date.
+  assert.deepStrictEqual(pick('Please return the form by 20-11-26.'), [['20-11-26', '2026-11-20']]);
+});
